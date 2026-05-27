@@ -1,0 +1,9 @@
+source: descry/example
+sink: stdout
+interval: 10s
+timeout: 10s
+concurrency: 4
+targets:
+  - url: https://example.com
+    labels:
+      env: demo
