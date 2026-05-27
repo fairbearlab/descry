@@ -16,9 +16,23 @@ import (
 	"github.com/fairbearlab/descry/sink"
 )
 
+// Populated by GoReleaser ldflags; fall back to "dev" / "none" / "unknown" in
+// local builds.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	cfgPath := flag.String("config", "", "path to YAML config")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("descry %s (%s) %s\n", version, commit, date)
+		return
+	}
 
 	if *cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "error: --config is required")
