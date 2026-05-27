@@ -1,3 +1,6 @@
 
 # Riptide artifacts (cloud-synced)
 .humanlayer/tasks/
+
+# Compiled binary
+/descry
