@@ -27,6 +27,8 @@ var (
 
 func main() {
 	cfgPath := flag.String("config", "", "path to YAML config")
+	sinkOverride := flag.String("sink", "", `override config sink ("stdout" | "file")`)
+	fileOverride := flag.String("file", "", "override config file_path (sink=file)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -44,6 +46,18 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(2)
+	}
+
+	// CLI flags override config values.
+	if *sinkOverride != "" {
+		if *sinkOverride != "stdout" && *sinkOverride != "file" {
+			fmt.Fprintf(os.Stderr, "error: --sink %q must be \"stdout\" or \"file\"\n", *sinkOverride)
+			os.Exit(2)
+		}
+		cfg.Sink = *sinkOverride
+	}
+	if *fileOverride != "" {
+		cfg.FilePath = *fileOverride
 	}
 
 	// Build the event sink.

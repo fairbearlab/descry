@@ -139,6 +139,9 @@ backoff:
 		if pubErr = r.sink.Publish(ctx, e); pubErr == nil {
 			break
 		}
+		if attempt == 2 {
+			break // final attempt failed; don't back off with no retry left
+		}
 		select {
 		case <-ctx.Done():
 			break backoff

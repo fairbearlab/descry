@@ -83,11 +83,16 @@ func controlContext(_ context.Context, _, address string, _ syscall.RawConn) err
 }
 
 // newSafeTransport clones http.DefaultTransport (preserving its timeouts,
-// connection pooling, proxy-from-environment, and HTTP/2 settings) and swaps in
-// a dialer whose ControlContext enforces the Layer 2 SSRF guard. ForceAttemptHTTP2
-// (set on DefaultTransport) keeps HTTP/2 working despite the custom DialContext.
+// connection pooling, and HTTP/2 settings) and swaps in a dialer whose
+// ControlContext enforces the Layer 2 SSRF guard. ForceAttemptHTTP2 (set on
+// DefaultTransport) keeps HTTP/2 working despite the custom DialContext.
+//
+// Proxy support is explicitly disabled: a proxy resolves the target host itself,
+// so our dial-time guard would only see the proxy's address and the Layer 2 guard
+// would be bypassed (a private rebinding result never reaches this process).
 func newSafeTransport() *nethttp.Transport {
 	t := nethttp.DefaultTransport.(*nethttp.Transport).Clone()
+	t.Proxy = nil
 	d := &net.Dialer{
 		Timeout:        30 * time.Second,
 		KeepAlive:      30 * time.Second,

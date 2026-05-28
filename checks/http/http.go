@@ -37,7 +37,10 @@ func New(timeout time.Duration) *Check {
 			if len(via) >= maxRedirects {
 				return errors.New("too many redirects")
 			}
-			return nil
+			// Re-run Layer 1 on each redirect hop: the dial-time guard only checks
+			// resolved IPs, so without this a redirect could bypass the scheme/port
+			// policy (e.g. hop to a public host on :8080).
+			return assertSafeURL(req.URL.String())
 		},
 	}
 	return c
