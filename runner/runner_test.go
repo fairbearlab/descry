@@ -33,8 +33,8 @@ func (c *instantCheck) Run(_ context.Context, t check.Target) (check.Observation
 
 // blockingCheck blocks on a channel until released. Used to force in-flight overlap.
 type blockingCheck struct {
-	gate   chan struct{} // close to unblock all pending runs
-	calls  atomic.Int64
+	gate  chan struct{} // close to unblock all pending runs
+	calls atomic.Int64
 }
 
 func (c *blockingCheck) Name() string { return "blocking" }
@@ -189,5 +189,26 @@ func TestPerCheckTimeout(t *testing.T) {
 	// The runner should have returned promptly after ctx expired.
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("Run took %v, expected < 500ms after ctx cancel", elapsed)
+	}
+}
+
+// TestRun_ShutdownDoesNotRequireResultsDrain verifies that diagnostics are
+// best-effort: callers can ignore Results without wedging shutdown.
+func TestRun_ShutdownDoesNotRequireResultsDrain(t *testing.T) {
+	target := check.Target{URL: "http://example.com", Labels: map[string]string{"url": "http://example.com"}}
+	r := New(&instantCheck{status: check.StatusUp}, discardSink{}, event.Config{Source: "test"},
+		[]check.Target{target}, time.Millisecond, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	time.Sleep(25 * time.Millisecond) // enough ticks to fill the small results buffer
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not shut down when Results was not drained")
 	}
 }

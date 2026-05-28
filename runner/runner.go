@@ -27,15 +27,15 @@ type target struct {
 // Runner schedules checks on a ticker, enforces concurrency limits, and
 // publishes CloudEvents to an EventSink.
 type Runner struct {
-	chk     check.Check
-	sink    sink.EventSink
-	evtCfg  event.Config
-	targets []*target
+	chk      check.Check
+	sink     sink.EventSink
+	evtCfg   event.Config
+	targets  []*target
 	interval time.Duration
-	sem     chan struct{} // buffered-channel semaphore
-	results chan Result
-	skipped atomic.Int64
-	wg      sync.WaitGroup // tracks in-flight runOne goroutines
+	sem      chan struct{} // buffered-channel semaphore
+	results  chan Result
+	skipped  atomic.Int64
+	wg       sync.WaitGroup // tracks in-flight runOne goroutines
 }
 
 // New creates a Runner. concurrency must be >= 1.
@@ -122,12 +122,12 @@ func (r *Runner) tick(ctx context.Context) {
 func (r *Runner) runOne(ctx context.Context, t check.Target) {
 	obs, err := r.chk.Run(ctx, t)
 	if err != nil {
-		r.results <- Result{Target: t, Err: err}
+		r.reportResult(Result{Target: t, Err: err})
 		return
 	}
 	e, err := event.ToCloudEvent(obs, r.evtCfg)
 	if err != nil {
-		r.results <- Result{Target: t, Err: err}
+		r.reportResult(Result{Target: t, Err: err})
 		return
 	}
 
@@ -151,5 +151,15 @@ backoff:
 	if pubErr != nil {
 		slog.Error("publish failed after retries", "url", t.URL, "err", pubErr)
 	}
-	r.results <- Result{Target: t, Err: pubErr}
+	r.reportResult(Result{Target: t, Err: pubErr})
+}
+
+// reportResult is best-effort. Results are useful for diagnostics, but a slow
+// or absent consumer must not block scheduler progress or shutdown.
+func (r *Runner) reportResult(res Result) {
+	select {
+	case r.results <- res:
+	default:
+		slog.Warn("dropping result; results channel full", "url", res.Target.URL, "err", res.Err)
+	}
 }
