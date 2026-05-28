@@ -91,5 +91,24 @@ func Load(path string) (Config, error) {
 		cfg.Sink = "stdout"
 	}
 
+	// Validate invariants the rest of the engine depends on.
+	if cfg.Source == "" {
+		return Config{}, fmt.Errorf("source is required")
+	}
+	if cfg.Sink != "stdout" && cfg.Sink != "file" {
+		return Config{}, fmt.Errorf("sink %q must be %q or %q", cfg.Sink, "stdout", "file")
+	}
+	if cfg.Sink == "file" && cfg.FilePath == "" {
+		return Config{}, fmt.Errorf("file_path is required when sink is %q", "file")
+	}
+	if len(cfg.Targets) == 0 {
+		return Config{}, fmt.Errorf("at least one target is required")
+	}
+	for i, t := range cfg.Targets {
+		if t.URL == "" {
+			return Config{}, fmt.Errorf("target %d: url is required", i)
+		}
+	}
+
 	return cfg, nil
 }

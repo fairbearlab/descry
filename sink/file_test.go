@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
@@ -23,6 +24,7 @@ func TestFileSink_NoTornLines(t *testing.T) {
 
 	const n = 200
 	var wg sync.WaitGroup
+	var pubErrs atomic.Int64
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
@@ -31,10 +33,15 @@ func TestFileSink_NoTornLines(t *testing.T) {
 			e.SetID("01ARZ3NDEKTSV4RRFFQ69G5FAV") // fixed ULID-shaped id
 			e.SetSource("test")
 			e.SetType("dev.descry.observation.v1")
-			_ = fs.Publish(context.Background(), e)
+			if err := fs.Publish(context.Background(), e); err != nil {
+				pubErrs.Add(1)
+			}
 		}()
 	}
 	wg.Wait()
+	if got := pubErrs.Load(); got > 0 {
+		t.Fatalf("%d of %d Publish calls failed", got, n)
+	}
 	if err := fs.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}

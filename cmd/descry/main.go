@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/fairbearlab/descry/check"
 	httpcheck "github.com/fairbearlab/descry/checks/http"
@@ -57,7 +58,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(2)
 		}
-		defer fs.Close()
+		defer func() {
+			if err := fs.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "error: closing file sink: %v\n", err)
+			}
+		}()
 		s = fs
 	}
 
@@ -75,7 +80,7 @@ func main() {
 		targets[i] = check.Target{URL: t.URL, Labels: lbl}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	r := runner.New(
@@ -87,8 +92,8 @@ func main() {
 		cfg.Concurrency,
 	)
 
-	// Drain results to stderr + count failures. The goroutine exits when ctx is
-	// cancelled and the runner stops sending on the results channel.
+	// Drain results to stderr + count failures. The goroutine exits when the
+	// runner closes the results channel during shutdown.
 	var failures atomic.Int64
 	go func() {
 		for res := range r.Results() {

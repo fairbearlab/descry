@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // ErrSSRFBlocked is returned (or surfaced as ErrorClass ssrf_blocked) when a
@@ -81,8 +82,17 @@ func controlContext(_ context.Context, _, address string, _ syscall.RawConn) err
 	return nil
 }
 
-// newSafeTransport builds an http.Transport whose dialer enforces Layer 2.
+// newSafeTransport clones http.DefaultTransport (preserving its timeouts,
+// connection pooling, proxy-from-environment, and HTTP/2 settings) and swaps in
+// a dialer whose ControlContext enforces the Layer 2 SSRF guard. ForceAttemptHTTP2
+// (set on DefaultTransport) keeps HTTP/2 working despite the custom DialContext.
 func newSafeTransport() *nethttp.Transport {
-	d := &net.Dialer{ControlContext: controlContext}
-	return &nethttp.Transport{DialContext: d.DialContext}
+	t := nethttp.DefaultTransport.(*nethttp.Transport).Clone()
+	d := &net.Dialer{
+		Timeout:        30 * time.Second,
+		KeepAlive:      30 * time.Second,
+		ControlContext: controlContext,
+	}
+	t.DialContext = d.DialContext
+	return t
 }

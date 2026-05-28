@@ -14,7 +14,7 @@ import (
 const (
 	defaultTimeout = 10 * time.Second
 	maxRedirects   = 5
-	maxBodyChars   = 4096
+	maxBodyBytes   = 4096
 )
 
 // Check is an HTTP uptime check that implements check.Check.
@@ -119,14 +119,11 @@ func (c *Check) Run(ctx context.Context, t check.Target) (check.Observation, err
 		obs.ErrorClass = check.ErrHTTPError
 	}
 
-	// capture body only on down, capped at 4096 chars
+	// capture body only on down, capped at maxBodyBytes. ToValidUTF8 drops any
+	// partial multibyte rune left dangling at the byte boundary.
 	if obs.Status == check.StatusDown {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyChars*4)) // *4 headroom for multibyte
-		s := string(body)
-		if len(s) > maxBodyChars {
-			s = s[:maxBodyChars]
-		}
-		obs.Extra["body"] = s
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		obs.Extra["body"] = strings.ToValidUTF8(string(body), "")
 	}
 	return obs, nil
 }

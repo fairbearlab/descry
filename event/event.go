@@ -38,7 +38,7 @@ func ToCloudEvent(obs check.Observation, cfg Config) (cloudevents.Event, error) 
 		cfg.Type = DefaultType
 	}
 	e.SetType(cfg.Type)
-	e.SetSubject(obs.Labels["url"]) // subject = target URL (set by caller via Labels or FinalURL)
+	e.SetSubject(obs.Labels["url"]) // subject = the "url" label, set by the caller
 	e.SetTime(obs.ObservedAt)
 
 	var tls *string

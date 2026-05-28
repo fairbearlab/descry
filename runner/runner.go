@@ -35,6 +35,7 @@ type Runner struct {
 	sem     chan struct{} // buffered-channel semaphore
 	results chan Result
 	skipped atomic.Int64
+	wg      sync.WaitGroup // tracks in-flight runOne goroutines
 }
 
 // New creates a Runner. concurrency must be >= 1.
@@ -66,6 +67,10 @@ func (r *Runner) Skipped() int64 { return r.skipped.Load() }
 
 // Run starts the ticker loop. It fires once immediately, then on each tick.
 // Returns ctx.Err() when ctx is cancelled — this is not considered fatal.
+//
+// On shutdown it stops dispatching, waits for all in-flight runs to finish, then
+// closes the results channel so a draining consumer can exit cleanly. Waiting for
+// in-flight runs also guarantees no Publish races with a deferred sink Close.
 func (r *Runner) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
@@ -73,6 +78,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			r.wg.Wait()
+			close(r.results)
 			return ctx.Err()
 		case <-ticker.C:
 			r.tick(ctx)
@@ -90,12 +97,20 @@ func (r *Runner) tick(ctx context.Context) {
 			r.skipped.Add(1)
 			continue
 		}
-		r.sem <- struct{}{} // acquire semaphore slot (blocks if pool is full)
+		r.wg.Add(1)
 		go func(tg *target) {
 			defer func() {
-				<-r.sem      // release semaphore slot
 				tg.mu.Unlock() // mark this target as no longer in-flight
+				r.wg.Done()
 			}()
+			// Acquire a semaphore slot inside the goroutine so a full pool never
+			// blocks tick dispatch. Bail out if shutdown beats us to the slot.
+			select {
+			case r.sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-r.sem }() // release semaphore slot
 			r.runOne(ctx, tg.t)
 		}(tg)
 	}
@@ -116,13 +131,19 @@ func (r *Runner) runOne(ctx context.Context, t check.Target) {
 		return
 	}
 
-	// Best-effort produce: up to 3 attempts with short back-off.
+	// Best-effort produce: up to 3 attempts with short back-off. The back-off is
+	// ctx-aware so shutdown isn't delayed by a sleeping goroutine.
 	var pubErr error
+backoff:
 	for attempt := 0; attempt < 3; attempt++ {
 		if pubErr = r.sink.Publish(ctx, e); pubErr == nil {
 			break
 		}
-		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			break backoff
+		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+		}
 	}
 	if pubErr != nil {
 		slog.Error("publish failed after retries", "url", t.URL, "err", pubErr)
