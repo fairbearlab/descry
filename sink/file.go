@@ -3,6 +3,7 @@ package sink
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -42,12 +43,13 @@ func (s *FileSink) Publish(_ context.Context, e cloudevents.Event) error {
 	return s.w.Flush() // no fsync by default
 }
 
-// Close flushes any buffered data and closes the underlying file.
+// Close flushes any buffered data and closes the underlying file. The file is
+// always closed even if the flush fails, so a flush error cannot leak the fd;
+// both errors are reported (joined) when they occur together.
 func (s *FileSink) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.w.Flush(); err != nil {
-		return err
-	}
-	return s.f.Close()
+	flushErr := s.w.Flush()
+	closeErr := s.f.Close()
+	return errors.Join(flushErr, closeErr)
 }

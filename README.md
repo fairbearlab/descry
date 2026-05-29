@@ -61,11 +61,12 @@ The guard runs two layers:
 
 Residual risks the guard does **not** cover:
 
-- DNS rebinding and resolver tricks (the resolved address is checked at dial time,
-  but a malicious resolver can return a public IP for the first query and a private
-  IP for subsequent ones).
-- Kernel routing manipulation (e.g. policy routing that redirects public-looking
-  traffic to internal hosts).
+- Kernel/network routing manipulation that maps a public-looking address to an
+  internal host *after* the Layer 2 check — e.g. policy routing, NAT/NAT64, or a
+  VPN/overlay that redirects an allowed destination IP to an internal endpoint.
+  (Classic DNS rebinding is *not* a residual risk here: Layer 2 re-checks the
+  resolved socket address on every dial, so a later private DNS answer is blocked
+  locally before connect rather than bypassing the guard.)
 - IPv6 embedding classes not explicitly decoded (unknown future embedding schemes).
 - Non-HTTP protocols tunneled over allowed ports 80/443.
 

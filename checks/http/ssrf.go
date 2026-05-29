@@ -25,7 +25,9 @@ var allowedPorts = map[string]bool{"": true, "80": true, "443": true}
 var extraBlocked = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),       // "this" network
 	netip.MustParsePrefix("100.64.0.0/10"),   // CGNAT (RFC 6598)
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF protocol assignments (RFC 6890)
 	netip.MustParsePrefix("192.0.2.0/24"),    // TEST-NET-1
+	netip.MustParsePrefix("198.18.0.0/15"),   // benchmarking (RFC 2544)
 	netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
 	netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3
 	netip.MustParsePrefix("240.0.0.0/4"),     // reserved
