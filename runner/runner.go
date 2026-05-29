@@ -12,6 +12,13 @@ import (
 	"github.com/fairbearlab/descry/sink"
 )
 
+const (
+	// maxPublishAttempts is the total number of Publish tries per observation.
+	maxPublishAttempts = 3
+	// basePublishBackoff is multiplied by the attempt number for linear back-off.
+	basePublishBackoff = 100 * time.Millisecond
+)
+
 // Result is the outcome of a single check run.
 type Result struct {
 	Target check.Target
@@ -93,7 +100,7 @@ func (r *Runner) Run(ctx context.Context) error {
 func (r *Runner) tick(ctx context.Context) {
 	for _, tg := range r.targets {
 		if !tg.mu.TryLock() {
-			slog.Warn("skipping tick; prior run in flight", "url", tg.t.URL)
+			slog.Warn("skipping tick; prior run in flight", "url", check.RedactURL(tg.t.URL))
 			r.skipped.Add(1)
 			continue
 		}
@@ -135,21 +142,21 @@ func (r *Runner) runOne(ctx context.Context, t check.Target) {
 	// ctx-aware so shutdown isn't delayed by a sleeping goroutine.
 	var pubErr error
 backoff:
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < maxPublishAttempts; attempt++ {
 		if pubErr = r.sink.Publish(ctx, e); pubErr == nil {
 			break
 		}
-		if attempt == 2 {
+		if attempt == maxPublishAttempts-1 {
 			break // final attempt failed; don't back off with no retry left
 		}
 		select {
 		case <-ctx.Done():
 			break backoff
-		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+		case <-time.After(time.Duration(attempt+1) * basePublishBackoff):
 		}
 	}
 	if pubErr != nil {
-		slog.Error("publish failed after retries", "url", t.URL, "err", pubErr)
+		slog.Error("publish failed after retries", "url", check.RedactURL(t.URL), "err", pubErr)
 	}
 	r.reportResult(Result{Target: t, Err: pubErr})
 }
@@ -160,6 +167,6 @@ func (r *Runner) reportResult(res Result) {
 	select {
 	case r.results <- res:
 	default:
-		slog.Warn("dropping result; results channel full", "url", res.Target.URL, "err", res.Err)
+		slog.Warn("dropping result; results channel full", "url", check.RedactURL(res.Target.URL), "err", res.Err)
 	}
 }

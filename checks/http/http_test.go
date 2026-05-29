@@ -2,9 +2,13 @@ package http
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
+	"net"
 	nethttp "net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -96,6 +100,48 @@ func TestRun_RedirectLoop(t *testing.T) {
 	}
 	if obs.ErrorClass != check.ErrHTTPError {
 		t.Fatalf("error_class = %v, want http_error", obs.ErrorClass)
+	}
+}
+
+// TestRun_SSRFBlockedProducesObservation drives the real (SSRF-guarded)
+// constructor against a literal loopback URL and asserts the best-effort produce
+// contract: a down/ssrf_blocked observation with a nil error.
+func TestRun_SSRFBlockedProducesObservation(t *testing.T) {
+	obs, err := New(2 * time.Second).Run(context.Background(), check.Target{URL: "http://127.0.0.1"})
+	if err != nil {
+		t.Fatalf("err = %v, want nil (best-effort produce)", err)
+	}
+	if obs.Status != check.StatusDown {
+		t.Fatalf("status = %v, want down", obs.Status)
+	}
+	if obs.ErrorClass != check.ErrSSRFBlocked {
+		t.Fatalf("error_class = %v, want ssrf_blocked", obs.ErrorClass)
+	}
+}
+
+// TestClassifyError locks in the typed-error mappings and the substring
+// fallback so a Go upgrade that changes error wording fails loudly here.
+func TestClassifyError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want check.ErrorClass
+	}{
+		{"ssrf", ErrSSRFBlocked, check.ErrSSRFBlocked},
+		{"deadline", context.DeadlineExceeded, check.ErrTimeout},
+		{"econnrefused", syscall.ECONNREFUSED, check.ErrConnectionRefused},
+		{"econnreset", syscall.ECONNRESET, check.ErrConnectionRefused},
+		{"dns", &net.DNSError{Err: "no such host", Name: "x"}, check.ErrDNSFailure},
+		{"x509", x509.UnknownAuthorityError{}, check.ErrTLSError},
+		{"redirects (fallback)", errors.New("too many redirects"), check.ErrHTTPError},
+		{"unknown", errors.New("something weird"), check.ErrUnknown},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := classifyError(c.err); got != c.want {
+				t.Errorf("classifyError(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
 	}
 }
 

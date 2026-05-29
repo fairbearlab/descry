@@ -37,6 +37,19 @@ type Config struct {
 	Targets     []Target
 }
 
+// ValidateSink checks the sink/file_path invariant. It is exported so callers
+// that override these values after Load (e.g. CLI flags) can re-validate without
+// duplicating the rule.
+func ValidateSink(sink, filePath string) error {
+	if sink != "stdout" && sink != "file" {
+		return fmt.Errorf("sink %q must be %q or %q", sink, "stdout", "file")
+	}
+	if sink == "file" && filePath == "" {
+		return fmt.Errorf("file_path is required when sink is %q", "file")
+	}
+	return nil
+}
+
 // Load reads and validates the YAML config at path.
 // Unknown fields are rejected (KnownFields(true)).
 func Load(path string) (Config, error) {
@@ -95,11 +108,8 @@ func Load(path string) (Config, error) {
 	if cfg.Source == "" {
 		return Config{}, fmt.Errorf("source is required")
 	}
-	if cfg.Sink != "stdout" && cfg.Sink != "file" {
-		return Config{}, fmt.Errorf("sink %q must be %q or %q", cfg.Sink, "stdout", "file")
-	}
-	if cfg.Sink == "file" && cfg.FilePath == "" {
-		return Config{}, fmt.Errorf("file_path is required when sink is %q", "file")
+	if err := ValidateSink(cfg.Sink, cfg.FilePath); err != nil {
+		return Config{}, err
 	}
 	if len(cfg.Targets) == 0 {
 		return Config{}, fmt.Errorf("at least one target is required")

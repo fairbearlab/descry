@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -28,5 +29,30 @@ func TestAssertSafeURL(t *testing.T) {
 		if err := assertSafeURL(u); err != nil {
 			t.Errorf("assertSafeURL(%q) = %v, want nil", u, err)
 		}
+	}
+}
+
+// TestControlContext exercises Layer 2 (the dial-time guard that runs on the
+// already-resolved socket address). This is the production guard — Layer 1 only
+// catches literal-IP and reserved hostnames, so a DNS name resolving into a
+// private range is stopped solely here.
+func TestControlContext(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1:80", "[::1]:443", "10.0.0.1:80", "192.168.1.1:443",
+		"169.254.169.254:80", "[fc00::1]:443", "[fe80::1]:80", "0.0.0.0:80",
+	}
+	for _, a := range blocked {
+		if err := controlContext(context.Background(), "tcp", a, nil); !errors.Is(err, ErrSSRFBlocked) {
+			t.Errorf("controlContext(%q) = %v, want ErrSSRFBlocked", a, err)
+		}
+	}
+	allowed := []string{"8.8.8.8:443", "1.1.1.1:80", "172.15.0.1:80"}
+	for _, a := range allowed {
+		if err := controlContext(context.Background(), "tcp", a, nil); err != nil {
+			t.Errorf("controlContext(%q) = %v, want nil", a, err)
+		}
+	}
+	if err := controlContext(context.Background(), "tcp", "garbage", nil); !errors.Is(err, ErrSSRFBlocked) {
+		t.Errorf("unparseable address: got %v, want ErrSSRFBlocked", err)
 	}
 }

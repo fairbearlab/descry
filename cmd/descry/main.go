@@ -48,25 +48,22 @@ func main() {
 		os.Exit(2)
 	}
 
-	// CLI flags override config values.
+	// CLI flags override config values; re-validate the combined result through
+	// the same invariant Load uses.
 	if *sinkOverride != "" {
-		if *sinkOverride != "stdout" && *sinkOverride != "file" {
-			fmt.Fprintf(os.Stderr, "error: --sink %q must be \"stdout\" or \"file\"\n", *sinkOverride)
-			os.Exit(2)
-		}
 		cfg.Sink = *sinkOverride
 	}
 	if *fileOverride != "" {
 		cfg.FilePath = *fileOverride
 	}
+	if err := config.ValidateSink(cfg.Sink, cfg.FilePath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
 
 	// Build the event sink.
 	var s sink.EventSink = sink.NewStdoutSink(os.Stdout)
 	if cfg.Sink == "file" {
-		if cfg.FilePath == "" {
-			fmt.Fprintln(os.Stderr, "error: file_path is required when sink is \"file\"")
-			os.Exit(2)
-		}
 		fs, err := sink.NewFileSink(cfg.FilePath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -113,7 +110,7 @@ func main() {
 		for res := range r.Results() {
 			if res.Err != nil {
 				failures.Add(1)
-				fmt.Fprintf(os.Stderr, "check failed: %s: %v\n", res.Target.URL, res.Err)
+				fmt.Fprintf(os.Stderr, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
 			}
 		}
 	}()

@@ -2,10 +2,13 @@ package http
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
+	"net"
 	nethttp "net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/fairbearlab/descry/check"
@@ -15,6 +18,10 @@ const (
 	defaultTimeout = 10 * time.Second
 	maxRedirects   = 5
 	maxBodyBytes   = 4096
+	// drainLimit caps how many leftover body bytes we discard before Close so the
+	// keep-alive connection can be reused. Bodies larger than this are abandoned
+	// (the transport closes the connection), which is the safe default.
+	drainLimit = 1 << 16 // 64 KiB
 )
 
 // Check is an HTTP uptime check that implements check.Check.
@@ -104,7 +111,14 @@ func (c *Check) Run(ctx context.Context, t check.Target) (check.Observation, err
 		obs.ErrorClass = classifyError(err)
 		return obs, nil
 	}
-	defer resp.Body.Close()
+	// Drain leftover body bytes (bounded) before close so the keep-alive
+	// connection is returned to the pool instead of forcing a fresh handshake
+	// every probe. The down-path read below consumes the first maxBodyBytes;
+	// this drains whatever remains within drainLimit.
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
+		_ = resp.Body.Close()
+	}()
 
 	obs.StatusCode = resp.StatusCode
 	obs.FinalURL = resp.Request.URL.String()
@@ -132,13 +146,46 @@ func (c *Check) Run(ctx context.Context, t check.Target) (check.Observation, err
 }
 
 // classifyError maps a transport error to the engine's closed ErrorClass enum.
+// It prefers typed-error unwrapping (errors.Is/As) over matching on error text,
+// since stdlib/OS wording is not a stable contract. Substring matching remains a
+// last-resort fallback for cases without a usable concrete type (e.g. the
+// "too many redirects" error from CheckRedirect).
 func classifyError(err error) check.ErrorClass {
 	if errors.Is(err, ErrSSRFBlocked) {
 		return check.ErrSSRFBlocked
 	}
+
+	// Timeout: context deadline, or any net.Error that reports a timeout.
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return check.ErrTimeout
+	}
+
+	// Connection refused / reset, surfaced as syscall errnos.
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+		return check.ErrConnectionRefused
+	}
+
+	// DNS resolution failure.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return check.ErrDNSFailure
+	}
+
+	// TLS / certificate verification failures.
+	var (
+		x509Unknown  x509.UnknownAuthorityError
+		x509Invalid  x509.CertificateInvalidError
+		x509Hostname x509.HostnameError
+	)
+	if errors.As(err, &x509Unknown) || errors.As(err, &x509Invalid) || errors.As(err, &x509Hostname) {
+		return check.ErrTLSError
+	}
+
+	// Fallback: substring matching for errors without a usable concrete type.
 	msg := strings.ToLower(err.Error())
 	switch {
-	case errors.Is(err, context.DeadlineExceeded), strings.Contains(msg, "timeout"):
+	case strings.Contains(msg, "timeout"):
 		return check.ErrTimeout
 	case strings.Contains(msg, "too many redirects"):
 		return check.ErrHTTPError

@@ -2,8 +2,19 @@ package check
 
 import (
 	"context"
+	"net/url"
 	"time"
 )
+
+// RedactURL masks any userinfo (credentials) in a target URL so it is safe to
+// log. On parse failure it returns the input unchanged.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return u.Redacted()
+}
 
 // Status is a closed, engine-owned enum. v1: StatusUp | StatusDown only.
 type Status string

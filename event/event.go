@@ -2,6 +2,7 @@ package event
 
 import (
 	"fmt"
+	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/oklog/ulid/v2"
@@ -43,7 +44,7 @@ func ToCloudEvent(obs check.Observation, cfg Config) (cloudevents.Event, error) 
 
 	var tls *string
 	if obs.TLSExpiry != nil {
-		s := obs.TLSExpiry.UTC().Format("2006-01-02T15:04:05Z07:00")
+		s := obs.TLSExpiry.UTC().Format(time.RFC3339)
 		tls = &s
 	}
 	p := payload{

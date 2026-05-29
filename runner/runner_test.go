@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -93,6 +94,29 @@ func (discardSink) Publish(_ context.Context, _ cloudevents.Event) error { retur
 
 // ensure discardSink satisfies EventSink at compile time
 var _ sink.EventSink = discardSink{}
+
+// flakySink fails its first `failsLeft` Publish calls, then succeeds. Used to
+// exercise the bounded-retry path in runOne.
+type flakySink struct {
+	failsLeft atomic.Int64
+	calls     atomic.Int64
+}
+
+func (s *flakySink) Publish(_ context.Context, _ cloudevents.Event) error {
+	s.calls.Add(1)
+	if s.failsLeft.Add(-1) >= 0 {
+		return errors.New("transient publish failure")
+	}
+	return nil
+}
+
+// alwaysFailSink fails every Publish call.
+type alwaysFailSink struct{ calls atomic.Int64 }
+
+func (s *alwaysFailSink) Publish(_ context.Context, _ cloudevents.Event) error {
+	s.calls.Add(1)
+	return errors.New("sink down")
+}
 
 // --- tests ---
 
@@ -189,6 +213,50 @@ func TestPerCheckTimeout(t *testing.T) {
 	// The runner should have returned promptly after ctx expired.
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("Run took %v, expected < 500ms after ctx cancel", elapsed)
+	}
+}
+
+// TestRunOne_RetriesThenSucceeds verifies the bounded-retry path: two transient
+// Publish failures followed by success yields a nil Result.Err and exactly 3
+// Publish calls.
+func TestRunOne_RetriesThenSucceeds(t *testing.T) {
+	s := &flakySink{}
+	s.failsLeft.Store(2) // fail twice, succeed on the 3rd attempt
+	tgt := check.Target{URL: "http://x", Labels: map[string]string{"url": "http://x"}}
+	r := New(&instantCheck{status: check.StatusUp}, s, event.Config{Source: "t"},
+		[]check.Target{tgt}, time.Hour, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+
+	res := <-r.Results()
+	if res.Err != nil {
+		t.Fatalf("Err = %v, want nil after retry success", res.Err)
+	}
+	if got := s.calls.Load(); got != 3 {
+		t.Fatalf("Publish calls = %d, want 3", got)
+	}
+}
+
+// TestRunOne_RetriesExhausted verifies that when every attempt fails the runner
+// makes exactly maxPublishAttempts tries and reports the error on Results.
+func TestRunOne_RetriesExhausted(t *testing.T) {
+	s := &alwaysFailSink{}
+	tgt := check.Target{URL: "http://x", Labels: map[string]string{"url": "http://x"}}
+	r := New(&instantCheck{status: check.StatusUp}, s, event.Config{Source: "t"},
+		[]check.Target{tgt}, time.Hour, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+
+	res := <-r.Results()
+	if res.Err == nil {
+		t.Fatal("Err = nil, want non-nil after exhausted retries")
+	}
+	if got := s.calls.Load(); got != maxPublishAttempts {
+		t.Fatalf("Publish calls = %d, want %d", got, maxPublishAttempts)
 	}
 }
 
