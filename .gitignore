@@ -1,0 +1,11 @@
+# System
+.DS_Store
+Thumbs.db
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/
+.humanlayer/tasks/
+.gstack/
+
+# Compiled binary
+/descry
