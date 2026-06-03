@@ -10,6 +10,58 @@ an `EventSink` (stdout / file in v1).
 go install github.com/fairbearlab/descry/cmd/descry@latest
 ```
 
+## Use as a private module
+
+`descry` is a **private** Go module. To `require` it from another project and
+`go mod download` it reproducibly, the consumer's toolchain needs two things:
+bypass the public proxy/checksum DB, and authenticate to GitHub for the fetch.
+
+**1. Tell Go the module is private** (skips proxy.golang.org and sum.golang.org,
+which can't see a private repo):
+
+```bash
+go env -w GOPRIVATE=github.com/fairbearlab/*
+# or per-invocation: GOPRIVATE=github.com/fairbearlab/* go mod download
+```
+
+**2. Authenticate the fetch.** Go fetches over HTTPS, so give git a token. Pick one:
+
+- **`.netrc`** (works in CI and Docker without rewriting git config):
+
+  ```
+  machine github.com
+    login <github-username>
+    password <personal-access-token>
+  ```
+  (`~/.netrc`, mode `0600`; in Docker, mount or `COPY` it then `chmod 600`.)
+
+- **git credential rewrite** (handy on a workstation):
+
+  ```bash
+  git config --global url."https://<token>@github.com/".insteadOf "https://github.com/"
+  ```
+
+**3. Require the version:**
+
+```
+require github.com/fairbearlab/descry v0.1.0
+```
+
+```bash
+GOPRIVATE=github.com/fairbearlab/* go mod download github.com/fairbearlab/descry
+```
+
+### Token / repo access notes
+
+- **No special repo settings are required on `descry`** beyond the token's
+  identity having read access to the repo. A classic PAT needs the `repo` scope;
+  a fine-grained PAT needs **Contents: read** on `fairbearlab/descry`.
+- If the `fairbearlab` org **enforces SAML SSO**, the PAT must be explicitly
+  **authorized for the org** (PAT settings → "Configure SSO"), or fetches 404.
+- In GitHub Actions, the default `GITHUB_TOKEN` is scoped to the *current* repo
+  only and cannot read a sibling private repo. Use a PAT (or a GitHub App token)
+  stored as a secret and feed it via `.netrc` / the git rewrite above.
+
 ## 60-second demo (stdout)
 
 ```bash
