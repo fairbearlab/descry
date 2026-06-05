@@ -7,5 +7,9 @@ Thumbs.db
 .humanlayer/tasks/
 .gstack/
 
+# Internal seam docs — name the private consumer (bearhost); must NOT ship in
+# this public, consumer-agnostic module. Public seam contract: docs/ARCHITECTURE.md
+docs/internal/
+
 # Compiled binary
 /descry

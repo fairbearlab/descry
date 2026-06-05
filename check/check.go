@@ -56,7 +56,7 @@ type Observation struct {
 	TLSExpiry  *time.Time // nil when not HTTPS / unavailable
 	ObservedAt time.Time  // authoritative; CloudEvent time = this
 	Labels     map[string]string
-	Extra      map[string]any // non-generic needs (body, bearhost's, etc.)
+	Extra      map[string]any // non-generic needs (body, consumer-specific payload, etc.)
 }
 
 // Check produces an Observation for a Target.

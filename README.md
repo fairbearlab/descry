@@ -95,6 +95,23 @@ descry --version
 # descry dev (none) unknown
 ```
 
+## HTTP check options
+
+`httpcheck.New` takes a timeout plus optional functional options:
+
+```go
+import httpcheck "github.com/fairbearlab/descry/checks/http"
+
+// Default: net/http's stdlib User-Agent ("Go-http-client/1.1"), no impersonation.
+c := httpcheck.New(10 * time.Second)
+
+// Override the User-Agent (e.g. to satisfy a WAF that blocks the default UA):
+c := httpcheck.New(10*time.Second, httpcheck.WithUserAgent("MyMonitor/1.0 (+https://example.com)"))
+```
+
+`WithUserAgent("")` (or omitting the option) leaves the stdlib default in place —
+the engine never impersonates a browser unless the caller explicitly opts in.
+
 ## Security
 
 The SSRF guard is **best-effort, not a security boundary**. Network egress

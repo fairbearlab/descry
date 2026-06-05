@@ -20,7 +20,7 @@ func TestRun_200Up(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
-	obs, _ := newForTest(2 * time.Second).Run(context.Background(), check.Target{URL: srv.URL})
+	obs, _ := newForTest(2*time.Second).Run(context.Background(), check.Target{URL: srv.URL})
 	if obs.Status != check.StatusUp {
 		t.Fatalf("status = %v, want up", obs.Status)
 	}
@@ -31,7 +31,7 @@ func TestRun_500HTTPError(t *testing.T) {
 		w.WriteHeader(500)
 	}))
 	defer srv.Close()
-	obs, _ := newForTest(2 * time.Second).Run(context.Background(), check.Target{URL: srv.URL})
+	obs, _ := newForTest(2*time.Second).Run(context.Background(), check.Target{URL: srv.URL})
 	if obs.Status != check.StatusDown || obs.ErrorClass != check.ErrHTTPError {
 		t.Fatalf("got %v/%v, want down/http_error", obs.Status, obs.ErrorClass)
 	}
@@ -43,7 +43,7 @@ func TestRun_BodyCappedTo4096(t *testing.T) {
 		_, _ = w.Write([]byte(strings.Repeat("x", 8000)))
 	}))
 	defer srv.Close()
-	obs, _ := newForTest(2 * time.Second).Run(context.Background(), check.Target{URL: srv.URL})
+	obs, _ := newForTest(2*time.Second).Run(context.Background(), check.Target{URL: srv.URL})
 	if got := obs.Extra["body"].(string); len(got) != 4096 {
 		t.Fatalf("body len = %d, want 4096", len(got))
 	}
@@ -56,7 +56,7 @@ func TestRun_Timeout(t *testing.T) {
 	}))
 	defer srv.Close()
 	// Use a very short timeout so the test runs quickly
-	obs, _ := newForTest(50 * time.Millisecond).Run(context.Background(), check.Target{URL: srv.URL})
+	obs, _ := newForTest(50*time.Millisecond).Run(context.Background(), check.Target{URL: srv.URL})
 	if obs.Status != check.StatusDown {
 		t.Fatalf("status = %v, want down", obs.Status)
 	}
@@ -77,7 +77,7 @@ func TestRun_FinalURLAfterRedirect(t *testing.T) {
 	defer srv.Close()
 	srvURL = srv.URL
 
-	obs, _ := newForTest(2 * time.Second).Run(context.Background(), check.Target{URL: srv.URL + "/start"})
+	obs, _ := newForTest(2*time.Second).Run(context.Background(), check.Target{URL: srv.URL + "/start"})
 	if obs.Status != check.StatusUp {
 		t.Fatalf("status = %v, want up", obs.Status)
 	}
@@ -94,7 +94,7 @@ func TestRun_RedirectLoop(t *testing.T) {
 	defer srv.Close()
 	srvURL = srv.URL
 
-	obs, _ := newForTest(2 * time.Second).Run(context.Background(), check.Target{URL: srv.URL + "/loop"})
+	obs, _ := newForTest(2*time.Second).Run(context.Background(), check.Target{URL: srv.URL + "/loop"})
 	if obs.Status != check.StatusDown {
 		t.Fatalf("status = %v, want down", obs.Status)
 	}
@@ -107,7 +107,7 @@ func TestRun_RedirectLoop(t *testing.T) {
 // constructor against a literal loopback URL and asserts the best-effort produce
 // contract: a down/ssrf_blocked observation with a nil error.
 func TestRun_SSRFBlockedProducesObservation(t *testing.T) {
-	obs, err := New(2 * time.Second).Run(context.Background(), check.Target{URL: "http://127.0.0.1"})
+	obs, err := New(2*time.Second).Run(context.Background(), check.Target{URL: "http://127.0.0.1"})
 	if err != nil {
 		t.Fatalf("err = %v, want nil (best-effort produce)", err)
 	}
@@ -161,5 +161,39 @@ func TestRun_TLSExpiryCaptured(t *testing.T) {
 	}
 	if obs.TLSExpiry == nil {
 		t.Fatalf("tls_expiry is nil, want non-nil")
+	}
+}
+
+func TestRun_WithUserAgentSetsHeader(t *testing.T) {
+	const wantUA = "MyMonitor/1.0 (+https://example.com)"
+	var gotUA string
+	srv := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		gotUA = r.UserAgent()
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	obs, _ := newForTest(2*time.Second, WithUserAgent(wantUA)).
+		Run(context.Background(), check.Target{URL: srv.URL})
+	if obs.Status != check.StatusUp {
+		t.Fatalf("status = %v, want up", obs.Status)
+	}
+	if gotUA != wantUA {
+		t.Fatalf("User-Agent = %q, want %q", gotUA, wantUA)
+	}
+}
+
+func TestRun_DefaultUserAgentIsStdlib(t *testing.T) {
+	var gotUA string
+	srv := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		gotUA = r.UserAgent()
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	// No WithUserAgent option → net/http's default UA ("Go-http-client/...").
+	_, _ = newForTest(2*time.Second).Run(context.Background(), check.Target{URL: srv.URL})
+	if !strings.HasPrefix(gotUA, "Go-http-client/") {
+		t.Fatalf("default User-Agent = %q, want stdlib Go-http-client/ prefix", gotUA)
 	}
 }
