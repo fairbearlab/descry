@@ -26,14 +26,24 @@ const (
 
 // Check is an HTTP uptime check that implements check.Check.
 type Check struct {
-	client   *nethttp.Client
-	timeout  time.Duration
-	skipSSRF bool // disable both SSRF guard layers (tests only)
+	client    *nethttp.Client
+	timeout   time.Duration
+	userAgent string // when "", net/http's default User-Agent is used
+	skipSSRF  bool   // disable both SSRF guard layers (tests only)
+}
+
+// Option configures a Check at construction time.
+type Option func(*Check)
+
+// WithUserAgent sets the User-Agent header sent on every request. When unset
+// (empty string), Go's net/http default User-Agent applies — no impersonation.
+func WithUserAgent(ua string) Option {
+	return func(c *Check) { c.userAgent = ua }
 }
 
 // New creates a new HTTP Check with the given timeout. If timeout <= 0,
-// defaultTimeout (10s) is used.
-func New(timeout time.Duration) *Check {
+// defaultTimeout (10s) is used. Options are applied after the defaults.
+func New(timeout time.Duration, opts ...Option) *Check {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
@@ -50,12 +60,15 @@ func New(timeout time.Duration) *Check {
 			return assertSafeURL(req.URL.String())
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
 	return c
 }
 
 // newForTest creates a Check that uses a plain (non-SSRF-guarded) transport,
 // for use in package-internal tests against httptest servers.
-func newForTest(timeout time.Duration) *Check {
+func newForTest(timeout time.Duration, opts ...Option) *Check {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
@@ -68,6 +81,9 @@ func newForTest(timeout time.Duration) *Check {
 			}
 			return nil
 		},
+	}
+	for _, opt := range opts {
+		opt(c)
 	}
 	return c
 }
@@ -99,6 +115,9 @@ func (c *Check) Run(ctx context.Context, t check.Target) (check.Observation, err
 		obs.Status = check.StatusDown
 		obs.ErrorClass = check.ErrUnknown
 		return obs, nil
+	}
+	if c.userAgent != "" {
+		req.Header.Set("User-Agent", c.userAgent)
 	}
 
 	start := time.Now()
