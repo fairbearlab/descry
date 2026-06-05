@@ -165,7 +165,7 @@ func TestRun_TLSExpiryCaptured(t *testing.T) {
 }
 
 func TestRun_WithUserAgentSetsHeader(t *testing.T) {
-	const wantUA = "BearHost-Monitor/0.3 (+https://bearhost.example)"
+	const wantUA = "MyMonitor/1.0 (+https://example.com)"
 	var gotUA string
 	srv := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
 		gotUA = r.UserAgent()
