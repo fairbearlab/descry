@@ -48,7 +48,8 @@ func isBlockedIP(ip netip.Addr) bool {
 	return false
 }
 
-// assertSafeURL is Layer 1: parse-time, string-only. Mirrors urlSafety.ts.
+// assertSafeURL is Layer 1: parse-time, string-only. Mirrors the consumer-side
+// URL safety allowlist.
 func assertSafeURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
