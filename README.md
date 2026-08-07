@@ -1,66 +1,36 @@
 # descry
 
-A sink-agnostic, event-sourced HTTP monitoring engine. A `Check` runs against a
+A sink-agnostic, event-sourced HTTP uptime engine. A `Check` runs against a
 `Target`, produces an `Observation`, mapped to a CloudEvents 1.0 event, handed to
-an `EventSink` (stdout / file in v1).
+an `EventSink` (stdout / file in v1); tenancy and routing ride along as an opaque
+`Labels` map the engine never interprets, so it owes no particular consumer
+anything. It runs in production in my homelab, watching real endpoints.
+
+The part that is more than table stakes is the SSRF guard: two layers, the second
+of which checks the already-resolved socket address inside
+`net.Dialer.ControlContext`, so a rebound DNS answer is blocked before `connect(2)`
+rather than after. Threat model and residual risks are in [Security](#security).
 
 ## Install
+
+As a binary:
 
 ```bash
 go install github.com/fairbearlab/descry/cmd/descry@latest
 ```
 
-## Use as a private module
-
-`descry` is a **private** Go module. To `require` it from another project and
-`go mod download` it reproducibly, the consumer's toolchain needs two things:
-bypass the public proxy/checksum DB, and authenticate to GitHub for the fetch.
-
-**1. Tell Go the module is private** (skips proxy.golang.org and sum.golang.org,
-which can't see a private repo):
+As a library:
 
 ```bash
-go env -w GOPRIVATE=github.com/fairbearlab/*
-# or per-invocation: GOPRIVATE=github.com/fairbearlab/* go mod download
+go get github.com/fairbearlab/descry
 ```
 
-**2. Authenticate the fetch.** Go fetches over HTTPS, so give git a token. Pick one:
+## Design
 
-- **`.netrc`** (works in CI and Docker without rewriting git config):
-
-  ```
-  machine github.com
-    login <github-username>
-    password <personal-access-token>
-  ```
-  (`~/.netrc`, mode `0600`; in Docker, mount or `COPY` it then `chmod 600`.)
-
-- **git credential rewrite** (handy on a workstation):
-
-  ```bash
-  git config --global url."https://<token>@github.com/".insteadOf "https://github.com/"
-  ```
-
-**3. Require the version:**
-
-```
-require github.com/fairbearlab/descry v0.1.0
-```
-
-```bash
-GOPRIVATE=github.com/fairbearlab/* go mod download github.com/fairbearlab/descry
-```
-
-### Token / repo access notes
-
-- **No special repo settings are required on `descry`** beyond the token's
-  identity having read access to the repo. A classic PAT needs the `repo` scope;
-  a fine-grained PAT needs **Contents: read** on `fairbearlab/descry`.
-- If the `fairbearlab` org **enforces SAML SSO**, the PAT must be explicitly
-  **authorized for the org** (PAT settings → "Configure SSO"), or fetches 404.
-- In GitHub Actions, the default `GITHUB_TOKEN` is scoped to the *current* repo
-  only and cannot read a sibling private repo. Use a PAT (or a GitHub App token)
-  stored as a secret and feed it via `.netrc` / the git rewrite above.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the producer/consumer seam
+contract: what the engine owns and never delegates, what a consumer owns, and the
+litmus test for whether a proposed change leaks consumer specifics into the
+engine's exported types. Read it before adding a typed field to `Observation`.
 
 ## 60-second demo (stdout)
 
@@ -90,10 +60,9 @@ cat events.jsonl   # one valid CloudEvent per line
 
 ## Version
 
-```bash
-descry --version
-# descry dev (none) unknown
-```
+`descry --version` prints version, commit, and build date. Release builds stamp
+them via `-ldflags -X main.version=…` (see `.goreleaser.yaml`); a plain
+`go build` reports the `dev` defaults.
 
 ## HTTP check options
 
