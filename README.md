@@ -2,6 +2,10 @@
 
 [![ci](https://github.com/fairbearlab/descry/actions/workflows/ci.yml/badge.svg)](https://github.com/fairbearlab/descry/actions/workflows/ci.yml)
 
+> **descry** *(verb, literary)* — to catch sight of something distant or hard to make out.
+>
+> That is the whole job: watch remote endpoints from a distance and notice when something is wrong.
+
 A sink-agnostic, event-sourced HTTP uptime engine. A `Check` runs against a
 `Target`, produces an `Observation`, mapped to a CloudEvents 1.0 event, handed to
 an `EventSink` (stdout / file in v1); tenancy and routing ride along as an opaque
