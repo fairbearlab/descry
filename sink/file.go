@@ -28,7 +28,7 @@ type FileSink struct {
 // looser permissions is chmod'd here too (deterministic 0600, regardless of
 // whether this call created the file or reopened an existing one).
 func NewFileSink(path string) (*FileSink, error) {
-	//nolint:gosec // path is the user-supplied config file_path / --file flag; writing to it is the feature
+	// #nosec G304 -- path is the user-supplied config file_path / --file flag; writing to it is the feature
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open sink file: %w", err)

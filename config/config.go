@@ -54,7 +54,7 @@ func ValidateSink(sink, filePath string) error {
 // Load reads and validates the YAML config at path.
 // Unknown fields are rejected (KnownFields(true)).
 func Load(path string) (cfg Config, err error) {
-	f, err := os.Open(path) //nolint:gosec // path is the user-supplied --config flag; reading it is the feature
+	f, err := os.Open(path) // #nosec G304 -- path is the user-supplied --config flag; reading it is the feature
 	if err != nil {
 		return Config{}, fmt.Errorf("open config: %w", err)
 	}

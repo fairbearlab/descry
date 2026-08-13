@@ -163,7 +163,7 @@ func TestFileSink_Permissions(t *testing.T) {
 		if err := os.WriteFile(path, nil, 0o600); err != nil {
 			t.Fatalf("seed file: %v", err)
 		}
-		//nolint:gosec // deliberately loosening to 0644 to exercise the tightening behavior (Decision 8A)
+		// #nosec G302 -- deliberately loosening to 0644 to exercise the tightening behavior (Decision 8A)
 		if err := os.Chmod(path, 0o644); err != nil {
 			t.Fatalf("seed chmod: %v", err)
 		}
