@@ -20,8 +20,11 @@ type StdoutSink struct {
 	w  io.Writer
 }
 
+// NewStdoutSink creates a StdoutSink that writes to w.
 func NewStdoutSink(w io.Writer) *StdoutSink { return &StdoutSink{w: w} }
 
+// Publish marshals e as JSON and writes it as a single line to the
+// underlying writer.
 func (s *StdoutSink) Publish(_ context.Context, e cloudevents.Event) error {
 	b, err := e.MarshalJSON()
 	if err != nil {

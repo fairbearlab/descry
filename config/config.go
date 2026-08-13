@@ -1,3 +1,4 @@
+// Package config loads and validates descry's YAML configuration file.
 package config
 
 import (
@@ -52,12 +53,16 @@ func ValidateSink(sink, filePath string) error {
 
 // Load reads and validates the YAML config at path.
 // Unknown fields are rejected (KnownFields(true)).
-func Load(path string) (Config, error) {
-	f, err := os.Open(path)
+func Load(path string) (cfg Config, err error) {
+	f, err := os.Open(path) //nolint:gosec // path is the user-supplied --config flag; reading it is the feature
 	if err != nil {
 		return Config{}, fmt.Errorf("open config: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close config: %w", cerr)
+		}
+	}()
 
 	var raw rawConfig
 	dec := yaml.NewDecoder(f)
@@ -66,7 +71,7 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
 
-	cfg := Config{
+	cfg = Config{
 		Source:      raw.Source,
 		Sink:        raw.Sink,
 		FilePath:    raw.FilePath,

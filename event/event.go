@@ -1,3 +1,5 @@
+// Package event maps a check.Observation onto a validated CloudEvents 1.0
+// envelope, ready to hand to a sink.EventSink.
 package event
 
 import (
@@ -10,6 +12,8 @@ import (
 	"github.com/fairbearlab/descry/check"
 )
 
+// DefaultType is the CloudEvents "type" attribute used when Config.Type is
+// left empty.
 const DefaultType = "dev.descry.observation.v1"
 
 // Config carries the static envelope fields.

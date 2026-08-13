@@ -50,7 +50,11 @@ func TestFileSink_NoTornLines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open output: %v", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close output: %v", err)
+		}
+	}()
 
 	lines := 0
 	sc := bufio.NewScanner(f)
@@ -108,7 +112,11 @@ func TestFileSink_AppendMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
 	sc := bufio.NewScanner(f)
 	lines := 0
 	for sc.Scan() {
@@ -117,4 +125,68 @@ func TestFileSink_AppendMode(t *testing.T) {
 	if lines != 2 {
 		t.Fatalf("lines = %d, want 2 (append mode broken)", lines)
 	}
+}
+
+// TestFileSink_Permissions pins Decision 8A: NewFileSink always leaves the
+// underlying file at mode 0o600, both for a file it creates and for a
+// pre-existing file it merely reopens. The chmod-on-every-open behavior is
+// deterministic on purpose — O_CREATE's mode argument only applies to newly
+// created files, so without an explicit chmod a pre-existing file with looser
+// permissions (e.g. 0o644) would keep them forever.
+func TestFileSink_Permissions(t *testing.T) {
+	t.Run("fresh file is created at 0600", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "events.jsonl")
+
+		fs, err := NewFileSink(path)
+		if err != nil {
+			t.Fatalf("NewFileSink: %v", err)
+		}
+		if err := fs.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if got := fi.Mode().Perm(); got != 0o600 {
+			t.Fatalf("mode = %o, want 0600", got)
+		}
+	})
+
+	t.Run("pre-existing 0644 file is tightened to 0600", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "events.jsonl")
+
+		// WriteFile's mode is masked by the process umask, so it alone can't
+		// guarantee a 0644 file under a stricter umask (e.g. 077). Chmod
+		// explicitly afterward to pin the precondition regardless of umask.
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+		//nolint:gosec // deliberately loosening to 0644 to exercise the tightening behavior (Decision 8A)
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatalf("seed chmod: %v", err)
+		}
+		if fi, err := os.Stat(path); err != nil {
+			t.Fatalf("stat before: %v", err)
+		} else if got := fi.Mode().Perm(); got != 0o644 {
+			t.Fatalf("precondition failed: seeded mode = %o, want 0644", got)
+		}
+
+		fs, err := NewFileSink(path)
+		if err != nil {
+			t.Fatalf("NewFileSink: %v", err)
+		}
+		if err := fs.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat after: %v", err)
+		}
+		if got := fi.Mode().Perm(); got != 0o600 {
+			t.Fatalf("mode = %o, want 0600 (pre-existing file not tightened)", got)
+		}
+	})
 }

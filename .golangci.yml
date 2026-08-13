@@ -1,0 +1,21 @@
+version: "2"
+
+linters:
+  # Defaults (errcheck, govet, ineffassign, staticcheck, unused) stay enabled.
+  enable:
+    - gosec      # security: common vulnerability patterns (weak perms, SSRF, etc.)
+    - revive     # style/API hygiene: exported-symbol doc comments, unused params
+    - errorlint  # error-wrapping: catches non-%w wraps and unsafe errors.Is/As use
+    - gocritic   # diagnostics: bugs, perf, and style issues static analysis catches
+    - misspell   # finds commonly misspelled English words in comments/strings
+    - unconvert  # flags unnecessary type conversions
+    - unparam    # flags unused function parameters and always-same return values
+  exclusions:
+    rules:
+      # t.TempDir()-derived paths in tests are trusted; G304 (file inclusion via
+      # variable) noise is excluded here only. Every other gosec rule still runs
+      # against _test.go files.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G304"

@@ -1,3 +1,6 @@
+// Command descry is a lightweight uptime/observability probe. It loads a
+// YAML config, runs the configured Check against each target on an interval,
+// and publishes CloudEvents to stdout or an append-only file.
 package main
 
 import (
