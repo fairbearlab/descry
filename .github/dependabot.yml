@@ -4,6 +4,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    allow:
+      - dependency-type: direct
+      # go.mod's govulncheck tool directive dep is classified indirect
+      # (dependabot-core#12050), so it needs an explicit carve-out with
+      # dependency-type all — name-only entries default to direct and
+      # never match it. Remove when upstream treats tool deps as direct.
+      - dependency-name: golang.org/x/vuln
+        dependency-type: all
     groups:
       # minor/patch bumps land as one PR; majors stay individual for review
       minor-patch:
