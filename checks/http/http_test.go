@@ -50,7 +50,7 @@ func TestRun_BodyCappedTo4096(t *testing.T) {
 }
 
 func TestRun_Timeout(t *testing.T) {
-	srv := httptest.NewServer(nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+	srv := httptest.NewServer(nethttp.HandlerFunc(func(_ nethttp.ResponseWriter, r *nethttp.Request) {
 		// Block until client disconnects
 		<-r.Context().Done()
 	}))

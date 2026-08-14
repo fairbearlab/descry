@@ -1,3 +1,6 @@
+// Package http implements an HTTP uptime check.Check with a two-layer SSRF
+// guard (parse-time scheme/port/literal-IP checks, plus a dial-time control
+// hook on the resolved socket address — see ssrf.go for the threat model).
 package http
 
 import (
@@ -75,7 +78,7 @@ func newForTest(timeout time.Duration, opts ...Option) *Check {
 	c := &Check{timeout: timeout, skipSSRF: true}
 	c.client = &nethttp.Client{
 		Transport: &nethttp.Transport{},
-		CheckRedirect: func(req *nethttp.Request, via []*nethttp.Request) error {
+		CheckRedirect: func(_ *nethttp.Request, via []*nethttp.Request) error {
 			if len(via) >= maxRedirects {
 				return errors.New("too many redirects")
 			}
@@ -88,8 +91,15 @@ func newForTest(timeout time.Duration, opts ...Option) *Check {
 	return c
 }
 
+// Name identifies this Check implementation as "http".
 func (c *Check) Name() string { return "http" }
 
+// Run performs a single GET against t.URL and maps the outcome to an
+// Observation. It never returns a non-nil error for ordinary probe failures
+// (timeouts, refused connections, non-2xx responses, SSRF blocks, etc.) —
+// those are reported via Observation.Status/ErrorClass instead, since a
+// failed probe is a successful check of a down target. A non-nil error is
+// reserved for conditions that mean the check itself could not run.
 func (c *Check) Run(ctx context.Context, t check.Target) (check.Observation, error) {
 	obs := check.Observation{
 		ObservedAt: time.Now().UTC(),

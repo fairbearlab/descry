@@ -1,0 +1,10 @@
+# Coverage is visible (Codecov comment + graph) but never gates CI —
+# this repo is small and clean enough that a hard threshold is noise.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true

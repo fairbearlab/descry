@@ -14,3 +14,6 @@ docs/internal/
 
 # Compiled binary
 /descry
+
+# Test coverage profile (written by the CI test command when run locally)
+coverage.out

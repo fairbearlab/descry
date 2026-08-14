@@ -1,3 +1,6 @@
+// Package runner schedules a check.Check against a set of targets on a
+// ticker, bounds concurrency, and publishes the resulting CloudEvents to a
+// sink.EventSink with bounded retry.
 package runner
 
 import (
