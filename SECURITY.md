@@ -36,6 +36,9 @@ Read the threat model first:
 The SSRF guard is explicitly **best-effort, not a security boundary**. Egress
 isolation is the deployer's job, not the library's. That means:
 
+<!-- Editors: the bullets below mirror README.md § Security ("Residual risks").
+     When guard behavior or the threat model changes, update both files in the
+     same PR — nothing else keeps them in sync. -->
 **Out of scope** — the residual risks the README already documents. These are
 accepted limitations, not vulnerabilities:
 

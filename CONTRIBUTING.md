@@ -12,9 +12,9 @@ be asked to rework before review continues.
 
 ## Dev setup
 
-Toolchain versions are pinned in `.tool-versions` (Go 1.26.6, golangci-lint
-2.12.2); `asdf install` or `mise install` gets you both. Install them by hand if
-you prefer — CI runs exactly those versions.
+Toolchain versions are pinned in `.tool-versions`; `asdf install` or
+`mise install` gets you both. Install them by hand if you prefer — CI runs
+exactly those versions.
 
 ```
 git clone https://github.com/fairbearlab/descry && cd descry
