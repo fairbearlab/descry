@@ -4,7 +4,7 @@ go 1.26.6
 
 require (
 	github.com/cloudevents/sdk-go/v2 v2.16.2
-	github.com/oklog/ulid/v2 v2.1.1
+	github.com/oklog/ulid/v2 v2.1.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 
