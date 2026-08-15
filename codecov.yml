@@ -1,5 +1,12 @@
-# Coverage is visible (Codecov comment + graph) but never gates CI —
-# this repo is small and clean enough that a hard threshold is noise.
+# Codecov itself stays informational — it posts the comment and the graph but
+# never fails a build. The gate lives in ci.yml instead ("coverage floor" step),
+# which enforces a hard minimum on Go's own statement coverage.
+#
+# Two reasons the gate is there and not here: it runs without a third-party
+# service in the path, and it fails on the same number a developer sees from
+# `go tool cover -func` locally. Codecov's number is line coverage and reads a
+# point or two lower than Go's statement coverage; gating on the one you can
+# reproduce offline avoids arguing with a badge.
 coverage:
   status:
     project:
