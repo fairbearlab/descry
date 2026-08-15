@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	nethttp "net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"syscall"
 	"testing"
@@ -129,11 +131,24 @@ func TestClassifyError(t *testing.T) {
 	}{
 		{"ssrf", ErrSSRFBlocked, check.ErrSSRFBlocked},
 		{"deadline", context.DeadlineExceeded, check.ErrTimeout},
+		{"net.Error timeout (not deadline)", &net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}, check.ErrTimeout},
+		{"wrapped deadline", fmt.Errorf("Get: %w", context.DeadlineExceeded), check.ErrTimeout},
 		{"econnrefused", syscall.ECONNREFUSED, check.ErrConnectionRefused},
 		{"econnreset", syscall.ECONNRESET, check.ErrConnectionRefused},
+		{"wrapped econnrefused", &net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}, check.ErrConnectionRefused},
 		{"dns", &net.DNSError{Err: "no such host", Name: "x"}, check.ErrDNSFailure},
-		{"x509", x509.UnknownAuthorityError{}, check.ErrTLSError},
+		{"x509 unknown authority", x509.UnknownAuthorityError{}, check.ErrTLSError},
+		{"x509 certificate invalid", x509.CertificateInvalidError{Reason: x509.Expired}, check.ErrTLSError},
+		{"x509 hostname mismatch", x509.HostnameError{Host: "example.com"}, check.ErrTLSError},
+		{"wrapped x509", fmt.Errorf("tls: %w", x509.HostnameError{Host: "x"}), check.ErrTLSError},
 		{"redirects (fallback)", errors.New("too many redirects"), check.ErrHTTPError},
+		{"timeout (fallback)", errors.New("i/o Timeout waiting"), check.ErrTimeout},
+		{"connection refused (fallback)", errors.New("dial: Connection Refused"), check.ErrConnectionRefused},
+		{"connection reset (fallback)", errors.New("read: connection reset by peer"), check.ErrConnectionRefused},
+		{"no such host (fallback)", errors.New("lookup x: no such host"), check.ErrDNSFailure},
+		{"server misbehaving (fallback)", errors.New("lookup x: server misbehaving"), check.ErrDNSFailure},
+		{"certificate (fallback)", errors.New("bad Certificate"), check.ErrTLSError},
+		{"tls (fallback)", errors.New("remote error: tls: handshake failure"), check.ErrTLSError},
 		{"unknown", errors.New("something weird"), check.ErrUnknown},
 	}
 	for _, c := range cases {
