@@ -22,6 +22,19 @@ https://github.com/fairbearlab/descry/security/advisories/new.
 Please do not open a public issue for a suspected vulnerability. Private
 reporting lets us assess and fix before details are public.
 
+## What's already in place
+
+- Dependencies are monitored by Dependabot; `govulncheck` runs on every push and
+  pull request, and weekly on a schedule.
+- CodeQL analyses every push and pull request, and weekly for newly published rules.
+- GitHub Actions are pinned to commit SHAs and run with minimal token permissions.
+- Secret scanning and push protection are enabled on the repository.
+- The SSRF guard has Go fuzz targets on both layers (`assertSafeURL`,
+  `isBlockedIP`) and on `check.RedactURL`. They hunt for panics and for
+  disagreements between the two layers; they do **not** make the guard a
+  security boundary, and nothing in the threat model above changes because of them.
+- This repository is scored by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/fairbearlab/descry).
+
 ## Response window
 
 descry has one maintainer. Expect an acknowledgment within about a week. There

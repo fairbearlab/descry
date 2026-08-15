@@ -1,6 +1,6 @@
 # descry
 
-[![ci](https://github.com/fairbearlab/descry/actions/workflows/ci.yml/badge.svg)](https://github.com/fairbearlab/descry/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/fairbearlab/descry/graph/badge.svg)](https://codecov.io/gh/fairbearlab/descry) [![pkg.go.dev](https://pkg.go.dev/badge/github.com/fairbearlab/descry.svg)](https://pkg.go.dev/github.com/fairbearlab/descry)
+[![ci](https://github.com/fairbearlab/descry/actions/workflows/ci.yml/badge.svg)](https://github.com/fairbearlab/descry/actions/workflows/ci.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/fairbearlab/descry/badge)](https://scorecard.dev/viewer/?uri=github.com/fairbearlab/descry) [![codecov](https://codecov.io/gh/fairbearlab/descry/graph/badge.svg)](https://codecov.io/gh/fairbearlab/descry) [![Release](https://img.shields.io/github/v/release/fairbearlab/descry?sort=semver)](https://github.com/fairbearlab/descry/releases) [![pkg.go.dev](https://pkg.go.dev/badge/github.com/fairbearlab/descry.svg)](https://pkg.go.dev/github.com/fairbearlab/descry)
 
 > **descry** *(verb, literary)* — to catch sight of something distant or hard to make out.
 >
