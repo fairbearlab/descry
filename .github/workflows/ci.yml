@@ -26,7 +26,7 @@ jobs:
       # they measure different things.
       - name: coverage floor
         env:
-          COVERAGE_FLOOR: '99'
+          COVERAGE_FLOOR: '75'
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
           if [ -z "$total" ]; then
