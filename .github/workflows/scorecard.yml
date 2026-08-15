@@ -12,9 +12,14 @@ permissions: read-all
 jobs:
   analysis:
     runs-on: ubuntu-latest
+    # A job-level `permissions` block replaces the workflow-level `read-all`
+    # rather than merging with it, so every scope this job needs must be listed
+    # here — anything omitted is `none`.
     permissions:
       security-events: write # upload SARIF to code scanning
       id-token: write # publish results to the OpenSSF API (needed for the badge)
+      contents: read # checkout, and Scorecard reading repo contents
+      actions: read # Scorecard enumerates workflow runs for several checks
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

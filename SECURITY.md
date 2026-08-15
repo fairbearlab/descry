@@ -24,9 +24,10 @@ reporting lets us assess and fix before details are public.
 
 ## What's already in place
 
-- Dependencies are monitored by Dependabot; `govulncheck` runs on every push and
-  pull request, and weekly on a schedule.
-- CodeQL analyses every push and pull request, and weekly for newly published rules.
+- Dependencies are monitored by Dependabot; `govulncheck` runs on pushes to
+  `main`, on pull requests targeting `main`, and weekly on a schedule.
+- CodeQL analyses pushes to `main` and pull requests targeting `main`, plus a
+  weekly run to catch newly published rules.
 - GitHub Actions are pinned to commit SHAs and run with minimal token permissions.
 - Secret scanning and push protection are enabled on the repository.
 - The SSRF guard has Go fuzz targets on both layers (`assertSafeURL`,
