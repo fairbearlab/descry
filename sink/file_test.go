@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -189,4 +191,59 @@ func TestFileSink_Permissions(t *testing.T) {
 			t.Fatalf("mode = %o, want 0600 (pre-existing file not tightened)", got)
 		}
 	})
+}
+
+// TestNewFileSink_OpenError verifies that an unopenable path surfaces a
+// wrapped, user-facing error rather than a nil sink.
+func TestNewFileSink_OpenError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "does-not-exist", "events.jsonl")
+	fs, err := NewFileSink(path)
+	if err == nil {
+		_ = fs.Close()
+		t.Fatal("expected error for path in nonexistent directory, got nil")
+	}
+	if fs != nil {
+		t.Errorf("expected nil sink on error, got %v", fs)
+	}
+	if !strings.Contains(err.Error(), "open sink file:") {
+		t.Errorf("error = %q, want it wrapped with %q", err.Error(), "open sink file:")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("error = %v, want errors.Is(err, os.ErrNotExist)", err)
+	}
+}
+
+// TestFileSink_UseAfterClose pins that a closed sink surfaces errors instead
+// of silently dropping events: Publish must fail on the closed fd, and a
+// second Close must report the underlying close error rather than swallow it.
+func TestFileSink_UseAfterClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	fs, err := NewFileSink(path)
+	if err != nil {
+		t.Fatalf("NewFileSink: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	e := cloudevents.NewEvent()
+	e.SetID("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	e.SetSource("test")
+	e.SetType("dev.descry.observation.v1")
+	if err := fs.Publish(context.Background(), e); err == nil {
+		t.Error("Publish after Close: expected error, got nil")
+	}
+
+	if err := fs.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("second Close: err = %v, want errors.Is(err, os.ErrClosed)", err)
+	}
+
+	// Nothing should have reached the file.
+	b, err := os.ReadFile(path) // #nosec G304 -- test-owned temp path
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if len(b) != 0 {
+		t.Errorf("file should be empty after use-after-close, got %d bytes", len(b))
+	}
 }
