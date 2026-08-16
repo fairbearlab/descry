@@ -165,7 +165,7 @@ func TestBoundedPool_RespectsCap(t *testing.T) {
 	}
 
 	r := New(chk, discardSink{}, event.Config{Source: "test"}, targets,
-		1*time.Hour, // long interval — we only want one tick
+		50*time.Millisecond, // first fire is at each target's phase offset, ≤ one interval in
 		maxConcurrency)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -200,7 +200,7 @@ func TestPerCheckTimeout(t *testing.T) {
 
 	target := check.Target{URL: "http://example.com", Labels: map[string]string{"url": "http://example.com"}}
 	r := New(chk, discardSink{}, event.Config{Source: "test"}, []check.Target{target},
-		1*time.Hour, // only first immediate tick fires
+		10*time.Millisecond, // first fire within 10ms; the check then blocks until ctx expires
 		1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -224,13 +224,14 @@ func TestRunOne_RetriesThenSucceeds(t *testing.T) {
 	s.failsLeft.Store(2) // fail twice, succeed on the 3rd attempt
 	tgt := check.Target{URL: "http://x", Labels: map[string]string{"url": "http://x"}}
 	r := New(&instantCheck{status: check.StatusUp}, s, event.Config{Source: "t"},
-		[]check.Target{tgt}, time.Hour, 1)
+		[]check.Target{tgt}, time.Second, 1) // one slot fires and finishes (300ms of back-off) before the next
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	go func() { _ = r.Run(ctx) }()
 
 	res := <-r.Results()
+	cancel() // no second slot may dispatch before we read the call count
 	if res.Err != nil {
 		t.Fatalf("Err = %v, want nil after retry success", res.Err)
 	}
@@ -245,13 +246,14 @@ func TestRunOne_RetriesExhausted(t *testing.T) {
 	s := &alwaysFailSink{}
 	tgt := check.Target{URL: "http://x", Labels: map[string]string{"url": "http://x"}}
 	r := New(&instantCheck{status: check.StatusUp}, s, event.Config{Source: "t"},
-		[]check.Target{tgt}, time.Hour, 1)
+		[]check.Target{tgt}, time.Second, 1) // one slot fires and finishes (300ms of back-off) before the next
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	go func() { _ = r.Run(ctx) }()
 
 	res := <-r.Results()
+	cancel() // no second slot may dispatch before we read the call count
 	if res.Err == nil {
 		t.Fatal("Err = nil, want non-nil after exhausted retries")
 	}

@@ -49,9 +49,14 @@ const (
 
 // Target is what a Check runs against. Labels are opaque: carried through,
 // never interpreted by the engine.
+//
+// Interval is the cadence at which the runner schedules this target; the
+// cadence rides with the target, as in a Prometheus per-target scrape
+// interval. Zero (or negative) means "use the runner's default interval".
 type Target struct {
-	URL    string
-	Labels map[string]string
+	URL      string
+	Labels   map[string]string
+	Interval time.Duration
 }
 
 // Observation is the generic result of a single Check run.
