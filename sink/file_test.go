@@ -378,8 +378,10 @@ func TestFileSink_ReopenTerminatesTornTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s2.Close()
 	if s2.torn {
 		t.Fatal("file ending in newline should reopen untorn")
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
