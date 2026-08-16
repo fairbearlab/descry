@@ -11,7 +11,7 @@ import (
 // benchRound measures one full scheduler round over n targets: every target
 // comes due once, is dispatched to the pool, runs a nop check, maps to a
 // CloudEvent, publishes to a nop sink, and reports a Result. It is the
-// before/after companion of the handoff's BenchmarkTick* (one tick() over n
+// before/after companion of the pre-rewrite BenchmarkTick* (one tick() over n
 // targets), driven by the fake clock so a round is exactly one interval.
 //
 // Run: go test -run '^$' -bench 'Round' -benchmem ./runner/
@@ -59,7 +59,7 @@ func BenchmarkRound1000Conc256(b *testing.B) { benchRound(b, 1000, 256) }
 func BenchmarkRound10kTargets(b *testing.B)  { benchRound(b, 10_000, 64) }
 
 // BenchmarkSkipPath measures the skip branch alone: sentinel selection, the
-// disabled Debug log, and the Result send. Expected 0 allocs/op (D23).
+// disabled Debug log, and the Result send. Expected 0 allocs/op.
 func BenchmarkSkipPath(b *testing.B) {
 	r := New(&fakeCheck{}, nopSink{}, event.Config{Source: "bench"}, targetsN(1, "https://example.com"), time.Second, 1)
 	e := r.entries[0]

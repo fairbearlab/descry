@@ -19,7 +19,7 @@
 //	  phase =         │   │               // + started for every finished  │  │
 //	  fnv1a64(URL)    │   │               // entry BEFORE judging due      │  │
 //	  % interval,     │   │  e = heap.peek()  (empty → wait ctx only)      │  │
-//	  next = epoch-   │   │  if e.next-now > e.interval → re-anchor (D19)  │  │
+//	  next = epoch-   │   │  if e.next-now > e.interval → re-anchor        │  │
 //	  aligned slot    │   │  timer.Reset(e.next-now); wait ── timer ──┐    │  │
 //	  (see Phase),    │   │      ▲                                    │    │  │
 //	  inflight=false, │   │      │ done ch ─ clear inflight/started, loop  │  │
@@ -58,8 +58,8 @@
 //
 //	next = now.Truncate(interval) + phase; if next <= now { next += interval }
 //
-// A process restart or a consumer-side runner rebuild at any instant leaves
-// every target on the slot it already had, so phase never drifts across
+// A process restart, or a Runner rebuilt from the same targets, at any instant
+// leaves every target on the slot it already had, so phase never drifts across
 // restarts. Slots that fall inside downtime are lost (a runner cannot make up a
 // slot it was not running for): for a restart shorter than one interval the gap
 // between two observations of one target is at most two intervals. The first

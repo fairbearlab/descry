@@ -13,7 +13,7 @@ import (
 	"github.com/fairbearlab/descry/event"
 )
 
-// The tests here are the scheduler's invariants (PERF-PLAN §3.1, each one a
+// The tests here are the scheduler's invariants (each one a
 // test) driven by the single-timer fake clock in helpers_test.go. Real-clock
 // tests are marked; everything else is deterministic under -race -count=N.
 
@@ -278,7 +278,7 @@ func TestSkip_SlowCheckReportsErrSkipped(t *testing.T) {
 	}
 }
 
-// TestSkip_QueuedReportsErrSkippedQueued (D28): concurrency 1, target A blocks
+// TestSkip_QueuedReportsErrSkippedQueued: concurrency 1, target A blocks
 // the only worker; B is dispatched but sits queued. At the next slot A reports
 // ErrSkipped (started) and B reports ErrSkippedQueued (not started).
 func TestSkip_QueuedReportsErrSkippedQueued(t *testing.T) {
@@ -314,7 +314,7 @@ func TestSkip_QueuedReportsErrSkippedQueued(t *testing.T) {
 	close(chk.gate)
 }
 
-// TestSkip_KOutstanding (D20): a check spanning three intervals produces exactly
+// TestSkip_KOutstanding: a check spanning three intervals produces exactly
 // three ErrSkipped and one completion, and a draining consumer drops nothing.
 func TestSkip_KOutstanding(t *testing.T) {
 	const iv = 10 * time.Second
@@ -363,7 +363,7 @@ func TestStall_OneRunNoSkipFlood(t *testing.T) {
 	}
 }
 
-// TestBackwardStep_ReanchorsWithinOneInterval (D19): after a 1h backward wall
+// TestBackwardStep_ReanchorsWithinOneInterval: after a 1h backward wall
 // step every target fires within one interval, phase is kept, and the guard
 // logs exactly once.
 func TestBackwardStep_ReanchorsWithinOneInterval(t *testing.T) {
@@ -415,7 +415,7 @@ func TestEarlyWake_ReArmsWithoutRunning(t *testing.T) {
 
 // ---------- rebuild continuity ----------
 
-// TestRebuild_Continuity (D13): a runner rebuilt mid-cycle from the same targets
+// TestRebuild_Continuity: a runner rebuilt mid-cycle from the same targets
 // fires each target at the same wall-clock slot the old one would have.
 func TestRebuild_Continuity(t *testing.T) {
 	const iv = 10 * time.Second
@@ -445,7 +445,7 @@ func TestRebuild_Continuity(t *testing.T) {
 	}
 }
 
-// TestRebuild_AcrossSlotBoundary (D26): A stops at slot−ε, B is built at slot+ε.
+// TestRebuild_AcrossSlotBoundary: A stops at slot−ε, B is built at slot+ε.
 // The slot inside downtime is lost; B first fires at slot+interval, so the gap
 // between consecutive observations of that target is exactly two intervals.
 func TestRebuild_AcrossSlotBoundary(t *testing.T) {
@@ -479,7 +479,7 @@ func TestRebuild_AcrossSlotBoundary(t *testing.T) {
 	}
 }
 
-// ---------- false skip (D27) ----------
+// ---------- false skip ----------
 
 // TestFalseSkip_AckBeforeTimerIsNeverSkipped: completion is scheduler receipt of
 // done. A worker that has sent its ack before the slot fires is drained before
@@ -535,7 +535,7 @@ func TestPool_ExactlyConcurrencyWorkers(t *testing.T) {
 	}
 }
 
-// TestShutdown_QueuedEntriesAckedNotRun (D16): with entries queued behind a
+// TestShutdown_QueuedEntriesAckedNotRun: with entries queued behind a
 // busy pool, cancel yields only the in-flight completion — no burst of
 // context.Canceled Results, and queued entries are never run.
 func TestShutdown_QueuedEntriesAckedNotRun(t *testing.T) {
@@ -614,7 +614,7 @@ func TestRun_ShutdownDoesNotRequireResultsDrain(t *testing.T) { // real clock
 
 // ---------- results channel ----------
 
-// TestReportResult_DropCountedAndWarnedOncePerInterval (D20/D25): a full channel
+// TestReportResult_DropCountedAndWarnedOncePerInterval: a full channel
 // counts every drop but warns at most once per runner-default interval.
 func TestReportResult_DropCountedAndWarnedOncePerInterval(t *testing.T) {
 	const iv = 10 * time.Second
@@ -639,7 +639,7 @@ func TestReportResult_DropCountedAndWarnedOncePerInterval(t *testing.T) {
 	}
 }
 
-// TestSkipPath_ZeroAllocs (D11/D23): the skip branch allocates nothing beyond
+// TestSkipPath_ZeroAllocs: the skip branch allocates nothing beyond
 // the Result send — reused timer, pre-built sentinels, LogAttrs with a
 // pre-redacted string on the disabled Debug path.
 func TestSkipPath_ZeroAllocs(t *testing.T) {

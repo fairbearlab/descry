@@ -17,8 +17,8 @@ import (
 	"github.com/fairbearlab/descry/sink"
 )
 
-// This file holds every test double for the runner package (D7): one fake
-// check, the sinks, the single-timer fake clock (D21), a slog capture handler,
+// This file holds every test double for the runner package: one fake
+// check, the sinks, the single-timer fake clock, a slog capture handler,
 // and the newTestRunner harness. Tests set no global state except the slog
 // default (see captureLogs), so nothing here calls t.Parallel.
 
@@ -163,10 +163,10 @@ func (s *alwaysFailSink) Publish(_ context.Context, _ cloudevents.Event) error {
 	return errors.New("sink down")
 }
 
-// --- fake clock (D21) ---
+// --- fake clock ---
 
 // fakeClock is a hand-rolled single-timer clock. The scheduler creates exactly
-// one timer and reuses it (D23); creating a second while one exists panics,
+// one timer and reuses it; creating a second while one exists panics,
 // which turns that design assumption into a regression detector.
 //
 // Advance moves time and fires the timer if its deadline has passed. Step
@@ -175,7 +175,7 @@ func (s *alwaysFailSink) Publish(_ context.Context, _ cloudevents.Event) error {
 // until n (0 or 1) timers are armed — after Advance, BlockUntil(1) means the
 // scheduler has processed everything due and is waiting again.
 //
-// Tripwire (D21): if this needs multi-timer ordering or grows past ~80 lines,
+// Tripwire: if this needs multi-timer ordering or grows past ~80 lines,
 // swap to jonboulle/clockwork behind the same clock/timer interfaces.
 type fakeClock struct {
 	tb      testing.TB

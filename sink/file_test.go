@@ -250,7 +250,7 @@ func TestFileSink_UseAfterClose(t *testing.T) {
 }
 
 // TestFileSink_PublishWritesGoldenLine pins the exact output bytes across the
-// writeLine refactor (D8): marshaled JSON followed by a single '\n', nothing
+// writeLine refactor: marshaled JSON followed by a single '\n', nothing
 // more (the prior `append(b, '\n')` could reallocate but wrote the same
 // bytes; this pins that the byte content is unchanged).
 func TestFileSink_PublishWritesGoldenLine(t *testing.T) {
@@ -286,10 +286,10 @@ func TestFileSink_PublishWritesGoldenLine(t *testing.T) {
 	}
 }
 
-// TestFileSink_PublishAllocs guards the writeLine write path (D8/D11):
+// TestFileSink_PublishAllocs guards the writeLine write path:
 // Publish must not allocate beyond what marshaling the event itself costs.
 // Bound measured 2026-08-16 on go1.26.6 darwin/arm64; re-measure and update
-// if it moves (D18 wording: bounds are "<=" the measured value).
+// if it moves (bounds are "<=" the measured value).
 func TestFileSink_PublishAllocs(t *testing.T) {
 	if raceEnabled {
 		t.Skip("allocation counts are unreliable under -race")
@@ -317,7 +317,7 @@ func TestFileSink_PublishAllocs(t *testing.T) {
 }
 
 // BenchmarkFileSink_Publish is the before/after evidence for the writeLine
-// refactor (D8): run with -benchmem to see allocs/op.
+// refactor: run with -benchmem to see allocs/op.
 func BenchmarkFileSink_Publish(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "events.jsonl")
 	fs, err := NewFileSink(path)

@@ -14,10 +14,11 @@ import (
 	"github.com/fairbearlab/descry/event"
 )
 
-// Scale harness (PERF-PLAN §3.5). Real clock, real goroutines: these measure
+// Scale harness. Real clock, real goroutines: these measure
 // what the scheduler does to a process at 10k targets. Every criterion is
-// printed as PASS/FAIL; nothing is asserted here (D12: PR1 logs, PR2 gates in a
-// dedicated CI job). Skipped under -short and under the race detector.
+// printed as PASS/FAIL; nothing is asserted here — the harness logs these; a
+// CI gate may assert them later in a dedicated CI job. Skipped under -short
+// and under the race detector.
 //
 // Run: go test -run 'TestScale' -v ./runner/
 
@@ -33,7 +34,7 @@ func skipUnlessScale(t *testing.T) {
 }
 
 // slotTracker is the check wrapper that measures start-lateness on the
-// monotonic clock (D30). For each URL it keeps the wall-clock slot the
+// monotonic clock. For each URL it keeps the wall-clock slot the
 // scheduler is expected to fire next (the same phase arithmetic the scheduler
 // uses) and, on each run, records lateness = time.Since(t0) − slot.Sub(t0):
 // the monotonic elapsed time minus the slot's fixed wall offset from t0, so
@@ -109,7 +110,7 @@ func percentiles(ds []time.Duration) (p50, p90, p99, maxD time.Duration) {
 	return p(0.50), p(0.90), p(0.99), ds[len(ds)-1]
 }
 
-// regime is one §3.5 configuration.
+// regime is one scale-harness configuration.
 type regime struct {
 	name        string
 	n           int
@@ -132,7 +133,7 @@ type regimeResult struct {
 	tEnd                    time.Time
 }
 
-// runRegime executes one regime and collects everything the §3.5 table needs.
+// runRegime executes one regime and collects everything the results table needs.
 func runRegime(t *testing.T, rg regime) *regimeResult {
 	t.Helper()
 	targets := targetsN(rg.n, "https://example.com")
@@ -217,7 +218,7 @@ func pf(ok bool) string {
 }
 
 // TestScale_Healthy: 10k targets, 10s interval, 20ms check, concurrency 64.
-// §3.5 criteria: zero skips, Dropped()==0, scheduler-owned goroutines ≤
+// Criteria: zero skips, Dropped()==0, scheduler-owned goroutines ≤
 // concurrency+8; p99 start-lateness printed, never asserted.
 func TestScale_Healthy(t *testing.T) {
 	skipUnlessScale(t)
@@ -230,14 +231,14 @@ func TestScale_Healthy(t *testing.T) {
 	t.Logf("[%s] n=%d interval=%v check=%v conc=%d ran=%v", rg.name, rg.n, rg.interval, rg.checkD, rg.concurrency, res.elapsed.Round(time.Millisecond))
 	t.Logf("[%s] completed=%d skipped=%d (slow=%d queued=%d) dropped=%d", rg.name, res.completed, res.skipped, res.slow, res.queued, res.dropped)
 	t.Logf("[%s] goroutines: idle=%d peak=%d scheduler-owned≈%d (bound conc+8=%d) heapΔ=%dKB", rg.name, res.idleGoroutines, res.peak, schedGoroutines, rg.concurrency+8, res.heapDeltaKB)
-	t.Logf("[%s] start-lateness (monotonic, D30): p50=%v p90=%v p99=%v max=%v samples=%d", rg.name,
+	t.Logf("[%s] start-lateness (monotonic clock): p50=%v p90=%v p99=%v max=%v samples=%d", rg.name,
 		p50.Round(time.Microsecond), p90.Round(time.Microsecond), p99.Round(time.Microsecond), maxL.Round(time.Microsecond), len(res.tracker.lateness))
 	t.Logf("[%s] %s zero skips | %s Dropped()==0 | %s goroutines ≤ conc+8 | (lateness printed only)", rg.name,
 		pf(res.skipped == 0), pf(res.dropped == 0), pf(schedGoroutines <= rg.concurrency+8))
 }
 
 // TestScale_Saturated: 500 targets, 100ms interval, 20ms check, concurrency 64
-// (≈156ms of work per 100ms). §3.5 criteria: accounting identity per target
+// (≈156ms of work per 100ms). Criteria: accounting identity per target
 // (completed + ErrSkipped + ErrSkippedQueued + dropped == slots processed; with
 // a real clock the boundary slot at each end is ±1), Dropped()==0, no
 // starvation (every target runs at least once per two intervals), goroutines
@@ -302,7 +303,7 @@ func TestScale_Saturated(t *testing.T) {
 
 // TestScale_Footprint sweeps 100 / 1k / 10k targets (20ms check, concurrency
 // 64) for one interval and prints peak goroutines and heap growth — the
-// before/after companion of the handoff's TestBurstShape table.
+// before/after companion of the pre-rewrite TestBurstShape table.
 func TestScale_Footprint(t *testing.T) {
 	skipUnlessScale(t)
 	for _, n := range []int{100, 1_000, 10_000} {

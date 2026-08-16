@@ -72,11 +72,9 @@ Pre-1.0, the minor version carries breaking changes.
   allocation-free (`StdoutSink.Publish` 4 → 3 allocs/op, both sinks now at
   `MarshalJSON`'s own floor).
 
-### Unchanged
-
-`runner.New`'s signature, `Results()`, `Skipped()`, the publish retry ladder, the
-`Check` and `EventSink` interfaces, and `EventSink`'s durability contract
-("flushed before `Publish` returns").
+**Unchanged.** `runner.New`'s signature, `Results()`, `Skipped()`, the publish
+retry ladder, the `Check` and `EventSink` interfaces, and `EventSink`'s
+durability contract ("flushed before `Publish` returns").
 
 ## [0.2.1] — 2026-08-14
 

@@ -30,7 +30,7 @@ const (
 )
 
 // ErrorClass is a closed, engine-owned enum. The engine does NOT try to match
-// Node's error_type strings — lossy translation is the adapter's job.
+// a consumer's own `error_type` vocabulary — lossy translation is the adapter's job.
 type ErrorClass string
 
 // The ErrorClass values a Check may report on a failed Observation. Exactly

@@ -20,7 +20,7 @@ Check.Run ──▶ Observation ──▶ event.ToCloudEvent ──▶ EventSink
 ```mermaid
 flowchart LR
   subgraph engine["descry (this module) — generic, consumer-agnostic"]
-    CFG["cmd/descry<br/>YAML config"] --> RUN["runner<br/>(heap scheduler, per-target interval,<br/>phase spread, bounded pool,<br/>per-check timeout, ErrSkipped)"]
+    CFG["cmd/descry<br/>YAML config"] --> RUN["runner<br/>(heap scheduler, per-target interval,<br/>phase spread, bounded pool,<br/>per-check timeout, ErrSkipped/ErrSkippedQueued)"]
     RUN --> CHK["checks/http<br/>(Check.Run → Observation)"]
     CHK --> EVT["event<br/>(Observation → CloudEvent 1.0)"]
     EVT --> SINK["sink: EventSink<br/>(stdout | file in v1)"]

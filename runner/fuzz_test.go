@@ -13,7 +13,7 @@ import (
 	"github.com/fairbearlab/descry/event"
 )
 
-// FuzzScheduler (PERF-PLAN §3.4, D34) drives the scheduler under the fake clock
+// FuzzScheduler drives the scheduler under the fake clock
 // with a decoded script of targets, clock movements and consumer behaviour, and
 // checks it against a *differential* oracle: `shadow` below is an independent
 // model of the scheduler's TIMING ONLY — when a slot is processed, how far next
@@ -238,7 +238,7 @@ func (c *fuzzCheck) snapshot() (calls map[string]int, overlap int) {
 // --- seed corpus ---
 
 // The seeds are built from a readable struct rather than opaque blobs in
-// testdata/fuzz so a reader can see which PERF-PLAN §3.4 scenario each one
+// testdata/fuzz so a reader can see which scenario each one
 // reproduces; `go test -fuzz` still writes crashers to
 // runner/testdata/fuzz/FuzzScheduler as usual.
 type fuzzSeed struct {
@@ -295,7 +295,7 @@ func fuzzSeeds() []fuzzSeed {
 			ops:     []fuzzSeedOp{{0, 0}, {0, 0}, {3, 0}, {0, 0}},
 		},
 		{
-			// Mirrors TestSkip_QueuedReportsErrSkippedQueued (D28): two slow
+			// Mirrors TestSkip_QueuedReportsErrSkippedQueued: two slow
 			// targets against a single worker, so one skip is ErrSkipped and the
 			// other ErrSkippedQueued.
 			name: "queued-skip", concurrency: 1, defIV: 3,
@@ -310,7 +310,7 @@ func fuzzSeeds() []fuzzSeed {
 			ops:     []fuzzSeedOp{{2, 39}, {0, 0}, {0, 0}},
 		},
 		{
-			// Mirrors TestBackwardStep_ReanchorsWithinOneInterval (D19): mixed
+			// Mirrors TestBackwardStep_ReanchorsWithinOneInterval: mixed
 			// intervals, a 1h backward wall step taken before any dispatch exists.
 			name: "backward-step", concurrency: 4, defIV: 3, backStep: 4, pre: 3,
 			targets: []fuzzSeedTarget{
@@ -319,7 +319,7 @@ func fuzzSeeds() []fuzzSeed {
 			ops: []fuzzSeedOp{{0, 0}, {0, 0}, {1, 7}, {0, 0}},
 		},
 		{
-			// Mirrors TestSkip_KOutstanding (D20): a check spanning several
+			// Mirrors TestSkip_KOutstanding: a check spanning several
 			// intervals produces one skip per missed slot, then one completion.
 			name: "k-skips", concurrency: 1, defIV: 3,
 			targets: []fuzzSeedTarget{slow},
@@ -571,7 +571,7 @@ func runFuzzScheduler(t *testing.T, data []byte) {
 	if !now.Equal(sh.now) {
 		t.Fatalf("model clock %v != fake clock %v", sh.now, now)
 	}
-	// (c) bounded next. PERF-PLAN §3.4 states this as now <= next <= now+interval
+	// (c) bounded next. The design invariant is stated as now <= next <= now+interval
 	// after any clock step, which is not what the code guarantees: the re-anchor
 	// guard triggers on the HEAP MINIMUM, so with mixed intervals a short-interval
 	// entry can still be stale on a lap where the earliest entry is not, and it

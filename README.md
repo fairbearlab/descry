@@ -43,6 +43,8 @@ engine's exported types. Read it before adding a typed field to `Observation`.
 `concurrency`, and how the scheduler behaves across restarts and clock steps.
 Read it before wiring up an alarm.
 
+[CHANGELOG.md](CHANGELOG.md) tracks notable changes release over release.
+
 ## 60-second demo (stdout)
 
 ```bash
@@ -54,7 +56,16 @@ go run ./cmd/descry --config example.yaml
 
 Each target can override the top-level `interval` with its own `targets[].interval`
 (e.g. scrape one site every 30s while the rest run on the default 10s) — see
-`example.yaml`. If a target's interval is shorter than the check `timeout`, descry
+`example.yaml`:
+
+```yaml
+targets:
+  - url: https://example.com
+  - url: https://status.example.com
+    interval: 30s      # this target's own cadence; others use the top-level interval
+```
+
+If a target's interval is shorter than the check `timeout`, descry
 logs one startup warning naming it; a slow response on that target will then
 surface as `ErrSkipped` rather than blocking its next slot.
 
@@ -79,7 +90,7 @@ Then run:
 
 ```bash
 go run ./cmd/descry --config example.yaml &
-sleep 15
+sleep 35
 cat events.jsonl   # one valid CloudEvent per line
 ```
 

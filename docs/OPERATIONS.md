@@ -63,7 +63,7 @@ channel and two counters. Nothing is silent.
 | Signal | Type | Means | What to do |
 |---|---|---|---|
 | `Result{Err: nil}` | channel | Check ran, event published | nothing |
-| `Result{Err: <publish or mapping error>}` | channel | The observation could not be delivered: the sink rejected it 3 times, or `event.ToCloudEvent` refused it | your sink or your event config — **not** the target |
+| `Result{Err: <check, mapping, or publish error>}` | channel | The check itself returned an error (only possible with a custom `Check` implementation — the bundled `httpcheck` never returns one), or the observation could not be delivered: `event.ToCloudEvent` refused it, or the sink rejected it up to 3 times (fewer if the context was cancelled mid-retry) | your check, your event config, or your sink — **not** the target |
 | `Result{Err: runner.ErrSkipped}` | channel | Slot skipped: the prior run **had started** and was still running. The check is slower than the target's interval | lengthen that target's interval, or shorten `timeout` |
 | `Result{Err: runner.ErrSkippedQueued}` | channel | Slot skipped: the prior run was still **queued** behind a saturated worker pool and had not started. The pool is too small | raise `concurrency` (see sizing below) |
 | `Runner.Skipped() int64` | counter | Total skipped slots, both kinds | trend it; a nonzero rate in steady state means undersized |
@@ -78,8 +78,9 @@ the SSRF guard is a **successful check of a down target**: the bundled
 on the published event, and returns no error. `httpcheck.Check.Run` never returns
 a non-nil error.
 
-So `Result.Err` is a narrow channel by design — it carries skips, mapping
-failures, and publish failures, and nothing about target health. **Uptime alarms
+So `Result.Err` is a narrow channel by design — it carries skips, check errors
+(from a custom `Check`), mapping failures, and publish failures, and nothing
+about target health. **Uptime alarms
 belong on the events, not on `Results()`.** `Results()` is where you watch the
 *engine*.
 
@@ -118,7 +119,7 @@ without limit. When the buffer is full the runner drops the `Result`, increments
 `Dropped()`, and warns at most once per default interval:
 
 ```
-level=WARN msg="dropping results; results channel full (consumer not draining)" url=... dropped=17
+level=WARN msg="dropping results; results channel full (consumer not draining)" url=... err=... dropped=17
 ```
 
 `Dropped()` is the only path a `Result` can take that is not the channel, and it
@@ -143,7 +144,7 @@ Worked examples, both measured:
 | Fleet | load | `concurrency` | Result |
 |---|---|---|---|
 | 10,000 targets, 10s interval, 20ms p99 | 10000 × 0.02 / 10 = **20** | 64 | zero skips, `Dropped() == 0`, 69 goroutines |
-| 500 targets, 100ms interval, 20ms p99 | 500 × 0.02 / 0.1 = **100** | 64 | 156% oversubscribed → ~35% of slots skipped, mostly `ErrSkippedQueued` |
+| 500 targets, 100ms interval, 20ms p99 | 500 × 0.02 / 0.1 = **100** | 64 | at 156% of capacity → ~35% of slots skipped, mostly `ErrSkippedQueued` |
 
 The second row is what undersizing looks like from the outside: a steady stream
 of `ErrSkippedQueued` and a `Skipped()` counter climbing linearly. That is the
@@ -153,9 +154,9 @@ Upper bound worth knowing: a check that ignores its context holds a worker until
 `timeout` expires, so the pool's worst-case throughput is
 `concurrency / timeout` checks per second. Keep `timeout` tight.
 
-Memory is not the constraint at these sizes — the scheduler heap is ~9 MB at
-10,000 targets and goroutine count stays flat at `concurrency + 1` plus the
-runtime's own.
+Memory is not the constraint at these sizes — the scheduler heap is roughly
+7–9 MB at 10,000 targets (run to run) and goroutine count stays flat at
+`concurrency + 1` plus the runtime's own.
 
 ## The `interval < timeout` warning
 
