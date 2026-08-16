@@ -51,16 +51,35 @@ func TestLoad_ParsesValues(t *testing.T) {
 	}
 }
 
+func TestLoad_TargetInterval(t *testing.T) {
+	p := writeConfig(t, "source: s\ninterval: 30s\ntargets:\n"+
+		"  - url: https://fast.example.com\n    interval: 5s\n"+
+		"  - url: https://default.example.com\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Targets[0].Interval != 5*time.Second {
+		t.Errorf("targets[0].Interval = %v, want 5s", cfg.Targets[0].Interval)
+	}
+	if cfg.Targets[1].Interval != 0 {
+		t.Errorf("targets[1].Interval = %v, want 0 (use config default)", cfg.Targets[1].Interval)
+	}
+}
+
 func TestLoad_Errors(t *testing.T) {
 	cases := map[string]string{
-		"missing source":   "targets:\n  - url: https://x.com\n",
-		"bad sink":         "source: s\nsink: kafka\ntargets:\n  - url: https://x.com\n",
-		"file no path":     "source: s\nsink: file\ntargets:\n  - url: https://x.com\n",
-		"no targets":       "source: s\n",
-		"empty target url": "source: s\ntargets:\n  - url: \"\"\n",
-		"unknown field":    "source: s\nbogus: 1\ntargets:\n  - url: https://x.com\n",
-		"bad interval":     "source: s\ninterval: notaduration\ntargets:\n  - url: https://x.com\n",
-		"bad timeout":      "source: s\ntimeout: notaduration\ntargets:\n  - url: https://x.com\n",
+		"missing source":           "targets:\n  - url: https://x.com\n",
+		"bad sink":                 "source: s\nsink: kafka\ntargets:\n  - url: https://x.com\n",
+		"file no path":             "source: s\nsink: file\ntargets:\n  - url: https://x.com\n",
+		"no targets":               "source: s\n",
+		"empty target url":         "source: s\ntargets:\n  - url: \"\"\n",
+		"unknown field":            "source: s\nbogus: 1\ntargets:\n  - url: https://x.com\n",
+		"bad interval":             "source: s\ninterval: notaduration\ntargets:\n  - url: https://x.com\n",
+		"bad timeout":              "source: s\ntimeout: notaduration\ntargets:\n  - url: https://x.com\n",
+		"bad target interval":      "source: s\ntargets:\n  - url: https://x.com\n    interval: notaduration\n",
+		"negative target interval": "source: s\ntargets:\n  - url: https://x.com\n    interval: -5s\n",
+		"multiple yaml documents":  "source: s\ntargets:\n  - url: https://x.com\n---\ntargets:\n  - url: https://y.com\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

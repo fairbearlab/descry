@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 
@@ -64,5 +65,296 @@ func TestStdoutSink_WriteError(t *testing.T) {
 	s := NewStdoutSink(errWriter{})
 	if err := s.Publish(context.Background(), newTestEvent()); err == nil {
 		t.Fatal("expected write error, got nil")
+	}
+}
+
+// TestStdoutSink_PublishWritesGoldenLine pins the exact output bytes across
+// the writeLine refactor: marshaled JSON followed by a single '\n',
+// nothing more.
+func TestStdoutSink_PublishWritesGoldenLine(t *testing.T) {
+	e := newTestEvent()
+	want, err := e.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, '\n')
+
+	var buf bytes.Buffer
+	s := NewStdoutSink(&buf)
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+// TestStdoutSink_PublishAllocs guards the writeLine write path:
+// Publish must not allocate beyond what marshaling the event itself costs.
+// Bound measured 2026-08-16 on go1.26.6 darwin/arm64; re-measure and update
+// if it moves (bounds are "<=" the measured value).
+func TestStdoutSink_PublishAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation counts are unreliable under -race")
+	}
+	e := newTestEvent()
+	s := NewStdoutSink(io.Discard)
+	got := testing.AllocsPerRun(200, func() {
+		if err := s.Publish(context.Background(), e); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got > 3 {
+		t.Errorf("allocs/op = %v, want <= 3", got)
+	}
+}
+
+// BenchmarkStdoutSink_Publish is the before/after evidence for the writeLine
+// refactor: run with -benchmem to see allocs/op.
+func BenchmarkStdoutSink_Publish(b *testing.B) {
+	e := newTestEvent()
+	s := NewStdoutSink(io.Discard)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := s.Publish(context.Background(), e); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// flakyWriter fails its first n writes and then behaves like a bytes.Buffer.
+type flakyWriter struct {
+	failFirst int
+	calls     int
+	buf       bytes.Buffer
+}
+
+func (w *flakyWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls <= w.failFirst {
+		return 0, errors.New("transient")
+	}
+	return w.buf.Write(p)
+}
+
+// TestStdoutSink_RecoversAfterTransientWriteError: bufio.Writer latches its
+// first error, so without a reset one failed write of the caller's writer
+// would make every later Publish fail too. The sink must report the failed
+// Publish and then succeed on the next one, writing exactly that next line.
+func TestStdoutSink_RecoversAfterTransientWriteError(t *testing.T) {
+	w := &flakyWriter{failFirst: 1}
+	s := NewStdoutSink(w)
+	e := newTestEvent()
+
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("first Publish: expected transient error, got nil")
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatalf("second Publish: expected recovery, got %v", err)
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatalf("third Publish: %v", err)
+	}
+	line, err := e.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte{}, line...), '\n')
+	want = append(want, want...)
+	if got := w.buf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("after recovery output = %q, want exactly two lines %q", got, want)
+	}
+}
+
+// TestWriteLine_DirectWriteError exercises writeLine's own error return (a
+// Write that fails before Flush), not just the flush-time path: with a
+// zero-size buffer bufio writes straight through, so the failing writer is
+// hit inside writeLine.
+func TestWriteLine_DirectWriteError(t *testing.T) {
+	bw := bufio.NewWriterSize(errWriter{}, 16)
+	n, err := writeLine(bw, bytes.Repeat([]byte("x"), 64))
+	if err == nil {
+		t.Fatal("expected write error from writeLine, got nil")
+	}
+	if n != 0 {
+		t.Fatalf("writeLine reported %d bytes handed on a write that accepted none", n)
+	}
+}
+
+// TestWriteLine_LargeLineFlushError: when a large line must first flush what
+// is already buffered and that flush fails, writeLine returns the flush error
+// without touching the line (nothing of it handed to w).
+func TestWriteLine_LargeLineFlushError(t *testing.T) {
+	bw := bufio.NewWriterSize(errWriter{}, 16)
+	if err := bw.WriteByte('\n'); err != nil { // buffered, not yet flushed
+		t.Fatal(err)
+	}
+	n, err := writeLine(bw, bytes.Repeat([]byte("x"), 64))
+	if err == nil {
+		t.Fatal("expected flush error from writeLine, got nil")
+	}
+	if n != 0 {
+		t.Fatalf("writeLine reported %d bytes handed after a failed flush", n)
+	}
+}
+
+// partialWriter accepts the first n bytes of one Write and then fails, the way
+// a regular file behaves on ENOSPC; every later Write succeeds.
+type partialWriter struct {
+	failOnce int // bytes accepted before the one-time failure
+	failed   bool
+	buf      bytes.Buffer
+}
+
+func (w *partialWriter) Write(p []byte) (int, error) {
+	if !w.failed {
+		w.failed = true
+		n := min(w.failOnce, len(p))
+		w.buf.Write(p[:n])
+		return n, errors.New("no space left")
+	}
+	return w.buf.Write(p)
+}
+
+// TestStdoutSink_PartialWriteDoesNotMergeRecords: a partial write leaves a
+// torn fragment in the output. The next successful Publish must terminate the
+// fragment with its own newline so the following record is still a parseable
+// line on its own — every non-empty line after the failure must be valid JSON.
+func TestStdoutSink_PartialWriteDoesNotMergeRecords(t *testing.T) {
+	w := &partialWriter{failOnce: 7}
+	s := NewStdoutSink(w)
+	e := newTestEvent()
+
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("first Publish: expected partial-write error, got nil")
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.Publish(context.Background(), e); err != nil {
+			t.Fatalf("Publish after failure: %v", err)
+		}
+	}
+	lines := bytes.Split(bytes.TrimRight(w.buf.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3 (fragment + 2 records):\n%s", len(lines), w.buf.String())
+	}
+	if !bytes.HasPrefix(lines[0], []byte(`{"specv`)) || json.Valid(lines[0]) {
+		t.Errorf("line 0 should be the torn 7-byte fragment, got %q", lines[0])
+	}
+	for _, l := range lines[1:] {
+		if !json.Valid(l) {
+			t.Errorf("record merged with fragment, not valid JSON: %q", l)
+		}
+	}
+}
+
+// seqWriter scripts the underlying writer: each entry is the number of bytes
+// accepted by one Write call before it fails (-1 = accept everything).
+type seqWriter struct {
+	script []int
+	buf    bytes.Buffer
+}
+
+func (w *seqWriter) Write(p []byte) (int, error) {
+	if len(w.script) == 0 {
+		return w.buf.Write(p)
+	}
+	n := w.script[0]
+	w.script = w.script[1:]
+	if n < 0 {
+		return w.buf.Write(p)
+	}
+	n = min(n, len(p))
+	w.buf.Write(p[:n])
+	return n, errors.New("io failure")
+}
+
+// TestStdoutSink_TornStateStickyAcrossFailures: a partial write followed by a
+// zero-byte failure must not forget the fragment — exactly the runner's retry
+// shape (attempt 1 tears, attempt 2 fails outright, attempt 3 succeeds). The
+// eventual record must still be its own parseable line.
+func TestStdoutSink_TornStateStickyAcrossFailures(t *testing.T) {
+	w := &seqWriter{script: []int{100, 0}} // partial, then zero-byte, then fine
+	s := NewStdoutSink(w)
+	e := newTestEvent()
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("attempt 1: expected partial-write error")
+	}
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("attempt 2: expected zero-byte error")
+	}
+	if !s.torn {
+		t.Fatal("torn must stay set after a zero-byte failure following a partial write")
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatalf("attempt 3: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(w.buf.Bytes(), "\n"), []byte("\n"))
+	last := lines[len(lines)-1]
+	if !json.Valid(last) {
+		t.Fatalf("record merged with the fragment: %q", last)
+	}
+	if len(lines) < 2 || json.Valid(lines[0]) {
+		t.Fatalf("expected the fragment on its own line first, got %q", w.buf.String())
+	}
+}
+
+// countingWriter records how many Write calls it receives.
+type countingWriter struct {
+	calls int
+	buf   bytes.Buffer
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) { w.calls++; return w.buf.Write(p) }
+
+// TestWriteLine_LargeLineIsOneWrite: a line larger than the bufio buffer must
+// reach the underlying writer in a single Write call (JSON and newline
+// together), so concurrent appenders to one file cannot interleave between them.
+func TestWriteLine_LargeLineIsOneWrite(t *testing.T) {
+	cw := &countingWriter{}
+	bw := bufio.NewWriterSize(cw, 64)
+	line := bytes.Repeat([]byte("x"), 200)
+	n, err := writeLine(bw, line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(line)+1 {
+		t.Fatalf("writeLine handed %d bytes, want %d (line + newline)", n, len(line)+1)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if cw.calls != 1 {
+		t.Fatalf("large line took %d Write calls, want 1", cw.calls)
+	}
+	if got := cw.buf.Bytes(); !bytes.Equal(got, append(append([]byte{}, line...), '\n')) {
+		t.Fatalf("bytes differ: %q", got)
+	}
+}
+
+// TestStdoutSink_LargeEventIsOneWrite pins the CHANGELOG guarantee at the
+// Publish boundary, not just in the helper: an event whose JSON exceeds the
+// bufio buffer reaches the underlying writer as one Write call carrying both
+// the JSON and its newline. (publishLine once bypassed writeLine and split
+// them into two calls; this is the regression test.)
+func TestStdoutSink_LargeEventIsOneWrite(t *testing.T) {
+	cw := &countingWriter{}
+	s := NewStdoutSink(cw)
+	e := newTestEvent()
+	big := bytes.Repeat([]byte("y"), 2*s.w.Size())
+	if err := e.SetData(cloudevents.TextPlain, string(big)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if cw.calls != 1 {
+		t.Fatalf("oversize event took %d Write calls, want 1", cw.calls)
+	}
+	out := cw.buf.Bytes()
+	if len(out) <= s.w.Size() || out[len(out)-1] != '\n' {
+		t.Fatalf("output %d bytes, last byte %q; want > buffer size and newline-terminated", len(out), out[len(out)-1])
+	}
+	if !json.Valid(out[:len(out)-1]) {
+		t.Fatal("oversize line is not valid JSON")
 	}
 }

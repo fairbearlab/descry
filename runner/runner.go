@@ -1,10 +1,109 @@
-// Package runner schedules a check.Check against a set of targets on a
-// ticker, bounds concurrency, and publishes the resulting CloudEvents to a
-// sink.EventSink with bounded retry.
+// Package runner schedules a check.Check against a set of targets, each on its
+// own interval, bounds concurrency with a fixed worker pool, and publishes the
+// resulting CloudEvents to a sink.EventSink with bounded retry.
+//
+// # Design
+//
+// One scheduler goroutine owns a min-heap of entries keyed by next fire time
+// and hands due entries to a pool of `concurrency` workers. Scheduler-owned
+// goroutines are therefore O(concurrency), regardless of target count.
+//
+//	                  ┌──────────────────────────────────────────────────────┐
+//	                  │  Runner.Run(ctx)                                     │
+//	                  │                                                      │
+//	New():            │   scheduler goroutine (sole owner of heap + flags)   │
+//	entries[i] =      │   ┌───────────────────────────────────────────────┐  │
+//	 {target,         │   │ timer := clock.NewTimer(0)  // ONE, reused     │  │
+//	  interval,       │   │ loop:                                          │  │
+//	  redacted,       │   │  drainDone()  // non-blocking: clear inflight  │  │
+//	  phase =         │   │               // + started for every finished  │  │
+//	  fnv1a64(URL)    │   │               // entry BEFORE judging due      │  │
+//	  % interval,     │   │  e = heap.peek()  (empty → wait ctx only)      │  │
+//	  next = epoch-   │   │  if e.next-now > e.interval → re-anchor        │  │
+//	  aligned slot    │   │  timer.Reset(e.next-now); wait ── timer ──┐    │  │
+//	  (see Phase),    │   │      ▲                                    │    │  │
+//	  inflight=false, │   │      │ done ch ─ clear inflight/started, loop  │  │
+//	  started=false}  │   │  if now < e.next → loop (early wake, re-arm)   │  │
+//	                  │   │  e = heap top                                  │  │
+//	                  │   │  if e.inflight → skipped++, results <-         │  │
+//	                  │   │     {t, started ? ErrSkipped : ErrSkippedQueued}│ │
+//	                  │   │  else e.inflight = true;                       │  │
+//	                  │   │       select { work <- e | <-ctx.Done: return }│  │
+//	                  │   │  e.next += k·interval  (k = ⌊(now-next)/iv⌋+1) │  │
+//	                  │   │  heap.Fix(e)  (re-sink to its new next)        │  │
+//	                  │   └───────────────┬───────────────────────────────┘  │
+//	                  │                   │ work chan (cap = len(entries))    │
+//	                  │                   ▼                                   │
+//	                  │   worker × concurrency:  for e := range work {        │
+//	                  │       if ctx.Err() != nil { done <- e; continue }     │
+//	                  │       e.started.Store(true)                           │
+//	                  │       runOne(ctx, e)   // check → CloudEvent → Publish│
+//	                  │       done <- e        // cap = len(entries): at most │
+//	                  │       afterDone?()     // one ack per entry (test hook)│
+//	                  │   }                                                   │
+//	                  │                                                      │
+//	                  │  ctx.Done: close(work) → wg.Wait() → close(results)  │
+//	                  └──────────────────────────────────────────────────────┘
+//
+// Ownership: the heap, e.next and e.inflight are touched ONLY by the scheduler
+// goroutine. Workers read e.t / e.redacted (immutable after New) and set
+// e.started (atomic.Bool, read by the scheduler at judgment, cleared by it on
+// done). There is no mutex in the runner: two atomics (per-entry `started`,
+// runner-wide `lastDropWarn`) plus the `skipped`/`dropped` counters.
+//
+// # Phase
+//
+// Each target fires at a stable per-URL offset within its interval:
+// phase = FNV-1a-64(URL) mod interval, anchored to the wall clock:
+//
+//	next = now.Truncate(interval) + phase; if next <= now { next += interval }
+//
+// A process restart, or a Runner rebuilt from the same targets, at any instant
+// leaves every target on the slot it already had, so phase never drifts across
+// restarts. Slots that fall inside downtime are lost (a runner cannot make up a
+// slot it was not running for): for a restart shorter than one interval the gap
+// between two observations of one target is at most two intervals. The first
+// check of each target therefore happens up to one interval after Run starts,
+// not immediately.
+//
+// # Skips
+//
+// A target is never run concurrently with itself (per configured target: two
+// entries with the same URL are independent targets, run and reported
+// separately, and with equal intervals they share a slot). If a target comes due while
+// its prior run is still in flight, that slot is skipped: Skipped() increments
+// and a Result carrying ErrSkipped (prior run had started: the check is slow)
+// or ErrSkippedQueued (prior run was still queued behind a saturated pool) is
+// sent on Results(). The entry's next slot advances by whole intervals, so
+// phase is kept. A stall of any length (host sleep, forward clock step) yields
+// one run and one O(1) reschedule, never a skip flood.
+//
+//	      due & !inflight            worker dequeues           worker finishes,
+//	IDLE ─────────────────▶ QUEUED ─────────────────▶ RUNNING ─────────────────▶ IDLE
+//	 ▲   (inflight=true,      (started=true)              (done <- e; scheduler
+//	 │    work <- e)             │                          clears inflight+started)
+//	 │                           │
+//	 │  due & inflight & !started ─▶ results <- ErrSkippedQueued  ("pool too small")
+//	 │  due & inflight &  started ─▶ results <- ErrSkipped        ("check is slow")
+//	 └── either way: skipped++, next += k·interval, phase kept
+//
+// # Accounting
+//
+// Per target: completed runs + ErrSkipped + ErrSkippedQueued == slots the
+// scheduler processed (a coalesced stall is one processed slot), as long as
+// Dropped() is zero. Dropped() counts Results discarded because Results() was
+// full; it is runner-wide (a dropped Result takes its target with it), so with
+// drops only the fleet-wide sum "+ dropped" is checkable. It is the only path a
+// Result can take that is not on the channel, and it is counted and warned once
+// per runner-default interval.
 package runner
 
 import (
+	"container/heap"
 	"context"
+	"errors"
+	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -22,107 +121,353 @@ const (
 	basePublishBackoff = 100 * time.Millisecond
 )
 
-// Result is the outcome of a single check run.
+// ErrSkipped is reported on Results when a target's slot is skipped because
+// its prior run was still in flight and had already started: the check itself
+// is slower than the target's interval. Test with errors.Is; it also matches
+// ErrSkippedQueued.
+var ErrSkipped = errors.New("runner: slot skipped; prior run still in flight")
+
+// ErrSkippedQueued is reported on Results when a target's slot is skipped
+// because its prior run was still queued behind a saturated worker pool and had
+// not started: the pool is too small for the workload. It wraps ErrSkipped, so
+// errors.Is(err, ErrSkipped) is true for both; check ErrSkippedQueued first
+// when classifying.
+var ErrSkippedQueued = fmt.Errorf("%w: prior run queued behind a saturated pool", ErrSkipped)
+
+// Result is the outcome of a single scheduled slot: a completed run (Err nil or
+// the check/publish error), or a skipped slot (Err is ErrSkipped or
+// ErrSkippedQueued).
 type Result struct {
 	Target check.Target
 	Err    error
 }
 
-// target wraps a check.Target with a per-target mutex for skip-tick detection.
-type target struct {
-	t  check.Target
-	mu sync.Mutex // held while a run is in-flight
+// clock and timer are the scheduler's only sources of time. realClock is the
+// production implementation; tests inject a fake through Runner.clock.
+type clock interface {
+	Now() time.Time
+	NewTimer(d time.Duration) timer
 }
 
-// Runner schedules checks on a ticker, enforces concurrency limits, and
-// publishes CloudEvents to an EventSink.
-type Runner struct {
-	chk      check.Check
-	sink     sink.EventSink
-	evtCfg   event.Config
-	targets  []*target
+type timer interface {
+	C() <-chan time.Time
+	Stop() bool
+	Reset(d time.Duration) bool
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time                 { return time.Now() }
+func (realClock) NewTimer(d time.Duration) timer { return realTimer{time.NewTimer(d)} }
+
+type realTimer struct{ *time.Timer }
+
+func (t realTimer) C() <-chan time.Time { return t.Timer.C }
+
+// entry is one scheduled target. Fields under "scheduler-owned" are read and
+// written only by the scheduler goroutine.
+type entry struct {
+	t        check.Target
 	interval time.Duration
-	sem      chan struct{} // buffered-channel semaphore
-	results  chan Result
-	skipped  atomic.Int64
-	wg       sync.WaitGroup // tracks in-flight runOne goroutines
+	phase    time.Duration // FNV-1a(URL) mod interval
+	redacted string        // check.RedactURL(t.URL), precomputed for the log paths
+
+	// scheduler-owned
+	next     time.Time
+	inflight bool
+
+	// started is set by the worker on dequeue and cleared by the scheduler when
+	// it receives the entry's done ack. It decides ErrSkipped vs ErrSkippedQueued.
+	started atomic.Bool
 }
 
-// New creates a Runner. concurrency must be >= 1.
+// schedHeap is a min-heap of entries keyed by next fire time.
+type schedHeap []*entry
+
+func (h schedHeap) Len() int           { return len(h) }
+func (h schedHeap) Less(i, j int) bool { return h[i].next.Before(h[j].next) }
+func (h schedHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *schedHeap) Push(x any)        { *h = append(*h, x.(*entry)) }
+func (h *schedHeap) Pop() any          { old := *h; n := len(old); e := old[n-1]; *h = old[:n-1]; return e }
+
+// Runner schedules checks on per-target intervals, bounds concurrency with a
+// fixed worker pool, and publishes CloudEvents to an EventSink.
+type Runner struct {
+	chk         check.Check
+	sink        sink.EventSink
+	evtCfg      event.Config
+	entries     []*entry
+	interval    time.Duration // default for targets with Interval <= 0; also the drop-warn rate-limit window
+	concurrency int
+	results     chan Result
+
+	skipped      atomic.Int64
+	dropped      atomic.Int64
+	lastDropWarn atomic.Int64 // unix nanos of the last "results channel full" warning; 0 = never
+	running      atomic.Bool  // Run is single-use; a second call is an error, not a panic
+
+	clock clock
+
+	// afterDone, when non-nil, is called by a worker immediately after it has
+	// sent an entry's done ack. It exists so tests can observe "the ack is on
+	// the channel" deterministically. Always nil in production.
+	afterDone func()
+}
+
+// New creates a Runner. interval is the default cadence for targets whose
+// Interval is <= 0 and must be > 0 (New panics otherwise). concurrency < 1 is
+// treated as 1.
 func New(chk check.Check, s sink.EventSink, evtCfg event.Config, targets []check.Target,
 	interval time.Duration, concurrency int) *Runner {
+	if interval <= 0 {
+		panic(fmt.Sprintf("runner.New: default interval must be > 0, got %v", interval))
+	}
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	ts := make([]*target, len(targets))
+	if concurrency > len(targets) && len(targets) > 0 {
+		// An entry is dispatched only while not in flight, so more workers than
+		// targets can never be busy at once; don't spend goroutines on them.
+		concurrency = len(targets)
+	}
+	entries := make([]*entry, len(targets))
 	for i, t := range targets {
-		ts[i] = &target{t: t}
+		iv := t.Interval
+		if iv <= 0 {
+			iv = interval
+		}
+		entries[i] = &entry{
+			t:        t,
+			interval: iv,
+			phase:    phaseOf(t.URL, iv),
+			redacted: check.RedactURL(t.URL),
+		}
 	}
 	return &Runner{
-		chk:      chk,
-		sink:     s,
-		evtCfg:   evtCfg,
-		targets:  ts,
-		interval: interval,
-		sem:      make(chan struct{}, concurrency),
-		results:  make(chan Result, len(targets)+1),
+		chk:         chk,
+		sink:        s,
+		evtCfg:      evtCfg,
+		entries:     entries,
+		interval:    interval,
+		concurrency: concurrency,
+		// Sized for the steady state: one completion + one skip outstanding per
+		// target. This is a heuristic, not an exactness claim — a check spanning
+		// k intervals has k skips + 1 completion outstanding, and a consumer that
+		// stops draining overflows it by design; that loss is counted in
+		// Dropped() and warned once per default interval.
+		results: make(chan Result, 2*len(targets)+1),
+		clock:   realClock{},
 	}
 }
 
-// Results returns the results channel. Callers should drain it.
+// phaseOf returns the target's stable offset within its interval:
+// FNV-1a-64(url) mod interval. FNV (not hash/maphash) because it is
+// deterministic across processes, which is what makes cadence restart-invariant.
+func phaseOf(url string, interval time.Duration) time.Duration {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(url))
+	return time.Duration(h.Sum64() % uint64(interval)) // #nosec G115 -- interval > 0, result < interval
+}
+
+// slotAfter returns the first wall-clock slot for (interval, phase) strictly
+// after now: now.Truncate(interval) + phase, bumped by one interval if that is
+// not in the future.
+func slotAfter(now time.Time, interval, phase time.Duration) time.Time {
+	next := now.Truncate(interval).Add(phase)
+	if !next.After(now) {
+		next = next.Add(interval)
+	}
+	return next
+}
+
+// Results returns the results channel. Callers should drain it: every
+// completed run and every skipped slot produces one Result, and a full channel
+// drops (see Dropped).
 func (r *Runner) Results() <-chan Result { return r.results }
 
-// Skipped returns the number of ticks skipped due to in-flight runs.
+// Skipped returns the number of slots skipped because the target's prior run
+// was still in flight (both ErrSkipped and ErrSkippedQueued kinds).
 func (r *Runner) Skipped() int64 { return r.skipped.Load() }
 
-// Run starts the ticker loop. It fires once immediately, then on each tick.
+// Dropped returns the number of Results discarded because Results() was full,
+// i.e. the consumer was not draining. Mirrors Skipped.
+func (r *Runner) Dropped() int64 { return r.dropped.Load() }
+
+// Run starts the scheduler and worker pool and blocks until ctx is cancelled.
+// Each target first fires at its phase offset within its interval (up to one
+// interval after Run starts), then every interval on the same wall-clock slot.
 // Returns ctx.Err() when ctx is cancelled — this is not considered fatal.
 //
 // On shutdown it stops dispatching, waits for all in-flight runs to finish, then
-// closes the results channel so a draining consumer can exit cleanly. Waiting for
-// in-flight runs also guarantees no Publish races with a deferred sink Close.
+// closes the results channel so a draining consumer can exit cleanly. Entries
+// that were queued but not yet started are acked, not run. Waiting for in-flight
+// runs also guarantees no Publish races with a deferred sink Close. That wait is
+// unbounded by design: a Check or sink that ignores its context holds shutdown
+// until it returns (the bundled httpcheck honours ctx and its own timeout).
+//
+// Run is single-use: a second call on the same Runner returns an error.
 func (r *Runner) Run(ctx context.Context) error {
-	ticker := time.NewTicker(r.interval)
-	defer ticker.Stop()
-	r.tick(ctx) // fire immediately on start
+	if !r.running.CompareAndSwap(false, true) {
+		return errors.New("runner: Run called more than once on the same Runner")
+	}
+	work := make(chan *entry, len(r.entries))
+	// done is sized so a worker's ack never blocks: an entry is dispatched only
+	// while !inflight, and inflight clears only when the scheduler receives the
+	// ack, so at most one ack per entry is ever outstanding.
+	done := make(chan *entry, len(r.entries))
+
+	var wg sync.WaitGroup
+	for range r.concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.worker(ctx, work, done)
+		}()
+	}
+
+	err := r.schedule(ctx, work, done)
+	close(work)
+	wg.Wait()
+	close(r.results)
+	return err
+}
+
+// schedule is the scheduler goroutine's loop; it is the sole owner of the heap
+// and of every entry's next/inflight.
+func (r *Runner) schedule(ctx context.Context, work chan<- *entry, done <-chan *entry) error {
+	now := r.clock.Now()
+	h := make(schedHeap, len(r.entries))
+	for i, e := range r.entries {
+		e.next = slotAfter(now, e.interval, e.phase)
+		h[i] = e
+	}
+	heap.Init(&h)
+
+	if len(h) == 0 {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	tm := r.clock.NewTimer(time.Hour) // one timer, reused; armed for real on the first lap
+	defer tm.Stop()
+
+	for {
+		// Drain every finished ack before judging anything due, so a target
+		// whose worker acked before the timer fired is never a false skip.
+		r.drainDone(done)
+
+		e := h[0]
+		now = r.clock.Now()
+
+		// Re-anchor guard: a backward wall-clock step leaves next more than one
+		// interval away. The guard is evaluated on the heap top only (O(1) per
+		// lap); if the top is stale the step has happened, and every stale
+		// entry's epoch slot is recomputed in one pass, logged once per step.
+		// Bound: after a step of s, every entry fires within its interval plus
+		// min(s, longest interval) — one interval exactly when the top is stale
+		// (always true for a step longer than the longest interval); with mixed
+		// intervals a shorter-interval entry can wait one extra lap when the
+		// top is not stale. Scanning every entry unconditionally would make
+		// this O(N) per lap on the hot path, which is what the heap avoids.
+		if e.next.Sub(now) > e.interval {
+			n := 0
+			for _, x := range h {
+				if x.next.Sub(now) > x.interval {
+					x.next = slotAfter(now, x.interval, x.phase)
+					n++
+				}
+			}
+			heap.Init(&h)
+			slog.Info("clock stepped back; re-anchored schedule", "targets", n)
+			continue
+		}
+
+		if wait := e.next.Sub(now); wait > 0 {
+			tm.Reset(wait)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case de := <-done:
+				r.finish(de)
+			case <-tm.C():
+				// Loop back: re-read now; an early wake (now < e.next) simply re-arms.
+			}
+			continue
+		}
+
+		// e is due.
+		if e.inflight {
+			r.skip(ctx, e)
+		} else {
+			e.inflight = true
+			select {
+			case work <- e:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		// Advance by whole intervals so phase is kept; O(1) however long the
+		// stall (a clock jump of hours is one run and one reschedule).
+		k := (now.Sub(e.next) / e.interval) + 1
+		e.next = e.next.Add(k * e.interval)
+		if !e.next.After(now) {
+			// Only reachable when now-next saturated time.Duration (a wall
+			// clock centuries off) and k*interval overflowed. Re-derive the
+			// slot from the epoch instead of spinning on a next in the past.
+			e.next = slotAfter(now, e.interval, e.phase)
+		}
+		heap.Fix(&h, 0)
+	}
+}
+
+// skip records a missed slot for an entry whose prior run is still in flight:
+// Skipped() increments and a Result carrying ErrSkipped (prior run had
+// started) or ErrSkippedQueued (still queued) is reported. This path allocates
+// nothing beyond the Result send: pre-built sentinels, and LogAttrs with a
+// pre-redacted string so the disabled Debug path boxes nothing.
+func (r *Runner) skip(ctx context.Context, e *entry) {
+	r.skipped.Add(1)
+	err := ErrSkippedQueued
+	if e.started.Load() {
+		err = ErrSkipped
+	}
+	slog.LogAttrs(ctx, slog.LevelDebug, "skipping slot; prior run in flight",
+		slog.String("url", e.redacted))
+	r.reportResult(Result{Target: e.t, Err: err})
+}
+
+// drainDone consumes every ack currently on done without blocking.
+func (r *Runner) drainDone(done <-chan *entry) {
 	for {
 		select {
-		case <-ctx.Done():
-			r.wg.Wait()
-			close(r.results)
-			return ctx.Err()
-		case <-ticker.C:
-			r.tick(ctx)
+		case e := <-done:
+			r.finish(e)
+		default:
+			return
 		}
 	}
 }
 
-// tick dispatches all targets for one scheduler round. If a target's prior run
-// is still in-flight (TryLock fails), the tick is skipped and the counter is
-// incremented.
-func (r *Runner) tick(ctx context.Context) {
-	for _, tg := range r.targets {
-		if !tg.mu.TryLock() {
-			slog.Warn("skipping tick; prior run in flight", "url", check.RedactURL(tg.t.URL))
-			r.skipped.Add(1)
-			continue
+// finish records that e's run (or its cancelled dispatch) is over.
+func (r *Runner) finish(e *entry) {
+	e.inflight = false
+	e.started.Store(false)
+}
+
+// worker runs entries from work until it is closed. Once ctx is cancelled it
+// acks queued entries without running them, so shutdown produces no burst of
+// context.Canceled Results.
+func (r *Runner) worker(ctx context.Context, work <-chan *entry, done chan<- *entry) {
+	for e := range work {
+		if ctx.Err() == nil {
+			e.started.Store(true)
+			r.runOne(ctx, e.t)
 		}
-		r.wg.Add(1)
-		go func(tg *target) {
-			defer func() {
-				tg.mu.Unlock() // mark this target as no longer in-flight
-				r.wg.Done()
-			}()
-			// Acquire a semaphore slot inside the goroutine so a full pool never
-			// blocks tick dispatch. Bail out if shutdown beats us to the slot.
-			select {
-			case r.sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			defer func() { <-r.sem }() // release semaphore slot
-			r.runOne(ctx, tg.t)
-		}(tg)
+		done <- e
+		if r.afterDone != nil {
+			r.afterDone()
+		}
 	}
 }
 
@@ -165,11 +510,22 @@ backoff:
 }
 
 // reportResult is best-effort. Results are useful for diagnostics, but a slow
-// or absent consumer must not block scheduler progress or shutdown.
+// or absent consumer must not block scheduler progress or shutdown. A drop is
+// counted in Dropped() and warned at most once per runner-default interval
+// (no mutex; one atomic CAS on the last-warn timestamp).
 func (r *Runner) reportResult(res Result) {
 	select {
 	case r.results <- res:
+		return
 	default:
-		slog.Warn("dropping result; results channel full", "url", check.RedactURL(res.Target.URL), "err", res.Err)
+	}
+	r.dropped.Add(1)
+	now := r.clock.Now().UnixNano()
+	last := r.lastDropWarn.Load()
+	// now < last: the wall clock stepped back; warn and re-arm rather than
+	// staying silent until the clock catches up to the old stamp.
+	if (last == 0 || now-last >= int64(r.interval) || now < last) && r.lastDropWarn.CompareAndSwap(last, now) {
+		slog.Warn("dropping results; results channel full (consumer not draining)",
+			"url", check.RedactURL(res.Target.URL), "err", res.Err, "dropped", r.dropped.Load())
 	}
 }

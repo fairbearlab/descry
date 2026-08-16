@@ -52,9 +52,19 @@ func FuzzRedactURL(f *testing.F) {
 			return
 		}
 		pw, hasPW := u.User.Password()
+		if !hasPW {
+			// Bare username: it is the secret (token-in-URL shape) and must be
+			// masked unless it was empty or already the mask.
+			if name := u.User.Username(); name != "" && name != "xxxxx" {
+				if u2, err2 := url.Parse(got); err2 != nil || u2.User == nil || u2.User.Username() == name {
+					t.Fatalf("RedactURL(%q) = %q, leaked the bare username", raw, got)
+				}
+			}
+			return
+		}
 		// url.Redacted() substitutes the literal "xxxxx"; a password that is
 		// already "xxxxx" is indistinguishable from a successful redaction.
-		if !hasPW || pw == "" || pw == "xxxxx" {
+		if pw == "" || pw == "xxxxx" {
 			return
 		}
 

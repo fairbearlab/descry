@@ -38,6 +38,13 @@ contract: what the engine owns and never delegates, what a consumer owns, and th
 litmus test for whether a proposed change leaks consumer specifics into the
 engine's exported types. Read it before adding a typed field to `Observation`.
 
+[docs/OPERATIONS.md](docs/OPERATIONS.md) is the operator's half: what
+`ErrSkipped`, `ErrSkippedQueued`, `Skipped()` and `Dropped()` mean, how to size
+`concurrency`, and how the scheduler behaves across restarts and clock steps.
+Read it before wiring up an alarm.
+
+[CHANGELOG.md](CHANGELOG.md) tracks notable changes release over release.
+
 ## 60-second demo (stdout)
 
 ```bash
@@ -46,6 +53,29 @@ cd descry
 go run ./cmd/descry --config example.yaml
 # prints CloudEvents 1.0 observations to stdout on the configured interval
 ```
+
+Each target can override the top-level `interval` with its own `targets[].interval`
+(e.g. scrape one site every 30s while the rest run on the default 10s) — see
+`example.yaml`:
+
+```yaml
+targets:
+  - url: https://example.com
+  - url: https://status.example.com
+    interval: 30s      # this target's own cadence; others use the top-level interval
+```
+
+If a target's interval is not longer than the check `timeout`, descry
+logs one startup warning naming it; a slow response on that target will then
+surface as `ErrSkipped` rather than blocking its next slot.
+
+**First fire is not immediate.** Each target starts at a stable per-URL offset
+within its interval (`FNV-1a-64(url) mod interval`, anchored to the wall clock),
+so a large fleet spreads across the interval instead of stampeding, and a target
+keeps its slot across restarts. The practical consequence: the first observation
+of a target arrives up to one interval after startup, so a health or freshness
+gate should allow at least 2× interval. Details and the rest of the cadence
+model are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## File-sink replay demo
 
@@ -60,7 +90,7 @@ Then run:
 
 ```bash
 go run ./cmd/descry --config example.yaml &
-sleep 15
+sleep 35
 cat events.jsonl   # one valid CloudEvent per line
 ```
 

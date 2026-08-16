@@ -2,17 +2,30 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Target is a single monitored URL with opaque labels.
+// Target is a single monitored URL with opaque labels and an optional
+// per-target interval override. Interval zero means "use the config's
+// top-level interval" (which itself rides through to the runner default).
 type Target struct {
-	URL    string            `yaml:"url"`
-	Labels map[string]string `yaml:"labels"`
+	URL      string
+	Labels   map[string]string
+	Interval time.Duration
+}
+
+// rawTarget is the on-disk shape; Interval comes in as a string like the
+// top-level interval/timeout fields.
+type rawTarget struct {
+	URL      string            `yaml:"url"`
+	Labels   map[string]string `yaml:"labels"`
+	Interval string            `yaml:"interval"`
 }
 
 // rawConfig is the on-disk shape; duration fields come in as strings.
@@ -23,7 +36,7 @@ type rawConfig struct {
 	Interval    string            `yaml:"interval"`
 	Timeout     string            `yaml:"timeout"`
 	Concurrency int               `yaml:"concurrency"`
-	Targets     []Target          `yaml:"targets"`
+	Targets     []rawTarget       `yaml:"targets"`
 	Labels      map[string]string `yaml:"labels"` // global labels (unused in v1, reserved)
 }
 
@@ -70,13 +83,21 @@ func Load(path string) (cfg Config, err error) {
 	if err := dec.Decode(&raw); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
+	// One document only: a stray "---" would otherwise silently drop every
+	// target after it.
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return Config{}, fmt.Errorf("decode config: %w", err)
+		}
+		return Config{}, errors.New("decode config: multiple YAML documents; expected exactly one")
+	}
 
 	cfg = Config{
 		Source:      raw.Source,
 		Sink:        raw.Sink,
 		FilePath:    raw.FilePath,
 		Concurrency: raw.Concurrency,
-		Targets:     raw.Targets,
 	}
 
 	// Parse duration strings; fall back to defaults on empty.
@@ -116,13 +137,26 @@ func Load(path string) (cfg Config, err error) {
 	if err := ValidateSink(cfg.Sink, cfg.FilePath); err != nil {
 		return Config{}, err
 	}
-	if len(cfg.Targets) == 0 {
+	if len(raw.Targets) == 0 {
 		return Config{}, fmt.Errorf("at least one target is required")
 	}
-	for i, t := range cfg.Targets {
-		if t.URL == "" {
+	cfg.Targets = make([]Target, len(raw.Targets))
+	for i, rt := range raw.Targets {
+		if rt.URL == "" {
 			return Config{}, fmt.Errorf("target %d: url is required", i)
 		}
+		t := Target{URL: rt.URL, Labels: rt.Labels}
+		if rt.Interval != "" {
+			d, err := time.ParseDuration(rt.Interval)
+			if err != nil {
+				return Config{}, fmt.Errorf("target %d: parse interval %q: %w", i, rt.Interval, err)
+			}
+			if d < 0 {
+				return Config{}, fmt.Errorf("target %d: interval %q must not be negative", i, rt.Interval)
+			}
+			t.Interval = d
+		}
+		cfg.Targets[i] = t
 	}
 
 	return cfg, nil

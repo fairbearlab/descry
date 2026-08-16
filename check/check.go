@@ -11,11 +11,19 @@ import (
 )
 
 // RedactURL masks any userinfo (credentials) in a target URL so it is safe to
-// log. On parse failure it returns the input unchanged.
+// log: a password becomes "xxxxx" (the username stays, as in url.URL.Redacted),
+// and a bare username with no password — the shape of a token-in-URL such as
+// https://<token>@api.example.com — is masked too, since there it is the secret.
+// Query strings are left alone. On parse failure it returns the input unchanged.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return raw
+	}
+	if u.User != nil {
+		if _, hasPW := u.User.Password(); !hasPW && u.User.Username() != "" {
+			u.User = url.User("xxxxx")
+		}
 	}
 	return u.Redacted()
 }
@@ -30,7 +38,7 @@ const (
 )
 
 // ErrorClass is a closed, engine-owned enum. The engine does NOT try to match
-// Node's error_type strings — lossy translation is the adapter's job.
+// a consumer's own `error_type` vocabulary — lossy translation is the adapter's job.
 type ErrorClass string
 
 // The ErrorClass values a Check may report on a failed Observation. Exactly
@@ -49,9 +57,14 @@ const (
 
 // Target is what a Check runs against. Labels are opaque: carried through,
 // never interpreted by the engine.
+//
+// Interval is the cadence at which the runner schedules this target; the
+// cadence rides with the target, as in a Prometheus per-target scrape
+// interval. Zero (or negative) means "use the runner's default interval".
 type Target struct {
-	URL    string
-	Labels map[string]string
+	URL      string
+	Labels   map[string]string
+	Interval time.Duration
 }
 
 // Observation is the generic result of a single Check run.

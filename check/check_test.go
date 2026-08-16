@@ -11,7 +11,8 @@ func TestRedactURL(t *testing.T) {
 		want string
 	}{
 		{"user and password", "https://user:secret@example.com/path?q=1", "https://user:xxxxx@example.com/path?q=1"},
-		{"user only", "https://user@example.com/", "https://user@example.com/"},
+		{"user only (token-in-URL shape) is masked", "https://ghp_token@example.com/", "https://xxxxx@example.com/"},
+		{"already-redacted user only is stable", "https://xxxxx@example.com/", "https://xxxxx@example.com/"},
 		{"no userinfo", "https://example.com/health", "https://example.com/health"},
 		{"empty", "", ""},
 		{"unparseable returned as-is", "http://[::1", "http://[::1"},

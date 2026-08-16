@@ -20,7 +20,7 @@ Check.Run ──▶ Observation ──▶ event.ToCloudEvent ──▶ EventSink
 ```mermaid
 flowchart LR
   subgraph engine["descry (this module) — generic, consumer-agnostic"]
-    CFG["cmd/descry<br/>YAML config"] --> RUN["runner<br/>(bounded pool, per-check<br/>timeout, ticker, skip-tick)"]
+    CFG["cmd/descry<br/>YAML config"] --> RUN["runner<br/>(heap scheduler, per-target interval,<br/>phase spread, bounded pool,<br/>per-check timeout, ErrSkipped/ErrSkippedQueued)"]
     RUN --> CHK["checks/http<br/>(Check.Run → Observation)"]
     CHK --> EVT["event<br/>(Observation → CloudEvent 1.0)"]
     EVT --> SINK["sink: EventSink<br/>(stdout | file in v1)"]
@@ -53,6 +53,32 @@ A genuinely *generic* HTTP output (one any HTTP monitor would emit) may become a
 typed field — that's not a leak. The test is "generic to HTTP monitoring," not
 "needed by my consumer."
 
+### It governs *vocabulary*, not *surface*
+
+Read the "zero changes to exported types" clause as the anti-leak rule it was
+written to be: no tenancy identifiers, no site or account concepts, no
+keyword-matching semantics in engine types. That part is absolute — no
+performance win buys it.
+
+The clause is **not** a promise never to change the exported API. Pre-1.0, a
+change that is the obvious design for a general-purpose uptime engine may take a
+minor version bump and migration notes. The bar is:
+
+> Would an engineer who has never heard of any particular consumer look at this
+> API and call it the obvious design for a general-purpose uptime engine?
+
+A change passes if it is justifiable from prior art and the problem domain alone.
+It fails if the only honest justification is "my consumer needed it." Where a
+non-breaking form is equally natural, prefer it — gratuitous breakage is not a
+benefit. Where breaking is genuinely the better design, take it, bump the minor
+version, write the migration notes, and **update this document** so the contract
+and the code stop disagreeing.
+
+Worked example: `check.Target.Interval` (v0.3.0). Per-target cadence is what
+Prometheus (`scrape_interval` per job), Blackbox Exporter, Uptime Kuma and
+Checkly all expose; it is the standard shape of the domain, it carries no
+consumer vocabulary, and it is additive. It changes surface, not vocabulary. ✅
+
 ## What the engine owns (never delegated)
 
 | Concern | Owned by the engine because… |
@@ -63,6 +89,7 @@ typed field — that's not a leak. The test is "generic to HTTP monitoring," not
 | CloudEvent `id` (ULID) | **Authoritative.** Consumers do not mint their own id; any `(time, id)` cursor a consumer builds uses the engine's id directly. |
 | `time` = `Observation.ObservedAt` | The authoritative timestamp a cursor orders on. |
 | Best-effort produce semantics | Bounded retry, then log + continue; never blocks the scheduler, never silently drops. |
+| Cadence and skip semantics | Per-target interval, wall-clock-anchored phase, and "a target is never run concurrently with itself." A missed slot is reported as `ErrSkipped` / `ErrSkippedQueued`, never swallowed; what to *do* about one is the consumer's call. See [OPERATIONS.md](OPERATIONS.md). |
 | The CloudEvents 1.0 envelope shape | Pinned and snapshot-tested. |
 | SSRF guard (best-effort) | App-layer guard, explicitly **not** a security boundary — see the README Security section. |
 
