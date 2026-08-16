@@ -130,7 +130,10 @@ func main() {
 // wraps it. Under saturation every slot of every target skips, so skip lines
 // are rate-limited to one per target per interval (with a suppressed count on
 // the next line printed) — otherwise a slow stderr would stall this drain, fill
-// Results(), and turn skips into drops. Failures are always printed.
+// Results(), and turn skips into drops. The window is the target's own
+// effective interval (its override, else interval), so a fast target under a
+// slow default is not silenced for several of its own slots. Failures are
+// always printed.
 func drainResults(results <-chan runner.Result, w io.Writer, interval time.Duration, now func() time.Time) int64 {
 	// Diagnostics are best-effort: a failed stderr write is not something this
 	// loop can act on, so write errors are deliberately ignored.
@@ -159,8 +162,12 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 			st = &skipState{}
 			skips[res.Target.URL] = st
 		}
+		window := res.Target.Interval
+		if window <= 0 {
+			window = interval
+		}
 		t := now()
-		if !st.last.IsZero() && t.Sub(st.last) < interval && t.Sub(st.last) >= 0 {
+		if !st.last.IsZero() && t.Sub(st.last) < window && t.Sub(st.last) >= 0 {
 			st.suppressed++
 			continue
 		}

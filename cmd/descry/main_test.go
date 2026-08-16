@@ -186,3 +186,38 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 		t.Errorf("suppressed count not reported:\n%s", s)
 	}
 }
+
+// TestDrainResults_SkipWindowUsesTargetInterval: the rate-limit window is the
+// target's own effective interval, not the top-level default. A 5s target under
+// a 30s default prints again 5s later; a target with no override still uses
+// the default.
+func TestDrainResults_SkipWindowUsesTargetInterval(t *testing.T) {
+	fast := check.Target{URL: "https://fast.example/", Interval: 5 * time.Second}
+	dflt := check.Target{URL: "https://dflt.example/"}
+	clock := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	now := func() time.Time {
+		calls++
+		if calls == 3 { // before the second round: past fast's window, inside dflt's
+			clock = clock.Add(6 * time.Second)
+		}
+		return clock
+	}
+
+	ch := make(chan runner.Result, 8)
+	ch <- runner.Result{Target: fast, Err: runner.ErrSkipped} // printed, t=0
+	ch <- runner.Result{Target: dflt, Err: runner.ErrSkipped} // printed, t=0
+	ch <- runner.Result{Target: fast, Err: runner.ErrSkipped} // t=6s: printed again (5s window)
+	ch <- runner.Result{Target: dflt, Err: runner.ErrSkipped} // t=6s: suppressed (30s window)
+	close(ch)
+	var out bytes.Buffer
+	drainResults(ch, &out, 30*time.Second, now)
+
+	s := out.String()
+	if n := strings.Count(s, "check skipped: https://fast.example/"); n != 2 {
+		t.Errorf("fast.example skip lines = %d, want 2 (5s window):\n%s", n, s)
+	}
+	if n := strings.Count(s, "check skipped: https://dflt.example/"); n != 1 {
+		t.Errorf("dflt.example skip lines = %d, want 1 (30s default window):\n%s", n, s)
+	}
+}
