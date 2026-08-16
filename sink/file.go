@@ -17,9 +17,10 @@ import (
 // FileSink is an append-only JSONL event sink (one CloudEvent per line).
 // It is concurrency-safe via an internal mutex.
 type FileSink struct {
-	mu sync.Mutex
-	f  *os.File
-	w  *bufio.Writer
+	mu   sync.Mutex
+	f    *os.File
+	w    *bufio.Writer
+	torn bool // last write failed and may have left a partial line; see publishLine
 }
 
 // NewFileSink opens (or creates) path in append mode and returns a FileSink.
@@ -48,10 +49,7 @@ func (s *FileSink) Publish(_ context.Context, e cloudevents.Event) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := writeLine(s.w, b); err != nil {
-		return err
-	}
-	return s.w.Flush() // no fsync by default
+	return publishLine(s.w, s.f, &s.torn, b) // flushed, no fsync by default
 }
 
 // Close flushes any buffered data and closes the underlying file. The file is

@@ -121,3 +121,107 @@ func BenchmarkStdoutSink_Publish(b *testing.B) {
 		}
 	}
 }
+
+// flakyWriter fails its first n writes and then behaves like a bytes.Buffer.
+type flakyWriter struct {
+	failFirst int
+	calls     int
+	buf       bytes.Buffer
+}
+
+func (w *flakyWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls <= w.failFirst {
+		return 0, errors.New("transient")
+	}
+	return w.buf.Write(p)
+}
+
+// TestStdoutSink_RecoversAfterTransientWriteError: bufio.Writer latches its
+// first error, so without a reset one failed write of the caller's writer
+// would make every later Publish fail too. The sink must report the failed
+// Publish and then succeed on the next one, writing exactly that next line.
+func TestStdoutSink_RecoversAfterTransientWriteError(t *testing.T) {
+	w := &flakyWriter{failFirst: 1}
+	s := NewStdoutSink(w)
+	e := newTestEvent()
+
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("first Publish: expected transient error, got nil")
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatalf("second Publish: expected recovery, got %v", err)
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatalf("third Publish: %v", err)
+	}
+	line, err := e.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte{}, line...), '\n')
+	want = append(want, want...)
+	if got := w.buf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("after recovery output = %q, want exactly two lines %q", got, want)
+	}
+}
+
+// TestWriteLine_DirectWriteError exercises writeLine's own error return (a
+// Write that fails before Flush), not just the flush-time path: with a
+// zero-size buffer bufio writes straight through, so the failing writer is
+// hit inside writeLine.
+func TestWriteLine_DirectWriteError(t *testing.T) {
+	bw := bufio.NewWriterSize(errWriter{}, 16)
+	if err := writeLine(bw, bytes.Repeat([]byte("x"), 64)); err == nil {
+		t.Fatal("expected write error from writeLine, got nil")
+	}
+}
+
+// partialWriter accepts the first n bytes of one Write and then fails, the way
+// a regular file behaves on ENOSPC; every later Write succeeds.
+type partialWriter struct {
+	failOnce int // bytes accepted before the one-time failure
+	failed   bool
+	buf      bytes.Buffer
+}
+
+func (w *partialWriter) Write(p []byte) (int, error) {
+	if !w.failed {
+		w.failed = true
+		n := min(w.failOnce, len(p))
+		w.buf.Write(p[:n])
+		return n, errors.New("no space left")
+	}
+	return w.buf.Write(p)
+}
+
+// TestStdoutSink_PartialWriteDoesNotMergeRecords: a partial write leaves a
+// torn fragment in the output. The next successful Publish must terminate the
+// fragment with its own newline so the following record is still a parseable
+// line on its own — every non-empty line after the failure must be valid JSON.
+func TestStdoutSink_PartialWriteDoesNotMergeRecords(t *testing.T) {
+	w := &partialWriter{failOnce: 7}
+	s := NewStdoutSink(w)
+	e := newTestEvent()
+
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("first Publish: expected partial-write error, got nil")
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.Publish(context.Background(), e); err != nil {
+			t.Fatalf("Publish after failure: %v", err)
+		}
+	}
+	lines := bytes.Split(bytes.TrimRight(w.buf.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3 (fragment + 2 records):\n%s", len(lines), w.buf.String())
+	}
+	if !bytes.HasPrefix(lines[0], []byte(`{"specv`)) || json.Valid(lines[0]) {
+		t.Errorf("line 0 should be the torn 7-byte fragment, got %q", lines[0])
+	}
+	for _, l := range lines[1:] {
+		if !json.Valid(l) {
+			t.Errorf("record merged with fragment, not valid JSON: %q", l)
+		}
+	}
+}
