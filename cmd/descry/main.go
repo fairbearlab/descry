@@ -149,9 +149,10 @@ func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
 			log.Warn("duplicate target URL; each entry is probed independently",
 				"url", check.RedactURL(t.URL))
 		}
-		lbl := t.Labels
-		if lbl == nil {
-			lbl = map[string]string{}
+		// Copy the labels: the engine target must not alias the config's map.
+		lbl := make(map[string]string, len(t.Labels)+1)
+		for k, v := range t.Labels {
+			lbl[k] = v
 		}
 		// Ensure the "url" label is always present (used by the CloudEvent subject).
 		if _, ok := lbl["url"]; !ok {

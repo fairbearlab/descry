@@ -79,6 +79,7 @@ func TestLoad_Errors(t *testing.T) {
 		"bad timeout":              "source: s\ntimeout: notaduration\ntargets:\n  - url: https://x.com\n",
 		"bad target interval":      "source: s\ntargets:\n  - url: https://x.com\n    interval: notaduration\n",
 		"negative target interval": "source: s\ntargets:\n  - url: https://x.com\n    interval: -5s\n",
+		"multiple yaml documents":  "source: s\ntargets:\n  - url: https://x.com\n---\ntargets:\n  - url: https://y.com\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

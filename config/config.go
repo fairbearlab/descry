@@ -2,7 +2,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -80,6 +82,15 @@ func Load(path string) (cfg Config, err error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&raw); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
+	}
+	// One document only: a stray "---" would otherwise silently drop every
+	// target after it.
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return Config{}, fmt.Errorf("decode config: %w", err)
+		}
+		return Config{}, errors.New("decode config: multiple YAML documents; expected exactly one")
 	}
 
 	cfg = Config{
