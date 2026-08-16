@@ -38,6 +38,11 @@ contract: what the engine owns and never delegates, what a consumer owns, and th
 litmus test for whether a proposed change leaks consumer specifics into the
 engine's exported types. Read it before adding a typed field to `Observation`.
 
+[docs/OPERATIONS.md](docs/OPERATIONS.md) is the operator's half: what
+`ErrSkipped`, `ErrSkippedQueued`, `Skipped()` and `Dropped()` mean, how to size
+`concurrency`, and how the scheduler behaves across restarts and clock steps.
+Read it before wiring up an alarm.
+
 ## 60-second demo (stdout)
 
 ```bash
@@ -52,6 +57,14 @@ Each target can override the top-level `interval` with its own `targets[].interv
 `example.yaml`. If a target's interval is shorter than the check `timeout`, descry
 logs one startup warning naming it; a slow response on that target will then
 surface as `ErrSkipped` rather than blocking its next slot.
+
+**First fire is not immediate.** Each target starts at a stable per-URL offset
+within its interval (`FNV-1a-64(url) mod interval`, anchored to the wall clock),
+so a large fleet spreads across the interval instead of stampeding, and a target
+keeps its slot across restarts. The practical consequence: the first observation
+of a target arrives up to one interval after startup, so a health or freshness
+gate should allow at least 2× interval. Details and the rest of the cadence
+model are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## File-sink replay demo
 
