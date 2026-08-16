@@ -11,11 +11,19 @@ import (
 )
 
 // RedactURL masks any userinfo (credentials) in a target URL so it is safe to
-// log. On parse failure it returns the input unchanged.
+// log: a password becomes "xxxxx" (the username stays, as in url.URL.Redacted),
+// and a bare username with no password — the shape of a token-in-URL such as
+// https://<token>@api.example.com — is masked too, since there it is the secret.
+// Query strings are left alone. On parse failure it returns the input unchanged.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return raw
+	}
+	if u.User != nil {
+		if _, hasPW := u.User.Password(); !hasPW && u.User.Username() != "" {
+			u.User = url.User("xxxxx")
+		}
 	}
 	return u.Redacted()
 }
