@@ -385,3 +385,48 @@ func TestFileSink_ReopenTerminatesTornTail(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestNewFileSink_WriteOnlyExistingFile: an existing sink file that grants
+// write but not read permission (mode 0200) must still open — the sink only
+// needs to write, and NewFileSink chmods to 0600 before it inspects the tail.
+// Opening O_RDWR would have failed here before the chmod could run.
+func TestNewFileSink_WriteOnlyExistingFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits")
+	}
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	if err := os.WriteFile(path, []byte(`{"torn":`), 0o200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(path); err == nil {
+		t.Skip("filesystem does not enforce a write-only mode; nothing to test")
+	}
+	s, err := NewFileSink(path)
+	if err != nil {
+		t.Fatalf("NewFileSink on a write-only existing file: %v", err)
+	}
+	if !s.torn {
+		t.Fatal("write-only file with an unterminated tail should start torn")
+	}
+	if err := s.Publish(context.Background(), newTestEvent()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %o, want 0600 after tightening", st.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	if len(lines) != 2 || !json.Valid(lines[1]) {
+		t.Fatalf("want [fragment, record], got %d lines:\n%s", len(lines), data)
+	}
+}
