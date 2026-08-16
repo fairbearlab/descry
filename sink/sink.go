@@ -15,9 +15,10 @@ type EventSink interface {
 	Publish(ctx context.Context, e cloudevents.Event) error
 }
 
-// writeLine writes b followed by a newline to w. It writes b directly (no
-// append-triggered reallocation) and the newline as a single byte. Callers are
-// responsible for any locking and flushing.
+// writeLine writes b followed by a newline to w and reports how many bytes it
+// handed to w (b's bytes plus the newline, on full success). It writes b
+// directly (no append-triggered reallocation) and the newline as a single
+// byte. Callers are responsible for any locking and flushing.
 //
 // A line larger than the buffer is the exception: bufio would hand b straight
 // to the underlying writer and buffer the newline for the following flush,
@@ -26,20 +27,23 @@ type EventSink interface {
 // append(b, '\n') so it stays a single write; MarshalJSON's slice usually has
 // the spare byte, and when it does not, the reallocation is the price of a
 // line that big.
-func writeLine(w *bufio.Writer, b []byte) error {
+func writeLine(w *bufio.Writer, b []byte) (int, error) {
 	if len(b)+1 > w.Available() {
 		if w.Buffered() > 0 {
 			if err := w.Flush(); err != nil {
-				return err
+				return 0, err
 			}
 		}
-		_, err := w.Write(append(b, '\n'))
-		return err
+		return w.Write(append(b, '\n'))
 	}
-	if _, err := w.Write(b); err != nil {
-		return err
+	n, err := w.Write(b)
+	if err != nil {
+		return n, err
 	}
-	return w.WriteByte('\n')
+	if err := w.WriteByte('\n'); err != nil {
+		return n, err
+	}
+	return n + 1, nil
 }
 
 // publishLine writes b as one line through w and flushes it. On any error the
@@ -68,13 +72,8 @@ func publishLine(w *bufio.Writer, resetTo io.Writer, torn *bool, b []byte) error
 	}
 	if err == nil {
 		var n int
-		n, err = w.Write(b)
+		n, err = writeLine(w, b) // one write call for a line larger than the buffer
 		handed += n
-	}
-	if err == nil {
-		if err = w.WriteByte('\n'); err == nil {
-			handed++
-		}
 	}
 	if err == nil {
 		err = w.Flush()

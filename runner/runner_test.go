@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"log/slog"
@@ -97,6 +98,35 @@ func TestPhase_DeterministicBoundedAndFNV(t *testing.T) {
 	// is what makes cadence restart-invariant (hash/maphash would not be).
 	if got := phaseOf("https://example.com/x", 10*time.Second); got != 5_857_744_516*time.Nanosecond {
 		t.Fatalf("phaseOf pinned value changed: %v — the hash is no longer FNV-1a-64", got)
+	}
+}
+
+// TestSchedHeap_PushPopOrder: schedHeap satisfies heap.Interface in full. The
+// scheduler itself only uses Init/Fix, so Push/Pop are otherwise unexercised;
+// this pins that they keep the min-next ordering rather than silently rotting.
+func TestSchedHeap_PushPopOrder(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	h := &schedHeap{}
+	heap.Init(h)
+	for _, off := range []time.Duration{5 * time.Second, time.Second, 3 * time.Second, 0, 4 * time.Second} {
+		heap.Push(h, &entry{next: base.Add(off)})
+	}
+	if h.Len() != 5 {
+		t.Fatalf("Len after 5 pushes = %d", h.Len())
+	}
+	prev := time.Time{}
+	for h.Len() > 0 {
+		e, ok := heap.Pop(h).(*entry)
+		if !ok {
+			t.Fatal("Pop did not return *entry")
+		}
+		if e.next.Before(prev) {
+			t.Fatalf("Pop order broken: %v after %v", e.next, prev)
+		}
+		prev = e.next
+	}
+	if prev != base.Add(5*time.Second) {
+		t.Fatalf("last popped = %v, want the max %v", prev, base.Add(5*time.Second))
 	}
 }
 

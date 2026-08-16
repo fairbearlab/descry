@@ -172,8 +172,29 @@ func TestStdoutSink_RecoversAfterTransientWriteError(t *testing.T) {
 // hit inside writeLine.
 func TestWriteLine_DirectWriteError(t *testing.T) {
 	bw := bufio.NewWriterSize(errWriter{}, 16)
-	if err := writeLine(bw, bytes.Repeat([]byte("x"), 64)); err == nil {
+	n, err := writeLine(bw, bytes.Repeat([]byte("x"), 64))
+	if err == nil {
 		t.Fatal("expected write error from writeLine, got nil")
+	}
+	if n != 0 {
+		t.Fatalf("writeLine reported %d bytes handed on a write that accepted none", n)
+	}
+}
+
+// TestWriteLine_LargeLineFlushError: when a large line must first flush what
+// is already buffered and that flush fails, writeLine returns the flush error
+// without touching the line (nothing of it handed to w).
+func TestWriteLine_LargeLineFlushError(t *testing.T) {
+	bw := bufio.NewWriterSize(errWriter{}, 16)
+	if err := bw.WriteByte('\n'); err != nil { // buffered, not yet flushed
+		t.Fatal(err)
+	}
+	n, err := writeLine(bw, bytes.Repeat([]byte("x"), 64))
+	if err == nil {
+		t.Fatal("expected flush error from writeLine, got nil")
+	}
+	if n != 0 {
+		t.Fatalf("writeLine reported %d bytes handed after a failed flush", n)
 	}
 }
 
@@ -292,8 +313,12 @@ func TestWriteLine_LargeLineIsOneWrite(t *testing.T) {
 	cw := &countingWriter{}
 	bw := bufio.NewWriterSize(cw, 64)
 	line := bytes.Repeat([]byte("x"), 200)
-	if err := writeLine(bw, line); err != nil {
+	n, err := writeLine(bw, line)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if n != len(line)+1 {
+		t.Fatalf("writeLine handed %d bytes, want %d (line + newline)", n, len(line)+1)
 	}
 	if err := bw.Flush(); err != nil {
 		t.Fatal(err)
@@ -303,5 +328,33 @@ func TestWriteLine_LargeLineIsOneWrite(t *testing.T) {
 	}
 	if got := cw.buf.Bytes(); !bytes.Equal(got, append(append([]byte{}, line...), '\n')) {
 		t.Fatalf("bytes differ: %q", got)
+	}
+}
+
+// TestStdoutSink_LargeEventIsOneWrite pins the CHANGELOG guarantee at the
+// Publish boundary, not just in the helper: an event whose JSON exceeds the
+// bufio buffer reaches the underlying writer as one Write call carrying both
+// the JSON and its newline. (publishLine once bypassed writeLine and split
+// them into two calls; this is the regression test.)
+func TestStdoutSink_LargeEventIsOneWrite(t *testing.T) {
+	cw := &countingWriter{}
+	s := NewStdoutSink(cw)
+	e := newTestEvent()
+	big := bytes.Repeat([]byte("y"), 2*s.w.Size())
+	if err := e.SetData(cloudevents.TextPlain, string(big)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if cw.calls != 1 {
+		t.Fatalf("oversize event took %d Write calls, want 1", cw.calls)
+	}
+	out := cw.buf.Bytes()
+	if len(out) <= s.w.Size() || out[len(out)-1] != '\n' {
+		t.Fatalf("output %d bytes, last byte %q; want > buffer size and newline-terminated", len(out), out[len(out)-1])
+	}
+	if !json.Valid(out[:len(out)-1]) {
+		t.Fatal("oversize line is not valid JSON")
 	}
 }
