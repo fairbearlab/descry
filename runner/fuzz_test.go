@@ -420,11 +420,18 @@ func runFuzzScheduler(t *testing.T, data []byte) {
 		sh.step(-stepMag)
 	}
 
-	// One guaranteed lap before the script proper. Two reasons, both measured:
-	// without it ~41% of inputs (every input shorter than 6+n bytes decodes to
-	// zero ops) processed no slot at all and every assertion below reduced to
-	// 0 == 0; and a backward step whose observing lap never ran left assertion
-	// (c) with nothing to check but next > now.
+	// Two guaranteed laps before the script proper. Measured reasons: without
+	// a forced lap ~40% of inputs (every input shorter than 6+n bytes decodes
+	// to zero ops) processed no slot at all and every assertion below reduced
+	// to 0 == 0; and a backward step whose observing lap never ran left
+	// assertion (c) with nothing to check but next > now. One lap is not
+	// enough after a backward step: the shadow's armed deadline shifted with
+	// the step but the entries did not, so the first lap lands where the heap
+	// minimum is stale and re-anchors instead of processing a slot (24% of
+	// inputs still zero-slot with one lap). After re-anchoring, next is in
+	// (now, now+interval], so the second lap is guaranteed to hit a real slot.
+	// The forced laps and the tightened (c) bound are load-bearing together.
+	advance(sh.deadline.Sub(sh.now))
 	advance(sh.deadline.Sub(sh.now))
 
 	var gateOnce sync.Once
