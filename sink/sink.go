@@ -27,7 +27,12 @@ type EventSink interface {
 // the spare byte, and when it does not, the reallocation is the price of a
 // line that big.
 func writeLine(w *bufio.Writer, b []byte) error {
-	if len(b)+1 > w.Available() && w.Buffered() == 0 {
+	if len(b)+1 > w.Available() {
+		if w.Buffered() > 0 {
+			if err := w.Flush(); err != nil {
+				return err
+			}
+		}
 		_, err := w.Write(append(b, '\n'))
 		return err
 	}

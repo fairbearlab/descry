@@ -41,7 +41,10 @@ Pre-1.0, the minor version carries breaking changes.
   more than once (duplicates are independent targets to the runner), and now
   waits for the results drain to finish before exiting so the last buffered
   diagnostics reach stderr; a second Ctrl-C after the first terminates the
-  process even if a check or sink ignores its context.
+  process even if a check or sink ignores its context. Its per-skip stderr
+  lines are rate-limited to one per target per interval (with the suppressed
+  count on the next line), so a saturated fleet cannot stall the drain on a
+  slow stderr; failures always print.
 - `runner.New` caps `concurrency` at the number of targets (more workers than
   targets can never be busy at once). `Run` is single-use: a second call on the
   same `Runner` returns an error instead of panicking on the closed results

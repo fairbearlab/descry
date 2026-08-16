@@ -8,11 +8,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/fairbearlab/descry/check"
 	httpcheck "github.com/fairbearlab/descry/checks/http"
@@ -97,24 +99,12 @@ func main() {
 	)
 
 	// Drain results to stderr + count failures. The goroutine exits when the
-	// runner closes the results channel during shutdown. Skipped slots are
-	// not check failures (the scheduler chose not to run, not a bad probe);
-	// check ErrSkippedQueued before ErrSkipped since it wraps ErrSkipped.
+	// runner closes the results channel during shutdown.
 	var failures atomic.Int64
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		for res := range r.Results() {
-			switch {
-			case errors.Is(res.Err, runner.ErrSkippedQueued):
-				fmt.Fprintf(os.Stderr, "check skipped: %s: prior run still queued (pool too small)\n", check.RedactURL(res.Target.URL))
-			case errors.Is(res.Err, runner.ErrSkipped):
-				fmt.Fprintf(os.Stderr, "check skipped: %s: prior run still running (slow check)\n", check.RedactURL(res.Target.URL))
-			case res.Err != nil:
-				failures.Add(1)
-				fmt.Fprintf(os.Stderr, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
-			}
-		}
+		failures.Store(drainResults(r.Results(), os.Stderr, cfg.Interval, time.Now))
 	}()
 
 	// Once the first signal has cancelled ctx, restore default signal handling
@@ -131,6 +121,57 @@ func main() {
 	_ = r.Run(ctx)
 	<-drained
 	_ = failures.Load() // available for future exit-code logic
+}
+
+// drainResults prints each Result's diagnostic to w until results is closed
+// and returns the number of check/mapping/publish failures seen. Skipped slots
+// are not check failures (the scheduler chose not to run, not a bad probe) and
+// are printed distinctly; ErrSkippedQueued is tested before ErrSkipped since it
+// wraps it. Under saturation every slot of every target skips, so skip lines
+// are rate-limited to one per target per interval (with a suppressed count on
+// the next line printed) — otherwise a slow stderr would stall this drain, fill
+// Results(), and turn skips into drops. Failures are always printed.
+func drainResults(results <-chan runner.Result, w io.Writer, interval time.Duration, now func() time.Time) int64 {
+	var failures int64
+	type skipState struct {
+		last       time.Time
+		suppressed int
+	}
+	skips := map[string]*skipState{}
+	for res := range results {
+		var reason string
+		switch {
+		case errors.Is(res.Err, runner.ErrSkippedQueued):
+			reason = "prior run still queued (pool too small)"
+		case errors.Is(res.Err, runner.ErrSkipped):
+			reason = "prior run still running (slow check)"
+		case res.Err != nil:
+			failures++
+			fmt.Fprintf(w, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
+			continue
+		default:
+			continue
+		}
+		st, ok := skips[res.Target.URL]
+		if !ok {
+			st = &skipState{}
+			skips[res.Target.URL] = st
+		}
+		t := now()
+		if !st.last.IsZero() && t.Sub(st.last) < interval && t.Sub(st.last) >= 0 {
+			st.suppressed++
+			continue
+		}
+		st.last = t
+		if st.suppressed > 0 {
+			fmt.Fprintf(w, "check skipped: %s: %s (%d more skips for this target since the last line)\n",
+				check.RedactURL(res.Target.URL), reason, st.suppressed)
+			st.suppressed = 0
+		} else {
+			fmt.Fprintf(w, "check skipped: %s: %s\n", check.RedactURL(res.Target.URL), reason)
+		}
+	}
+	return failures
 }
 
 // buildTargets maps config targets to engine targets. It warns once, at

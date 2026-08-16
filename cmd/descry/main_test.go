@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/fairbearlab/descry/check"
 	"github.com/fairbearlab/descry/config"
+	"github.com/fairbearlab/descry/runner"
 )
 
 // TestBuildTargets_WarnsWhenIntervalShorterThanTimeout: exactly one Warn per
@@ -122,5 +125,64 @@ func TestBuildTargets_WarnsOnceForDuplicateURL(t *testing.T) {
 	}
 	if !strings.Contains(out, "dup.example") || strings.Contains(out, "unique.example") || strings.Contains(out, "pw@") {
 		t.Errorf("duplicate warning names the wrong URL or leaks userinfo:\n%s", out)
+	}
+}
+
+// TestDrainResults_RateLimitsSkipsPerTarget: skips print once per target per
+// interval with a suppressed count on the next line; failures always print;
+// nil Results print nothing; the failure count is returned.
+func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
+	ch := make(chan runner.Result, 16)
+	a := check.Target{URL: "https://a.example/"}
+	b := check.Target{URL: "https://b.example/"}
+	clock := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clock }
+
+	ch <- runner.Result{Target: a, Err: runner.ErrSkipped}       // printed
+	ch <- runner.Result{Target: a, Err: runner.ErrSkipped}       // suppressed (same interval)
+	ch <- runner.Result{Target: a, Err: runner.ErrSkippedQueued} // suppressed
+	ch <- runner.Result{Target: b, Err: runner.ErrSkippedQueued} // printed (different target)
+	ch <- runner.Result{Target: a}                               // ok: silent
+	ch <- runner.Result{Target: a, Err: errors.New("publish failed")}
+	close(ch)
+
+	var out bytes.Buffer
+	if got := drainResults(ch, &out, 30*time.Second, now); got != 1 {
+		t.Fatalf("failures = %d, want 1", got)
+	}
+	s := out.String()
+	if n := strings.Count(s, "check skipped: https://a.example/"); n != 1 {
+		t.Errorf("a.example skip lines = %d, want 1 (rate-limited):\n%s", n, s)
+	}
+	if !strings.Contains(s, "check skipped: https://b.example/: prior run still queued") {
+		t.Errorf("b.example queued skip missing:\n%s", s)
+	}
+	if !strings.Contains(s, "check failed: https://a.example/: publish failed") {
+		t.Errorf("failure line missing:\n%s", s)
+	}
+
+	// After the interval passes, the next skip prints again and reports the
+	// suppressed count.
+	ch2 := make(chan runner.Result, 4)
+	ch2 <- runner.Result{Target: a, Err: runner.ErrSkipped}
+	ch2 <- runner.Result{Target: a, Err: runner.ErrSkipped}
+	ch2 <- runner.Result{Target: a, Err: runner.ErrSkipped}
+	close(ch2)
+	out.Reset()
+	calls := 0
+	tick := func() time.Time {
+		calls++
+		if calls == 3 {
+			clock = clock.Add(31 * time.Second)
+		}
+		return clock
+	}
+	drainResults(ch2, &out, 30*time.Second, tick)
+	s = out.String()
+	if n := strings.Count(s, "check skipped:"); n != 2 {
+		t.Fatalf("skip lines across an interval boundary = %d, want 2:\n%s", n, s)
+	}
+	if !strings.Contains(s, "(1 more skips for this target since the last line)") {
+		t.Errorf("suppressed count not reported:\n%s", s)
 	}
 }
