@@ -225,3 +225,83 @@ func TestStdoutSink_PartialWriteDoesNotMergeRecords(t *testing.T) {
 		}
 	}
 }
+
+// seqWriter scripts the underlying writer: each entry is the number of bytes
+// accepted by one Write call before it fails (-1 = accept everything).
+type seqWriter struct {
+	script []int
+	buf    bytes.Buffer
+}
+
+func (w *seqWriter) Write(p []byte) (int, error) {
+	if len(w.script) == 0 {
+		return w.buf.Write(p)
+	}
+	n := w.script[0]
+	w.script = w.script[1:]
+	if n < 0 {
+		return w.buf.Write(p)
+	}
+	n = min(n, len(p))
+	w.buf.Write(p[:n])
+	return n, errors.New("io failure")
+}
+
+// TestStdoutSink_TornStateStickyAcrossFailures: a partial write followed by a
+// zero-byte failure must not forget the fragment — exactly the runner's retry
+// shape (attempt 1 tears, attempt 2 fails outright, attempt 3 succeeds). The
+// eventual record must still be its own parseable line.
+func TestStdoutSink_TornStateStickyAcrossFailures(t *testing.T) {
+	w := &seqWriter{script: []int{100, 0}} // partial, then zero-byte, then fine
+	s := NewStdoutSink(w)
+	e := newTestEvent()
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("attempt 1: expected partial-write error")
+	}
+	if err := s.Publish(context.Background(), e); err == nil {
+		t.Fatal("attempt 2: expected zero-byte error")
+	}
+	if !s.torn {
+		t.Fatal("torn must stay set after a zero-byte failure following a partial write")
+	}
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatalf("attempt 3: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(w.buf.Bytes(), "\n"), []byte("\n"))
+	last := lines[len(lines)-1]
+	if !json.Valid(last) {
+		t.Fatalf("record merged with the fragment: %q", last)
+	}
+	if len(lines) < 2 || json.Valid(lines[0]) {
+		t.Fatalf("expected the fragment on its own line first, got %q", w.buf.String())
+	}
+}
+
+// countingWriter records how many Write calls it receives.
+type countingWriter struct {
+	calls int
+	buf   bytes.Buffer
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) { w.calls++; return w.buf.Write(p) }
+
+// TestWriteLine_LargeLineIsOneWrite: a line larger than the bufio buffer must
+// reach the underlying writer in a single Write call (JSON and newline
+// together), so concurrent appenders to one file cannot interleave between them.
+func TestWriteLine_LargeLineIsOneWrite(t *testing.T) {
+	cw := &countingWriter{}
+	bw := bufio.NewWriterSize(cw, 64)
+	line := bytes.Repeat([]byte("x"), 200)
+	if err := writeLine(bw, line); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if cw.calls != 1 {
+		t.Fatalf("large line took %d Write calls, want 1", cw.calls)
+	}
+	if got := cw.buf.Bytes(); !bytes.Equal(got, append(append([]byte{}, line...), '\n')) {
+		t.Fatalf("bytes differ: %q", got)
+	}
+}

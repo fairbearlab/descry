@@ -338,3 +338,48 @@ func BenchmarkFileSink_Publish(b *testing.B) {
 		}
 	}
 }
+
+// TestFileSink_ReopenTerminatesTornTail: a file whose last line has no newline
+// (a previous process died mid-write) must not have the next record appended
+// onto the fragment. The reopened sink starts torn and its first publish emits
+// the separator first, so every line after the fragment parses.
+func TestFileSink_ReopenTerminatesTornTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	if err := os.WriteFile(path, []byte(`{"specversion":"1.0","id":"01ARZ3ND`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewFileSink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.torn {
+		t.Fatal("reopened sink on a file without a trailing newline should start torn")
+	}
+	if err := s.Publish(context.Background(), newTestEvent()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2 (fragment + record):\n%s", len(lines), data)
+	}
+	if json.Valid(lines[0]) || !json.Valid(lines[1]) {
+		t.Fatalf("expected [fragment, record], got %q / %q", lines[0], lines[1])
+	}
+
+	// A clean file (trailing newline) reopens untorn.
+	s2, err := NewFileSink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if s2.torn {
+		t.Fatal("file ending in newline should reopen untorn")
+	}
+}

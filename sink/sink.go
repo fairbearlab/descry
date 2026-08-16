@@ -15,10 +15,22 @@ type EventSink interface {
 	Publish(ctx context.Context, e cloudevents.Event) error
 }
 
-// writeLine writes b followed by a newline to w. It writes b directly
-// (no append-triggered reallocation) and the newline as a single byte.
-// Callers are responsible for any locking and flushing.
+// writeLine writes b followed by a newline to w. It writes b directly (no
+// append-triggered reallocation) and the newline as a single byte. Callers are
+// responsible for any locking and flushing.
+//
+// A line larger than the buffer is the exception: bufio would hand b straight
+// to the underlying writer and buffer the newline for the following flush,
+// i.e. two write calls, and with several processes appending to one file
+// another writer's line could land between them. Such a line is written as one
+// append(b, '\n') so it stays a single write; MarshalJSON's slice usually has
+// the spare byte, and when it does not, the reallocation is the price of a
+// line that big.
 func writeLine(w *bufio.Writer, b []byte) error {
+	if len(b)+1 > w.Available() && w.Buffered() == 0 {
+		_, err := w.Write(append(b, '\n'))
+		return err
+	}
 	if _, err := w.Write(b); err != nil {
 		return err
 	}
@@ -37,7 +49,10 @@ func writeLine(w *bufio.Writer, b []byte) error {
 // *torn records whether any byte reached the underlying writer, and the next
 // successful publish then first emits a bare '\n' so the fragment is
 // terminated as its own (unparseable, skippable) line instead of swallowing
-// the record that follows it. Callers hold their own lock around the call.
+// the record that follows it. The flag is sticky: it clears only when a
+// publish fully succeeds, so a run of failures (partial, then zero-byte) keeps
+// the obligation until the separator is actually written. Callers hold their
+// own lock around the call.
 func publishLine(w *bufio.Writer, resetTo io.Writer, torn *bool, b []byte) error {
 	handed := 0 // bytes handed to w this call; minus w.Buffered() = bytes delivered
 	var err error
@@ -60,7 +75,7 @@ func publishLine(w *bufio.Writer, resetTo io.Writer, torn *bool, b []byte) error
 		err = w.Flush()
 	}
 	if err != nil {
-		*torn = handed-w.Buffered() > 0
+		*torn = *torn || handed-w.Buffered() > 0
 		w.Reset(resetTo)
 		return err
 	}
