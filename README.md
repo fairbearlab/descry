@@ -47,6 +47,12 @@ go run ./cmd/descry --config example.yaml
 # prints CloudEvents 1.0 observations to stdout on the configured interval
 ```
 
+Each target can override the top-level `interval` with its own `targets[].interval`
+(e.g. scrape one site every 30s while the rest run on the default 10s) — see
+`example.yaml`. If a target's interval is shorter than the check `timeout`, descry
+logs one startup warning naming it; a slow response on that target will then
+surface as `ErrSkipped` rather than blocking its next slot.
+
 ## File-sink replay demo
 
 Edit `example.yaml` to switch the sink:

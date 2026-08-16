@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -80,7 +82,10 @@ func main() {
 		s = fs
 	}
 
-	// Map config targets to engine targets.
+	// Map config targets to engine targets. Warn once at startup for any
+	// target whose effective interval is shorter than the check timeout
+	// (D31): not a Load error (fast sites with tight cadence are legitimate),
+	// but slow responses will surface as ErrSkipped at runtime.
 	targets := make([]check.Target, len(cfg.Targets))
 	for i, t := range cfg.Targets {
 		lbl := t.Labels
@@ -91,7 +96,16 @@ func main() {
 		if _, ok := lbl["url"]; !ok {
 			lbl["url"] = t.URL
 		}
-		targets[i] = check.Target{URL: t.URL, Labels: lbl}
+		targets[i] = check.Target{URL: t.URL, Labels: lbl, Interval: t.Interval}
+
+		effInterval := t.Interval
+		if effInterval <= 0 {
+			effInterval = cfg.Interval
+		}
+		if effInterval < cfg.Timeout {
+			slog.Warn("check timeout exceeds interval; slow responses will surface as ErrSkipped",
+				"url", check.RedactURL(t.URL), "interval", effInterval, "timeout", cfg.Timeout)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -107,11 +121,18 @@ func main() {
 	)
 
 	// Drain results to stderr + count failures. The goroutine exits when the
-	// runner closes the results channel during shutdown.
+	// runner closes the results channel during shutdown. Skipped slots are
+	// not check failures (the scheduler chose not to run, not a bad probe);
+	// check ErrSkippedQueued before ErrSkipped since it wraps ErrSkipped.
 	var failures atomic.Int64
 	go func() {
 		for res := range r.Results() {
-			if res.Err != nil {
+			switch {
+			case errors.Is(res.Err, runner.ErrSkippedQueued):
+				fmt.Fprintf(os.Stderr, "check skipped: %s: prior run still queued (pool too small)\n", check.RedactURL(res.Target.URL))
+			case errors.Is(res.Err, runner.ErrSkipped):
+				fmt.Fprintf(os.Stderr, "check skipped: %s: prior run still running (slow check)\n", check.RedactURL(res.Target.URL))
+			case res.Err != nil:
 				failures.Add(1)
 				fmt.Fprintf(os.Stderr, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
 			}

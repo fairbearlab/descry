@@ -7,3 +7,7 @@ targets:
   - url: https://example.com
     labels:
       env: demo
+  - url: https://status.example.com
+    interval: 30s # overrides the top-level interval for this target only
+    labels:
+      env: demo
