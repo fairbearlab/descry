@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pre-1.0, the minor version carries breaking changes.
 
-## [0.3.0] — unreleased
+## [0.3.0] — 2026-08-16
 
 ### Added
 
@@ -141,7 +141,7 @@ two-layer SSRF guard, and the YAML-configured `descry` binary.
 <!-- Entries for 0.1.0–0.2.1 were reconstructed from git history when this file
      was added in 0.3.0; the GitHub release notes are authoritative for those tags. -->
 
-[0.3.0]: https://github.com/fairbearlab/descry/compare/v0.2.1...HEAD
+[0.3.0]: https://github.com/fairbearlab/descry/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/fairbearlab/descry/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/fairbearlab/descry/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/fairbearlab/descry/compare/v0.1.1...v0.1.2
