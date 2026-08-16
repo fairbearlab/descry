@@ -24,13 +24,13 @@
 //	  (see Phase),    │   │      ▲                                    │    │  │
 //	  inflight=false, │   │      │ done ch ─ clear inflight/started, loop  │  │
 //	  started=false}  │   │  if now < e.next → loop (early wake, re-arm)   │  │
-//	                  │   │  pop e                                         │  │
+//	                  │   │  e = heap top                                  │  │
 //	                  │   │  if e.inflight → skipped++, results <-         │  │
 //	                  │   │     {t, started ? ErrSkipped : ErrSkippedQueued}│ │
 //	                  │   │  else e.inflight = true;                       │  │
 //	                  │   │       select { work <- e | <-ctx.Done: return }│  │
 //	                  │   │  e.next += k·interval  (k = ⌊(now-next)/iv⌋+1) │  │
-//	                  │   │  heap.push(e)                                  │  │
+//	                  │   │  heap.Fix(e)  (re-sink to its new next)        │  │
 //	                  │   └───────────────┬───────────────────────────────┘  │
 //	                  │                   │ work chan (cap = len(entries))    │
 //	                  │                   ▼                                   │
@@ -68,7 +68,9 @@
 //
 // # Skips
 //
-// A target is never run concurrently with itself. If a target comes due while
+// A target is never run concurrently with itself (per configured target: two
+// entries with the same URL are independent targets, run and reported
+// separately, and with equal intervals they share a slot). If a target comes due while
 // its prior run is still in flight, that slot is skipped: Skipped() increments
 // and a Result carrying ErrSkipped (prior run had started: the check is slow)
 // or ErrSkippedQueued (prior run was still queued behind a saturated pool) is
@@ -87,9 +89,11 @@
 //
 // # Accounting
 //
-// Per target: completed runs + ErrSkipped + ErrSkippedQueued + dropped == slots
-// the scheduler processed (a coalesced stall is one processed slot). Dropped()
-// counts Results discarded because Results() was full; it is the only path a
+// Per target: completed runs + ErrSkipped + ErrSkippedQueued == slots the
+// scheduler processed (a coalesced stall is one processed slot), as long as
+// Dropped() is zero. Dropped() counts Results discarded because Results() was
+// full; it is runner-wide (a dropped Result takes its target with it), so with
+// drops only the fleet-wide sum "+ dropped" is checkable. It is the only path a
 // Result can take that is not on the channel, and it is counted and warned once
 // per runner-default interval.
 package runner
@@ -200,6 +204,7 @@ type Runner struct {
 	skipped      atomic.Int64
 	dropped      atomic.Int64
 	lastDropWarn atomic.Int64 // unix nanos of the last "results channel full" warning; 0 = never
+	running      atomic.Bool  // Run is single-use; a second call is an error, not a panic
 
 	clock clock
 
@@ -219,6 +224,11 @@ func New(chk check.Check, s sink.EventSink, evtCfg event.Config, targets []check
 	}
 	if concurrency < 1 {
 		concurrency = 1
+	}
+	if concurrency > len(targets) && len(targets) > 0 {
+		// An entry is dispatched only while not in flight, so more workers than
+		// targets can never be busy at once; don't spend goroutines on them.
+		concurrency = len(targets)
 	}
 	entries := make([]*entry, len(targets))
 	for i, t := range targets {
@@ -291,8 +301,15 @@ func (r *Runner) Dropped() int64 { return r.dropped.Load() }
 // On shutdown it stops dispatching, waits for all in-flight runs to finish, then
 // closes the results channel so a draining consumer can exit cleanly. Entries
 // that were queued but not yet started are acked, not run. Waiting for in-flight
-// runs also guarantees no Publish races with a deferred sink Close.
+// runs also guarantees no Publish races with a deferred sink Close. That wait is
+// unbounded by design: a Check or sink that ignores its context holds shutdown
+// until it returns (the bundled httpcheck honours ctx and its own timeout).
+//
+// Run is single-use: a second call on the same Runner returns an error.
 func (r *Runner) Run(ctx context.Context) error {
+	if !r.running.CompareAndSwap(false, true) {
+		return errors.New("runner: Run called more than once on the same Runner")
+	}
 	work := make(chan *entry, len(r.entries))
 	// done is sized so a worker's ack never blocks: an entry is dispatched only
 	// while !inflight, and inflight clears only when the scheduler receives the
@@ -343,10 +360,15 @@ func (r *Runner) schedule(ctx context.Context, work chan<- *entry, done <-chan *
 		now = r.clock.Now()
 
 		// Re-anchor guard: a backward wall-clock step leaves next more than one
-		// interval away. The heap top is the earliest entry, so if it is stale
-		// the step has happened; recompute every stale entry's epoch slot in
-		// one pass so the stall is bounded to one interval in either direction,
-		// and say so once per step.
+		// interval away. The guard is evaluated on the heap top only (O(1) per
+		// lap); if the top is stale the step has happened, and every stale
+		// entry's epoch slot is recomputed in one pass, logged once per step.
+		// Bound: after a step of s, every entry fires within its interval plus
+		// min(s, longest interval) — one interval exactly when the top is stale
+		// (always true for a step longer than the longest interval); with mixed
+		// intervals a shorter-interval entry can wait one extra lap when the
+		// top is not stale. Scanning every entry unconditionally would make
+		// this O(N) per lap on the hot path, which is what the heap avoids.
 		if e.next.Sub(now) > e.interval {
 			n := 0
 			for _, x := range h {
@@ -389,6 +411,12 @@ func (r *Runner) schedule(ctx context.Context, work chan<- *entry, done <-chan *
 		// stall (a clock jump of hours is one run and one reschedule).
 		k := (now.Sub(e.next) / e.interval) + 1
 		e.next = e.next.Add(k * e.interval)
+		if !e.next.After(now) {
+			// Only reachable when now-next saturated time.Duration (a wall
+			// clock centuries off) and k*interval overflowed. Re-derive the
+			// slot from the epoch instead of spinning on a next in the past.
+			e.next = slotAfter(now, e.interval, e.phase)
+		}
 		heap.Fix(&h, 0)
 	}
 }
@@ -494,7 +522,9 @@ func (r *Runner) reportResult(res Result) {
 	r.dropped.Add(1)
 	now := r.clock.Now().UnixNano()
 	last := r.lastDropWarn.Load()
-	if (last == 0 || now-last >= int64(r.interval)) && r.lastDropWarn.CompareAndSwap(last, now) {
+	// now < last: the wall clock stepped back; warn and re-arm rather than
+	// staying silent until the clock catches up to the old stamp.
+	if (last == 0 || now-last >= int64(r.interval) || now < last) && r.lastDropWarn.CompareAndSwap(last, now) {
 		slog.Warn("dropping results; results channel full (consumer not draining)",
 			"url", check.RedactURL(res.Target.URL), "err", res.Err, "dropped", r.dropped.Load())
 	}

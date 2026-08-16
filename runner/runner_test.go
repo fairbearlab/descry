@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -246,10 +247,12 @@ func TestRun_DuplicateURLsShareAPhaseAndBothRun(t *testing.T) {
 // never overlaps itself, and phase is kept when it fires again.
 func TestSkip_SlowCheckReportsErrSkipped(t *testing.T) {
 	const iv = 10 * time.Second
+	logs := captureLogs(t, slog.LevelDebug)
+	url := "http://user:" + strings.Repeat("pw", 1) + "@slow" // built at runtime: no literal credential in source
 	chk := &fakeCheck{gate: make(chan struct{}), calls: make(chan call, 16)}
-	tr := newTestRunner(t, chk, []check.Target{{URL: "http://slow"}}, iv, 1)
+	tr := newTestRunner(t, chk, []check.Target{{URL: url}}, iv, 1)
 
-	slot := firstSlot("http://slow", iv)
+	slot := firstSlot(url, iv)
 	tr.advanceTo(slot)
 	recvCall(t, chk.calls) // running (started=true)
 
@@ -262,6 +265,24 @@ func TestSkip_SlowCheckReportsErrSkipped(t *testing.T) {
 		t.Fatalf("Skipped() = %d, want 1", tr.Skipped())
 	}
 	expectNoCall(t, chk.calls) // never concurrent with itself
+
+	// The per-skip log is Debug, not Warn (Results is the signal), and it
+	// carries the redacted URL: no userinfo reaches the log.
+	if n := len(logs.records(slog.LevelWarn)); n != 0 {
+		t.Fatalf("skip logged %d Warn records, want 0 (skips are Debug)", n)
+	}
+	dbg := logs.records(slog.LevelDebug)
+	if len(dbg) != 1 {
+		t.Fatalf("skip logged %d Debug records, want 1", len(dbg))
+	}
+	dbg[0].Attrs(func(a slog.Attr) bool {
+		if a.Key == "url" {
+			if v := a.Value.String(); strings.Contains(v, "pw") || !strings.Contains(v, "slow") {
+				t.Errorf("skip log url = %q, want redacted URL naming the target", v)
+			}
+		}
+		return true
+	})
 
 	close(chk.gate)
 	if r := tr.completeOne(t); r.Err != nil {
@@ -705,4 +726,84 @@ func TestFakeClock_SecondTimerPanics(t *testing.T) {
 		}
 	}()
 	fc.NewTimer(time.Second)
+}
+
+// TestRun_SecondCallReturnsError: Run is single-use. A second call must return
+// an error, not panic on close of the already-closed results channel, and must
+// not start a second scheduler over the same heap.
+func TestRun_SecondCallReturnsError(t *testing.T) {
+	r := New(&fakeCheck{}, nopSink{}, event.Config{Source: "test"}, []check.Target{{URL: "http://once"}}, time.Second, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run err = %v, want context.Canceled", err)
+	}
+	if err := r.Run(context.Background()); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("second Run err = %v, want a 'called more than once' error", err)
+	}
+}
+
+// TestNew_ConcurrencyCappedAtTargets: more workers than targets can never be
+// busy at once (an entry is dispatched only while not in flight), so New caps
+// the pool at len(targets); zero targets keeps the requested value.
+func TestNew_ConcurrencyCappedAtTargets(t *testing.T) {
+	two := []check.Target{{URL: "http://a"}, {URL: "http://b"}}
+	if r := New(&fakeCheck{}, nopSink{}, event.Config{Source: "test"}, two, time.Second, 64); r.concurrency != 2 {
+		t.Fatalf("concurrency = %d, want 2 (capped at targets)", r.concurrency)
+	}
+	if r := New(&fakeCheck{}, nopSink{}, event.Config{Source: "test"}, two, time.Second, 1); r.concurrency != 1 {
+		t.Fatalf("concurrency = %d, want 1 (below cap, unchanged)", r.concurrency)
+	}
+}
+
+// TestReportResult_DropWarnSurvivesBackwardClockStep: the drop-warn rate limit
+// is keyed to the wall clock. After a backward step the last-warn stamp lies in
+// the future; the limiter must warn (and re-arm) rather than stay silent until
+// the clock catches up.
+func TestReportResult_DropWarnSurvivesBackwardClockStep(t *testing.T) {
+	const iv = 10 * time.Second
+	logs := captureLogs(t, slog.LevelWarn)
+	fc := newFakeClock(t)
+	r := New(&fakeCheck{}, nopSink{}, event.Config{Source: "test"}, nil, iv, 1) // cap(results) == 1
+	r.clock = fc
+	res := Result{Target: check.Target{URL: "http://drop"}}
+	r.reportResult(res) // fills the buffer
+	r.reportResult(res) // drop 1 → Warn
+	fc.Step(-time.Hour)
+	r.reportResult(res) // drop 2, clock now before the last stamp → must still Warn
+	if got := len(logs.records(slog.LevelWarn)); got != 2 {
+		t.Fatalf("warns after backward step = %d, want 2", got)
+	}
+	r.reportResult(res) // drop 3, inside the re-armed window → rate-limited
+	if got := len(logs.records(slog.LevelWarn)); got != 2 {
+		t.Fatalf("warns inside re-armed window = %d, want 2", got)
+	}
+}
+
+// TestStall_SaturatedDurationSelfHeals: a wall clock centuries ahead saturates
+// time.Time.Sub at the maximum Duration, and k*interval in the O(1) catch-up
+// overflows. The scheduler must re-derive the slot from the epoch instead of
+// leaving next in the past and spinning; the target still fires exactly once
+// per lap and next lands in (now, now+interval].
+func TestStall_SaturatedDurationSelfHeals(t *testing.T) {
+	const iv = 30 * time.Second
+	chk := &fakeCheck{calls: make(chan call, 16)}
+	tr := newTestRunner(t, chk, []check.Target{{URL: "http://far"}}, iv, 1)
+
+	tr.fc.Step(time.Duration(math.MaxInt64)) // wall clock ~292 years ahead; timer deadline moves with it
+	tr.fc.FireEarly()                        // deliver the armed timer: scheduler sees now far past next
+	c := recvCall(t, chk.calls)              // exactly one run
+	tr.awaitAck(t)
+	tr.fc.BlockUntil(1) // scheduler parked again, not spinning
+	expectNoCall(t, chk.calls)
+
+	tr.stop()
+	e := tr.entries[0]
+	now := tr.fc.Now()
+	if !e.next.After(now) || e.next.Sub(now) > iv {
+		t.Fatalf("next = %v after run at %v: want in (now, now+interval]", e.next, c.at)
+	}
+	if got := e.next.Sub(e.next.Truncate(iv)); got != e.phase {
+		t.Fatalf("phase lost: next-truncate = %v, phase = %v", got, e.phase)
+	}
 }
