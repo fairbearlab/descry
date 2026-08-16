@@ -27,15 +27,25 @@ Pre-1.0, the minor version carries breaking changes.
 - `runner.Runner.Dropped() int64` — the count of `Result`s discarded because
   `Results()` was full (the consumer stopped draining). Mirrors `Skipped()`.
   Together they close the accounting identity: per target,
-  `completed + ErrSkipped + ErrSkippedQueued + dropped == slots processed`.
+  `completed + ErrSkipped + ErrSkippedQueued == slots processed` while
+  `Dropped() == 0`, and fleet-wide `+ dropped` otherwise (a dropped `Result`
+  takes its target with it).
 - `docs/OPERATIONS.md` — operator's guide: what each skip kind and counter means,
   how to size `concurrency` from `Σ p99 / interval`, first-fire delay, restart
   gap, the `interval < timeout` warning, and a triage table. Linked from the
   README.
 - `cmd/descry` logs one startup warning per target whose effective interval is
-  shorter than the check `timeout`, naming the target. Not a config error — a
+  not longer than the check `timeout`, naming the target. Not a config error — a
   fast endpoint on a tight cadence is legitimate — but slow responses on that
-  target will surface as `ErrSkipped`.
+  target will surface as `ErrSkipped`. It also warns once per URL that appears
+  more than once (duplicates are independent targets to the runner), and now
+  waits for the results drain to finish before exiting so the last buffered
+  diagnostics reach stderr; a second Ctrl-C after the first terminates the
+  process even if a check or sink ignores its context.
+- `runner.New` caps `concurrency` at the number of targets (more workers than
+  targets can never be busy at once). `Run` is single-use: a second call on the
+  same `Runner` returns an error instead of panicking on the closed results
+  channel.
 
 ### Changed
 
@@ -64,13 +74,17 @@ Pre-1.0, the minor version carries breaking changes.
   saturation the log was a flood. The results-channel-full warning stays at Warn,
   rate-limited to once per default interval.
 - A wall-clock step backward now re-anchors every stale entry in one pass and logs
-  once at Info, bounding the stall to one interval in either direction. A forward
-  step still yields one late run per target and an O(1) catch-up, never a skip
-  flood.
+  once at Info, bounding the stall to one interval plus at most the step size (one
+  interval exactly when the step exceeds the longest interval; see
+  `docs/OPERATIONS.md`). A forward step still yields one late run per target and
+  an O(1) catch-up, never a skip flood.
 - `sink.StdoutSink` buffers its writer internally. The
   "flushed before `Publish` returns" contract is unchanged; the write path is now
   allocation-free (`StdoutSink.Publish` 4 → 3 allocs/op, both sinks now at
-  `MarshalJSON`'s own floor).
+  `MarshalJSON`'s own floor). `StdoutSink` now buffers through a `bufio.Writer`
+  like `FileSink` (still flushed inside the lock before `Publish` returns), and
+  both sinks reset the buffer after a failed write or flush so one transient
+  error of the underlying writer no longer wedges the sink for good.
 
 **Unchanged.** `runner.New`'s signature, `Results()`, `Skipped()`, the publish
 retry ladder, the `Check` and `EventSink` interfaces, and `EventSink`'s

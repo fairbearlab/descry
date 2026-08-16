@@ -56,6 +56,36 @@ goroutine dump from the helper.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** none
 
+### Bounded shutdown grace
+
+**What:** `Run`'s shutdown wait for in-flight runs is unbounded by design: a `Check` or
+sink that ignores its context holds `Run` (and `Results()` open) until it returns. Add an
+optional grace deadline (a functional option or a field on `New`'s successor) after which
+`Run` returns `errors.Join(ctx.Err(), ErrShutdownTimeout)`, logs how many workers were
+still in flight, and does *not* close `Results()` (a straggler could still publish).
+
+**Why:** The bundled `httpcheck` honours ctx and its own timeout, and `cmd/descry` now
+restores default signal handling after the first signal so a second Ctrl-C terminates the
+process. A library user with a custom sink and no such escape hatch would want the bound.
+It changes the "no `Publish` after `Run` returns" guarantee for that path, so it needs its
+own design note and OPERATIONS.md entry, not a drive-by.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** a consumer that needs it
+
+## Config
+
+### Cadence floor
+
+**What:** `config.Load` rejects negative per-target intervals and non-positive top-level
+ones, but nothing stops `interval: 1ns`. A sub-millisecond interval makes the scheduler
+spin (every slot is due before the timer arms) and drives `Skipped()`/`Dropped()` up at
+millions per second with one rate-limited warning. Reject, or clamp with a warning,
+effective intervals below a documented floor (1 ms is generous for a network probe) in
+`config.Load`, and state the floor in OPERATIONS.md next to the sizing formula.
+`runner.New` itself stays permissive — the floor is a CLI/config policy.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
 ## Event
 
 ### Attribute and reduce `ToCloudEvent` allocations
@@ -68,7 +98,7 @@ bottleneck at any realistic workload, but it is the largest per-event allocation
 and an isolated win once CI allocation guards exist to lock it in. Both sinks' `Publish`
 already sit at `MarshalJSON`'s own 3-alloc floor, so this is the remaining per-event cost.
 
-**Context:** `event/event.go` `ToCloudEvent`; benchmark in `event/bench_test.go`. A first
+**Context:** `event/event.go` `ToCloudEvent`; the numbers above came from an ad-hoc benchmark that was not kept — add one at `event/bench_test.go` first. A first
 CPU profile was dominated by GC and scheduler noise, indicating allocation pressure rather
 than a hot loop; the individual sites were never attributed. Likely candidates:
 `Extra`/`Labels` map handling and repeated `SetExtension` calls on the `cloudevents.Event`.

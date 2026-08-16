@@ -14,11 +14,20 @@ Each target fires on its own interval (`targets[].interval`, falling back to the
 top-level `interval`). Within that interval it fires at a stable offset —
 `phase = FNV-1a-64(url) mod interval` — anchored to the wall clock, so 10,000
 targets spread themselves evenly across the interval instead of stampeding on
-every tick, and a target keeps the same slot across process restarts. One
+every tick, and a target keeps the same slot across process restarts. (FNV is a
+spreading hash, not a keyed one: a target list written by someone hostile could
+pick URLs that share a slot. The pool absorbs the burst and any overflow is
+visible as skips — nothing is silent — but if your target list is not your own,
+know that the spread is best-effort.) One
 scheduler goroutine owns a min-heap of next-fire times and hands due targets to a
 fixed pool of `concurrency` workers, so goroutine count is O(concurrency), not
-O(targets). A target is never run concurrently with itself: if it comes due while
-its previous run is still in flight, that slot is **skipped** and reported.
+O(targets) — and never more workers than targets, since a target is dispatched
+only while it is not already in flight. A target is never run concurrently with
+itself: if it comes due while its previous run is still in flight, that slot is
+**skipped** and reported. "Itself" means the configured entry: the same URL
+listed twice is two independent targets, probed and reported separately (with
+equal intervals they share a slot); `descry` warns once per duplicated URL at
+startup.
 
 ### First fire is up to one interval after start
 
@@ -52,8 +61,12 @@ epoch slot, and logs once:
 level=INFO msg="clock stepped back; re-anchored schedule" targets=50
 ```
 
-The stall is bounded to one interval in either direction. Continuous NTP slew is
-absorbed slot by slot and never accumulates.
+The stall is bounded: after a step of `s`, every target fires within its
+interval plus `min(s, longest interval)` — exactly one interval when the step is
+longer than the longest interval (the guard is evaluated on the earliest entry;
+with mixed intervals a shorter-interval target can wait one extra lap when the
+earliest one is not stale). Continuous NTP slew is absorbed slot by slot and
+never accumulates.
 
 ## Signals
 
@@ -123,9 +136,10 @@ level=WARN msg="dropping results; results channel full (consumer not draining)" 
 ```
 
 `Dropped()` is the only path a `Result` can take that is not the channel, and it
-is counted — so `completed + ErrSkipped + ErrSkippedQueued + dropped` equals the
-slots the scheduler processed, per target. If you are exporting one number, make
-it that identity.
+is counted — so `completed + ErrSkipped + ErrSkippedQueued` equals the slots the
+scheduler processed, per target, while `Dropped() == 0`; a dropped `Result` takes
+its target with it, so with drops only the fleet-wide sum `+ dropped` is
+checkable. If you are exporting one number, make it that identity.
 
 ## Sizing `concurrency`
 
@@ -158,10 +172,11 @@ Memory is not the constraint at these sizes — the scheduler heap is roughly
 7–9 MB at 10,000 targets (run to run) and goroutine count stays flat at
 `concurrency + 1` plus the runtime's own.
 
-## The `interval < timeout` warning
+## The `interval <= timeout` warning
 
 At startup, `descry` logs one warning per target whose effective interval is
-shorter than the check `timeout`:
+not longer than the check `timeout` (equal counts: a response that uses its full
+timeout lands exactly on the next slot):
 
 ```
 level=WARN msg="check timeout exceeds interval; slow responses will surface as ErrSkipped" url=... interval=5s timeout=10s
@@ -187,7 +202,10 @@ Fix it by raising that target's `interval` above `timeout`, or by lowering
 | ERROR | `publish failed after retries` | the sink rejected an event 3 times (linear back-off, 100ms × attempt). The observation is lost; the scheduler continues |
 
 Publishing is best-effort by design: bounded retry, then log and continue. The
-scheduler is never blocked by a sink.
+scheduler goroutine is never blocked by a sink — a slow `Publish` holds one
+worker, and the target's later slots surface as `ErrSkipped`. A sink or `Check`
+that ignores its context altogether holds that worker (and, at shutdown, `Run`)
+until it returns; the bundled `httpcheck` honours both.
 
 ## Shutdown
 
@@ -195,7 +213,11 @@ Cancel the context passed to `Run`. The runner stops dispatching, waits for
 in-flight runs to finish, then closes `Results()` so a draining consumer's loop
 exits. Targets that were queued but not yet started are acked without running, so
 shutdown produces no burst of `context.Canceled` results. No `Publish` happens
-after `Run` returns — which is what makes a deferred sink `Close()` safe.
+after `Run` returns — which is what makes a deferred sink `Close()` safe. The wait
+for in-flight runs is unbounded by design (see above); `cmd/descry` restores
+default signal handling once the first signal has been received, so a second
+Ctrl-C terminates the process if a check or sink will not return. A `Runner` is
+single-use: a second `Run` returns an error.
 
 ## Triage quick reference
 
