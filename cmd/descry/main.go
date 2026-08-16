@@ -132,6 +132,8 @@ func main() {
 // the next line printed) — otherwise a slow stderr would stall this drain, fill
 // Results(), and turn skips into drops. Failures are always printed.
 func drainResults(results <-chan runner.Result, w io.Writer, interval time.Duration, now func() time.Time) int64 {
+	// Diagnostics are best-effort: a failed stderr write is not something this
+	// loop can act on, so write errors are deliberately ignored.
 	var failures int64
 	type skipState struct {
 		last       time.Time
@@ -147,7 +149,7 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 			reason = "prior run still running (slow check)"
 		case res.Err != nil:
 			failures++
-			fmt.Fprintf(w, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
+			_, _ = fmt.Fprintf(w, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
 			continue
 		default:
 			continue
@@ -164,11 +166,11 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 		}
 		st.last = t
 		if st.suppressed > 0 {
-			fmt.Fprintf(w, "check skipped: %s: %s (%d more skips for this target since the last line)\n",
+			_, _ = fmt.Fprintf(w, "check skipped: %s: %s (%d more skips for this target since the last line)\n",
 				check.RedactURL(res.Target.URL), reason, st.suppressed)
 			st.suppressed = 0
 		} else {
-			fmt.Fprintf(w, "check skipped: %s: %s\n", check.RedactURL(res.Target.URL), reason)
+			_, _ = fmt.Fprintf(w, "check skipped: %s: %s\n", check.RedactURL(res.Target.URL), reason)
 		}
 	}
 	return failures
