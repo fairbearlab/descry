@@ -101,7 +101,9 @@ func main() {
 	// not check failures (the scheduler chose not to run, not a bad probe);
 	// check ErrSkippedQueued before ErrSkipped since it wraps ErrSkipped.
 	var failures atomic.Int64
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		for res := range r.Results() {
 			switch {
 			case errors.Is(res.Err, runner.ErrSkippedQueued):
@@ -115,19 +117,38 @@ func main() {
 		}
 	}()
 
-	// Run until interrupted. ctx.Err() on shutdown is not fatal.
+	// Once the first signal has cancelled ctx, restore default signal handling
+	// so a second Ctrl-C / SIGTERM terminates the process even if shutdown is
+	// waiting on an in-flight check or a sink that ignores its context.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
+	// Run until interrupted. ctx.Err() on shutdown is not fatal. Run closes
+	// Results() before returning; wait for the drain so the last buffered
+	// diagnostics reach stderr before the process exits.
 	_ = r.Run(ctx)
+	<-drained
 	_ = failures.Load() // available for future exit-code logic
 }
 
 // buildTargets maps config targets to engine targets. It warns once, at
-// startup, for any target whose effective interval is shorter than the check
-// timeout: that is not a Load error (a fast endpoint on a tight cadence is
-// legitimate), but a slow response on such a target cannot finish before its
-// next slot and will surface as ErrSkipped at runtime.
+// startup, for any target whose effective interval is not longer than the
+// check timeout: that is not a Load error (a fast endpoint on a tight cadence
+// is legitimate), but a response that uses its full timeout cannot finish
+// before the next slot and will surface as ErrSkipped at runtime. It also
+// warns once per URL that appears more than once: duplicates are independent
+// targets to the runner (probed and reported separately, sharing a slot when
+// their intervals match), which is rarely what a copy-pasted entry intended.
 func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
 	targets := make([]check.Target, len(cfg.Targets))
+	seen := make(map[string]int, len(cfg.Targets))
 	for i, t := range cfg.Targets {
+		if seen[t.URL]++; seen[t.URL] == 2 {
+			log.Warn("duplicate target URL; each entry is probed independently",
+				"url", check.RedactURL(t.URL))
+		}
 		lbl := t.Labels
 		if lbl == nil {
 			lbl = map[string]string{}
@@ -142,7 +163,7 @@ func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
 		if effInterval <= 0 {
 			effInterval = cfg.Interval
 		}
-		if effInterval < cfg.Timeout {
+		if effInterval <= cfg.Timeout {
 			log.Warn("check timeout exceeds interval; slow responses will surface as ErrSkipped",
 				"url", check.RedactURL(t.URL), "interval", effInterval, "timeout", cfg.Timeout)
 		}
