@@ -375,15 +375,7 @@ func (r *Runner) schedule(ctx context.Context, work chan<- *entry, done <-chan *
 
 		// e is due.
 		if e.inflight {
-			r.skipped.Add(1)
-			err := ErrSkippedQueued
-			if e.started.Load() {
-				err = ErrSkipped
-			}
-			// LogAttrs with a pre-redacted string: the disabled path boxes nothing.
-			slog.LogAttrs(ctx, slog.LevelDebug, "skipping slot; prior run in flight",
-				slog.String("url", e.redacted))
-			r.reportResult(Result{Target: e.t, Err: err})
+			r.skip(ctx, e)
 		} else {
 			e.inflight = true
 			select {
@@ -399,6 +391,22 @@ func (r *Runner) schedule(ctx context.Context, work chan<- *entry, done <-chan *
 		e.next = e.next.Add(k * e.interval)
 		heap.Fix(&h, 0)
 	}
+}
+
+// skip records a missed slot for an entry whose prior run is still in flight:
+// Skipped() increments and a Result carrying ErrSkipped (prior run had
+// started) or ErrSkippedQueued (still queued) is reported. This path allocates
+// nothing beyond the Result send: pre-built sentinels, and LogAttrs with a
+// pre-redacted string so the disabled Debug path boxes nothing.
+func (r *Runner) skip(ctx context.Context, e *entry) {
+	r.skipped.Add(1)
+	err := ErrSkippedQueued
+	if e.started.Load() {
+		err = ErrSkipped
+	}
+	slog.LogAttrs(ctx, slog.LevelDebug, "skipping slot; prior run in flight",
+		slog.String("url", e.redacted))
+	r.reportResult(Result{Target: e.t, Err: err})
 }
 
 // drainDone consumes every ack currently on done without blocking.
