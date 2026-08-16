@@ -2,6 +2,7 @@ package sink
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -245,5 +246,95 @@ func TestFileSink_UseAfterClose(t *testing.T) {
 	}
 	if len(b) != 0 {
 		t.Errorf("file should be empty after use-after-close, got %d bytes", len(b))
+	}
+}
+
+// TestFileSink_PublishWritesGoldenLine pins the exact output bytes across the
+// writeLine refactor (D8): marshaled JSON followed by a single '\n', nothing
+// more (the prior `append(b, '\n')` could reallocate but wrote the same
+// bytes; this pins that the byte content is unchanged).
+func TestFileSink_PublishWritesGoldenLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	fs, err := NewFileSink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e := cloudevents.NewEvent()
+	e.SetID("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	e.SetSource("test")
+	e.SetType("dev.descry.observation.v1")
+	want, err := e.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, '\n')
+
+	if err := fs.Publish(context.Background(), e); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	got, err := os.ReadFile(path) // #nosec G304 -- test-owned temp path
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+// TestFileSink_PublishAllocs guards the writeLine write path (D8/D11):
+// Publish must not allocate beyond what marshaling the event itself costs.
+// Bound measured 2026-08-16 on go1.26.6 darwin/arm64; re-measure and update
+// if it moves (D18 wording: bounds are "<=" the measured value).
+func TestFileSink_PublishAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation counts are unreliable under -race")
+	}
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	fs, err := NewFileSink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fs.Close() }()
+
+	e := cloudevents.NewEvent()
+	e.SetID("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	e.SetSource("test")
+	e.SetType("dev.descry.observation.v1")
+
+	got := testing.AllocsPerRun(200, func() {
+		if err := fs.Publish(context.Background(), e); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got > 3 {
+		t.Errorf("allocs/op = %v, want <= 3", got)
+	}
+}
+
+// BenchmarkFileSink_Publish is the before/after evidence for the writeLine
+// refactor (D8): run with -benchmem to see allocs/op.
+func BenchmarkFileSink_Publish(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "events.jsonl")
+	fs, err := NewFileSink(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = fs.Close() }()
+
+	e := cloudevents.NewEvent()
+	e.SetID("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	e.SetSource("test")
+	e.SetType("dev.descry.observation.v1")
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := fs.Publish(context.Background(), e); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 
@@ -64,5 +65,59 @@ func TestStdoutSink_WriteError(t *testing.T) {
 	s := NewStdoutSink(errWriter{})
 	if err := s.Publish(context.Background(), newTestEvent()); err == nil {
 		t.Fatal("expected write error, got nil")
+	}
+}
+
+// TestStdoutSink_PublishWritesGoldenLine pins the exact output bytes across
+// the writeLine refactor (D8): marshaled JSON followed by a single '\n',
+// nothing more.
+func TestStdoutSink_PublishWritesGoldenLine(t *testing.T) {
+	e := newTestEvent()
+	want, err := e.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, '\n')
+
+	var buf bytes.Buffer
+	s := NewStdoutSink(&buf)
+	if err := s.Publish(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+// TestStdoutSink_PublishAllocs guards the writeLine write path (D8/D11):
+// Publish must not allocate beyond what marshaling the event itself costs.
+// Bound measured 2026-08-16 on go1.26.6 darwin/arm64; re-measure and update
+// if it moves (D18 wording: bounds are "<=" the measured value).
+func TestStdoutSink_PublishAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation counts are unreliable under -race")
+	}
+	e := newTestEvent()
+	s := NewStdoutSink(io.Discard)
+	got := testing.AllocsPerRun(200, func() {
+		if err := s.Publish(context.Background(), e); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got > 3 {
+		t.Errorf("allocs/op = %v, want <= 3", got)
+	}
+}
+
+// BenchmarkStdoutSink_Publish is the before/after evidence for the writeLine
+// refactor (D8): run with -benchmem to see allocs/op.
+func BenchmarkStdoutSink_Publish(b *testing.B) {
+	e := newTestEvent()
+	s := NewStdoutSink(io.Discard)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := s.Publish(context.Background(), e); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

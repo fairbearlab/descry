@@ -48,7 +48,7 @@ func (s *FileSink) Publish(_ context.Context, e cloudevents.Event) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.w.Write(append(b, '\n')); err != nil {
+	if err := writeLine(s.w, b); err != nil {
 		return err
 	}
 	return s.w.Flush() // no fsync by default
