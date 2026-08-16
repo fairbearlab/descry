@@ -84,7 +84,17 @@ Pre-1.0, the minor version carries breaking changes.
   `MarshalJSON`'s own floor). `StdoutSink` now buffers through a `bufio.Writer`
   like `FileSink` (still flushed inside the lock before `Publish` returns), and
   both sinks reset the buffer after a failed write or flush so one transient
-  error of the underlying writer no longer wedges the sink for good.
+  error of the underlying writer no longer wedges the sink for good. A partial
+  write leaves a torn fragment; the next successful record is preceded by a
+  newline so the fragment is its own skippable line, and `FileSink` applies the
+  same rule to a file it reopens whose last byte is not a newline. Lines larger
+  than the buffer are written in one call so concurrent appenders cannot
+  interleave between JSON and newline.
+- `check.RedactURL` now also masks a bare username (the `https://<token>@host`
+  shape, where the username is the secret); passwords are masked as before and
+  the username kept.
+- `config.Load` rejects a file with more than one YAML document (a stray `---`
+  previously dropped every target after it silently).
 
 **Unchanged.** `runner.New`'s signature, `Results()`, `Skipped()`, the publish
 retry ladder, the `Check` and `EventSink` interfaces, and `EventSink`'s

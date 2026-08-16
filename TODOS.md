@@ -82,9 +82,22 @@ spin (every slot is due before the timer arms) and drives `Skipped()`/`Dropped()
 millions per second with one rate-limited warning. Reject, or clamp with a warning,
 effective intervals below a documented floor (1 ms is generous for a network probe) in
 `config.Load`, and state the floor in OPERATIONS.md next to the sizing formula.
-`runner.New` itself stays permissive — the floor is a CLI/config policy.
+`runner.New` itself stays permissive — the floor is a CLI/config policy. Raised by two
+independent pre-merge reviewers (Claude adversarial, Codex): a 1 ns target measured ~800k
+slots/s on one pegged core with one rate-limited warning as the only signal.
 
-**Effort:** S · **Priority:** P3 · **Depends on:** none
+**Effort:** S · **Priority:** P2 · **Depends on:** none
+
+### Fuzz shadow model does not mirror the overflow self-heal
+
+**What:** `runner/runner.go` re-derives `next` from the epoch when `k·interval` overflows
+(a wall clock centuries ahead saturates `Sub` at the max `Duration`). `FuzzScheduler`'s
+`shadow.lap()` does not model that branch. Unreachable at the fuzz's clock excursions
+(~12.8 h forward / 25 h back), so assertion (g) exact-`next` still holds; if the decoder's
+advance range is ever widened past the saturation point, (g) will diverge and look like
+a scheduler bug when it is a model gap. Mirror the guard in the shadow at that time.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** widening the fuzz clock range
 
 ## Event
 

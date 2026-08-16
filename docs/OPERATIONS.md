@@ -52,6 +52,11 @@ the wall clock rather than to process start.
 
 Forward step (host sleep, VM resume): one late run per target, then normal
 cadence. Catch-up is O(1) — a jump of hours produces a single run, never a flood.
+One caveat for long intervals: the wait itself is a monotonic timer, which does
+not advance while the host is suspended, so a slot armed before a suspend fires
+late by up to the suspend duration (bounded by the remaining wait) rather than at
+the wall-clock slot. Irrelevant at seconds-to-minutes cadences; visible only if
+an interval is longer than the naps the host takes.
 
 Backward step (RTC wrong at boot, NTP steps back): the scheduler notices that
 entries are more than one interval in the future, re-anchors them to the current
@@ -206,6 +211,18 @@ scheduler goroutine is never blocked by a sink — a slow `Publish` holds one
 worker, and the target's later slots surface as `ErrSkipped`. A sink or `Check`
 that ignores its context altogether holds that worker (and, at shutdown, `Run`)
 until it returns; the bundled `httpcheck` honours both.
+
+Logging itself is synchronous `slog`: the two lines the scheduler goroutine can
+emit (the re-anchor Info and the rate-limited drop Warn) are written inline. If
+stderr is a pipe nobody reads, that write blocks the scheduler like any other
+blocked stderr write blocks a Go program — give the log a reader.
+
+The bundled sinks write one JSON object per line and flush before `Publish`
+returns. If the underlying write fails part-way (ENOSPC on a file), the sink
+resets, reports the failure, and terminates the torn fragment with its own
+newline before the next successful record, so readers see one unparseable line
+to skip rather than two records fused. `FileSink` does the same across restarts:
+a file whose last byte is not `\n` is treated as torn on open.
 
 ## Shutdown
 
