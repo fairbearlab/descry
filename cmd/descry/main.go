@@ -82,31 +82,7 @@ func main() {
 		s = fs
 	}
 
-	// Map config targets to engine targets. Warn once at startup for any
-	// target whose effective interval is shorter than the check timeout
-	// (D31): not a Load error (fast sites with tight cadence are legitimate),
-	// but slow responses will surface as ErrSkipped at runtime.
-	targets := make([]check.Target, len(cfg.Targets))
-	for i, t := range cfg.Targets {
-		lbl := t.Labels
-		if lbl == nil {
-			lbl = map[string]string{}
-		}
-		// Ensure the "url" label is always present (used by the CloudEvent subject).
-		if _, ok := lbl["url"]; !ok {
-			lbl["url"] = t.URL
-		}
-		targets[i] = check.Target{URL: t.URL, Labels: lbl, Interval: t.Interval}
-
-		effInterval := t.Interval
-		if effInterval <= 0 {
-			effInterval = cfg.Interval
-		}
-		if effInterval < cfg.Timeout {
-			slog.Warn("check timeout exceeds interval; slow responses will surface as ErrSkipped",
-				"url", check.RedactURL(t.URL), "interval", effInterval, "timeout", cfg.Timeout)
-		}
-	}
+	targets := buildTargets(cfg, slog.Default())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -142,4 +118,34 @@ func main() {
 	// Run until interrupted. ctx.Err() on shutdown is not fatal.
 	_ = r.Run(ctx)
 	_ = failures.Load() // available for future exit-code logic
+}
+
+// buildTargets maps config targets to engine targets. It warns once, at
+// startup, for any target whose effective interval is shorter than the check
+// timeout: that is not a Load error (a fast endpoint on a tight cadence is
+// legitimate), but a slow response on such a target cannot finish before its
+// next slot and will surface as ErrSkipped at runtime.
+func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
+	targets := make([]check.Target, len(cfg.Targets))
+	for i, t := range cfg.Targets {
+		lbl := t.Labels
+		if lbl == nil {
+			lbl = map[string]string{}
+		}
+		// Ensure the "url" label is always present (used by the CloudEvent subject).
+		if _, ok := lbl["url"]; !ok {
+			lbl["url"] = t.URL
+		}
+		targets[i] = check.Target{URL: t.URL, Labels: lbl, Interval: t.Interval}
+
+		effInterval := t.Interval
+		if effInterval <= 0 {
+			effInterval = cfg.Interval
+		}
+		if effInterval < cfg.Timeout {
+			log.Warn("check timeout exceeds interval; slow responses will surface as ErrSkipped",
+				"url", check.RedactURL(t.URL), "interval", effInterval, "timeout", cfg.Timeout)
+		}
+	}
+	return targets
 }
