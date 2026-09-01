@@ -120,25 +120,6 @@ guarded.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** none (prefer after the CI perf gate)
 
-## CI
-
-### Perf gate: same-job benchstat + structural asserts + fuzz job
-
-**What:** A PR-triggered workflow that (1) benchmarks merge-base and head in the same job
-and fails on a ≥ +10 % ns/op regression (p < 0.05) on the runner dispatch and sink
-benchmarks via `benchstat` — relative only, no stored baseline; (2) runs the scale harness
-(`runner/scale_test.go`, not under `-race`, `-short` off) with its structural criteria
-*asserted*: healthy regime → zero skips, `Dropped()==0`, scheduler-owned goroutines ≤
-concurrency + 8; saturated regime → accounting identity, no starvation, goroutines flat;
-start-lateness printed, never asserted (shared runners); (3) runs `-fuzz=FuzzScheduler
--fuzztime=60s` alongside the existing SSRF fuzz job; (4) extends `AllocsPerRun` guards to
-`checks/http` (`assertSafeURL`, `controlContext`), already measured.
-
-**Why:** v0.3.0 records the numbers and prints PASS/FAIL; nothing gates them yet. Every
-job is PR-triggered, not cron (idle repos get scheduled workflows auto-disabled).
-
-**Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
-
 ## Sink
 
 ### Batch publishing seam (`BatchSink` + `sink.NewBatcher`)
@@ -188,4 +169,24 @@ consumer asks, not speculatively.
 
 ## Completed
 
-_(none yet — entries move here with the PR that closed them)_
+### Perf gate: same-job benchstat + structural asserts + fuzz job
+
+**What:** A PR-triggered workflow that (1) benchmarks merge-base and head in the same job
+and fails on a ≥ +10 % ns/op regression (p < 0.05) on the runner dispatch and sink
+benchmarks via `benchstat` — relative only, no stored baseline; (2) runs the scale harness
+(`runner/scale_test.go`, not under `-race`, `-short` off) with its structural criteria
+*asserted*: healthy regime → zero skips, `Dropped()==0`, scheduler-owned goroutines ≤
+concurrency + 8; saturated regime → accounting identity, no starvation, goroutines flat;
+start-lateness printed, never asserted (shared runners); (3) runs `-fuzz=FuzzScheduler
+-fuzztime=60s` alongside the existing SSRF fuzz job; (4) extends `AllocsPerRun` guards to
+`checks/http` (`assertSafeURL`, `controlContext`), already measured.
+
+**Why:** v0.3.0 records the numbers and prints PASS/FAIL; nothing gates them yet. Every
+job is PR-triggered, not cron (idle repos get scheduled workflows auto-disabled).
+
+**Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
+
+**Completed:** PR #18 (2026-09-01) — plus review hardening: pipefail on the bench
+pipes, awk gate fails closed on zero parsed rows, alloc guards actually run in CI
+(non-`-race` step), fuzz crashers uploaded as artifacts, scale harness detects
+early `Run` exit and iterates all configured targets.
