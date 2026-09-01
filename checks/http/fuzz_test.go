@@ -15,8 +15,10 @@ import (
 // for exactly those two things — crashes, and Layer 1 / Layer 2 divergence —
 // not for a proof that the guard is complete.
 //
-// They run as ordinary unit tests in CI (seed corpus only). Real fuzzing is
-// on-demand: go test ./checks/http -run '^$' -fuzz FuzzAssertSafeURL -fuzztime 60s
+// The seed corpora run as ordinary unit tests in the regular CI test job; the
+// perf workflow additionally runs 60s of coverage-guided fuzzing on both SSRF
+// targets on every PR. On demand:
+// go test ./checks/http -run '^$' -fuzz FuzzAssertSafeURL -fuzztime 60s
 
 // FuzzAssertSafeURL checks two invariants of Layer 1:
 //

@@ -36,7 +36,7 @@ reporting lets us assess and fix before details are public.
   security boundary, and nothing in the threat model above changes because of them.
   The two SSRF-layer targets (plus the scheduler's) get 60s of coverage-guided
   fuzzing on every pull request via the `perf` workflow; all fuzz seed corpora
-  also run as regular tests in every `go test`.
+  also run as regular tests in CI's `go test -race ./...` invocation.
 - This repository is scored by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/fairbearlab/descry).
 
 ## Response window
