@@ -6,6 +6,15 @@ on:
   pull_request: { branches: [main] }
 permissions:
   contents: read
+concurrency:
+  group: perf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    # An explicit bash shell runs with `-e -o pipefail`; the default `bash -e`
+    # has no pipefail, so `go test | tee` would swallow a failed build and the
+    # gate below would compare empty files.
+    shell: bash
 jobs:
   # Relative regression gate (D33): benchmark the merge-base and the head in
   # the SAME job on the SAME runner, then compare with benchstat. Same-job
@@ -28,25 +37,39 @@ jobs:
         # @latest when this gate landed (2026-09-01).
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
       - name: bench merge-base
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          base=$(git merge-base "origin/$BASE_REF" HEAD)
           echo "merge-base: $base"
           git worktree add ../base "$base"
           cd ../base
-          go test -run '^$' -bench . -count=10 ./runner/ ./sink/ | tee "$GITHUB_WORKSPACE/base.txt"
+          go test -run '^$' -bench . -count=10 -timeout 20m ./runner/ ./sink/ | tee "$GITHUB_WORKSPACE/base.txt"
       - name: bench head
-        run: go test -run '^$' -bench . -count=10 ./runner/ ./sink/ | tee head.txt
+        run: go test -run '^$' -bench . -count=10 -timeout 20m ./runner/ ./sink/ | tee head.txt
       - name: benchstat gate
         run: |
           benchstat base.txt head.txt | tee benchstat.txt
-          # Gate on the sec/op section only (B/op and allocs/op have their own
-          # guards in the test suite). benchstat prints a delta column only for
-          # statistically significant rows ("~" otherwise); we still parse the
-          # p-value explicitly and fail on ≥ +10% with p < 0.05.
+          # Renamed/removed benchmarks silently leave the comparison (benchstat
+          # only pairs rows present on both sides), so surface any name-set
+          # difference in the log rather than gating on it — adding a benchmark
+          # in a PR is legitimate.
+          if ! diff <(grep -oE '^Benchmark[^ ]+' base.txt | sort -u) \
+                    <(grep -oE '^Benchmark[^ ]+' head.txt | sort -u) >/dev/null; then
+            echo "::warning::benchmark name sets differ between base and head — renamed/removed benchmarks are not gated"
+          fi
+          # Gate on the sec/op section only (B/op and allocs/op are guarded by
+          # the alloc-count tests, run without -race in the scale job below).
+          # benchstat prints a delta column only for statistically significant
+          # rows ("~" otherwise); we still parse the p-value explicitly and
+          # fail on ≥ +10% with p < 0.05. Zero parsed rows fails closed: it
+          # means empty/truncated bench output or a benchstat format change,
+          # not a clean bill.
           awk '
             /sec\/op.*vs base/ { insec = 1; next }
             /(B\/op|allocs\/op).*vs base/ { insec = 0; next }
             insec && /\(p=/ {
+              rows++
               delta = ""; p = 1
               for (i = 1; i <= NF; i++) {
                 if ($i ~ /^\+[0-9.]+%$/) delta = substr($i, 2, length($i) - 2) + 0
@@ -58,8 +81,9 @@ jobs:
               }
             }
             END {
+              if (rows == 0) { print "benchstat gate: no comparable sec/op rows parsed — failing closed"; exit 1 }
               if (bad) { print "benchstat gate: ns/op regressed >= 10% with p < 0.05"; exit 1 }
-              print "benchstat gate: no significant ns/op regression >= 10%"
+              printf "benchstat gate: no significant ns/op regression >= 10%% (%d rows compared)\n", rows
             }
           ' benchstat.txt
 
@@ -79,6 +103,10 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test -run 'TestScale' -v -timeout 10m ./runner/
+      - name: alloc guards
+        # Every AllocsPerRun guard skips itself under -race, and ci.yml only
+        # runs -race — without this step the alloc bounds never execute in CI.
+        run: go test -run 'Allocs' -v ./...
 
   # Coverage-guided fuzzing: the scheduler oracle plus the SSRF guards from
   # PR #14. The seed corpora still run as normal tests in every `go test`
@@ -98,3 +126,15 @@ jobs:
         run: go test -run '^$' -fuzz '^FuzzAssertSafeURL$' -fuzztime=60s ./checks/http/
       - name: fuzz SSRF blocked-IP classifier
         run: go test -run '^$' -fuzz '^FuzzIsBlockedIP$' -fuzztime=60s ./checks/http/
+      - name: upload fuzz crashers
+        # A crasher found on the runner is written to testdata/fuzz/ and lost
+        # with the VM unless preserved; without this the failure is
+        # unreproducible locally.
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crashers
+          path: |
+            runner/testdata/fuzz/**
+            checks/http/testdata/fuzz/**
+          if-no-files-found: ignore
