@@ -34,6 +34,20 @@ golangci-lint run ./...
 go tool govulncheck ./...
 ```
 
+PRs also run a perf gate (`.github/workflows/perf.yml`): a same-job `benchstat`
+comparison against the merge base that fails on a ≥ +10 % ns/op regression
+(p < 0.05) in the runner and sink benchmarks, the scale harness
+(`runner/scale_test.go`) with its structural criteria asserted, allocation-count
+guards (they skip under `-race`, so `go test -race` never exercises them), and
+60s coverage-guided fuzz runs. If your change touches the runner, sink, or the
+SSRF guard, reproduce locally before pushing:
+
+```
+go test -run 'TestScale' -v ./runner/
+go test -run 'Allocs' -v ./...
+go test -run '^$' -bench . -count=10 ./runner/ ./sink/
+```
+
 ## PRs
 
 - Branch from `main`, PR back to `main` — no direct pushes to `main`.
