@@ -15,10 +15,13 @@ import (
 )
 
 // Scale harness. Real clock, real goroutines: these measure
-// what the scheduler does to a process at 10k targets. Every criterion is
-// printed as PASS/FAIL; nothing is asserted here — the harness logs these; a
-// CI gate may assert them later in a dedicated CI job. Skipped under -short
-// and under the race detector.
+// what the scheduler does to a process at 10k targets. The §3.5 structural
+// criteria are asserted (zero skips / accounting identity, Dropped()==0,
+// no starvation, scheduler-owned goroutines ≤ concurrency+8); start-lateness
+// is printed, never asserted — on shared CI runners the number is not the
+// point, and dispatch-path regressions are caught by the same-job benchstat
+// gate instead. Skipped under -short and under the race detector; CI runs
+// these in perf.yml's dedicated scale job.
 //
 // Run: go test -run 'TestScale' -v ./runner/
 
@@ -218,7 +221,7 @@ func pf(ok bool) string {
 }
 
 // TestScale_Healthy: 10k targets, 10s interval, 20ms check, concurrency 64.
-// Criteria: zero skips, Dropped()==0, scheduler-owned goroutines ≤
+// Asserted: zero skips, Dropped()==0, scheduler-owned goroutines ≤
 // concurrency+8; p99 start-lateness printed, never asserted.
 func TestScale_Healthy(t *testing.T) {
 	skipUnlessScale(t)
@@ -235,10 +238,20 @@ func TestScale_Healthy(t *testing.T) {
 		p50.Round(time.Microsecond), p90.Round(time.Microsecond), p99.Round(time.Microsecond), maxL.Round(time.Microsecond), len(res.tracker.lateness))
 	t.Logf("[%s] %s zero skips | %s Dropped()==0 | %s goroutines ≤ conc+8 | (lateness printed only)", rg.name,
 		pf(res.skipped == 0), pf(res.dropped == 0), pf(schedGoroutines <= rg.concurrency+8))
+
+	if res.skipped != 0 {
+		t.Errorf("healthy regime skipped %d runs (slow=%d queued=%d), want 0", res.skipped, res.slow, res.queued)
+	}
+	if res.dropped != 0 {
+		t.Errorf("Dropped() = %d, want 0", res.dropped)
+	}
+	if schedGoroutines > rg.concurrency+8 {
+		t.Errorf("scheduler-owned goroutines ≈ %d, want ≤ concurrency+8 = %d", schedGoroutines, rg.concurrency+8)
+	}
 }
 
 // TestScale_Saturated: 500 targets, 100ms interval, 20ms check, concurrency 64
-// (≈156ms of work per 100ms). Criteria: accounting identity per target
+// (≈156ms of work per 100ms). Asserted: accounting identity per target
 // (completed + ErrSkipped + ErrSkippedQueued + dropped == slots processed; with
 // a real clock the boundary slot at each end is ±1), Dropped()==0, no
 // starvation (every target runs at least once per two intervals), goroutines
@@ -299,6 +312,19 @@ func TestScale_Saturated(t *testing.T) {
 		p50.Round(time.Microsecond), p90.Round(time.Microsecond), p99.Round(time.Microsecond), maxL.Round(time.Microsecond))
 	t.Logf("[%s] %s identity | %s Dropped()==0 | %s no starvation | %s goroutines flat | (lateness printed only)", rg.name,
 		pf(identityOK), pf(res.dropped == 0), pf(maxGap <= starveBound), pf(schedGoroutines <= rg.concurrency+8))
+
+	if !identityOK {
+		t.Errorf("accounting identity broken: worst per-target |results − expected slots| = %d, want ≤ 1", worstDelta)
+	}
+	if res.dropped != 0 {
+		t.Errorf("Dropped() = %d, want 0", res.dropped)
+	}
+	if maxGap > starveBound {
+		t.Errorf("starvation: max gap between a target's runs = %v, want ≤ %v", maxGap, starveBound)
+	}
+	if schedGoroutines > rg.concurrency+8 {
+		t.Errorf("scheduler-owned goroutines ≈ %d, want ≤ concurrency+8 = %d", schedGoroutines, rg.concurrency+8)
+	}
 }
 
 // TestScale_Footprint sweeps 100 / 1k / 10k targets (20ms check, concurrency

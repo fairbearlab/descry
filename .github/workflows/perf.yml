@@ -1,0 +1,100 @@
+# Perf gate (PERF-PLAN §4, D33/D34): same-job relative benchstat, structural
+# scale asserts, and fuzzing. Everything here is pull_request-triggered, never
+# cron — GitHub auto-disables scheduled workflows on idle repos after 60 days.
+name: perf
+on:
+  pull_request: { branches: [main] }
+permissions:
+  contents: read
+jobs:
+  # Relative regression gate (D33): benchmark the merge-base and the head in
+  # the SAME job on the SAME runner, then compare with benchstat. Same-job
+  # cancels machine, VM-contention, and Go-version noise, so no stored
+  # baseline file and no absolute thresholds. Fails on a ≥ +10% ns/op
+  # regression with p < 0.05 on the runner dispatch and sink benchmarks.
+  benchstat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # merge-base needs history
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install benchstat
+        # x/perf has no tagged releases; pinned to the pseudo-version that was
+        # @latest when this gate landed (2026-09-01).
+        run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
+      - name: bench merge-base
+        run: |
+          base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          echo "merge-base: $base"
+          git worktree add ../base "$base"
+          cd ../base
+          go test -run '^$' -bench . -count=10 ./runner/ ./sink/ | tee "$GITHUB_WORKSPACE/base.txt"
+      - name: bench head
+        run: go test -run '^$' -bench . -count=10 ./runner/ ./sink/ | tee head.txt
+      - name: benchstat gate
+        run: |
+          benchstat base.txt head.txt | tee benchstat.txt
+          # Gate on the sec/op section only (B/op and allocs/op have their own
+          # guards in the test suite). benchstat prints a delta column only for
+          # statistically significant rows ("~" otherwise); we still parse the
+          # p-value explicitly and fail on ≥ +10% with p < 0.05.
+          awk '
+            /sec\/op.*vs base/ { insec = 1; next }
+            /(B\/op|allocs\/op).*vs base/ { insec = 0; next }
+            insec && /\(p=/ {
+              delta = ""; p = 1
+              for (i = 1; i <= NF; i++) {
+                if ($i ~ /^\+[0-9.]+%$/) delta = substr($i, 2, length($i) - 2) + 0
+                if ($i ~ /^\(p=[0-9.]+$/) p = substr($i, 4) + 0
+              }
+              if (delta != "" && delta >= 10 && p < 0.05) {
+                bad = 1
+                printf "REGRESSION: %s\n", $0
+              }
+            }
+            END {
+              if (bad) { print "benchstat gate: ns/op regressed >= 10% with p < 0.05"; exit 1 }
+              print "benchstat gate: no significant ns/op regression >= 10%"
+            }
+          ' benchstat.txt
+
+  # Structural asserts (PERF-PLAN §3.5): the scale harness runs with a real
+  # clock, no -race and no -short. Healthy regime asserts zero skips,
+  # Dropped()==0, and scheduler-owned goroutines ≤ concurrency+8; saturated
+  # asserts the accounting identity, no starvation, and flat goroutines.
+  # Start-lateness is printed in the log, never asserted — shared CI runners
+  # make the number meaningless.
+  scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -run 'TestScale' -v -timeout 10m ./runner/
+
+  # Coverage-guided fuzzing: the scheduler oracle plus the SSRF guards from
+  # PR #14. The seed corpora still run as normal tests in every `go test`
+  # invocation (ci.yml); this job is the budgeted exploration on top.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: fuzz scheduler
+        run: go test -run '^$' -fuzz '^FuzzScheduler$' -fuzztime=60s ./runner/
+      - name: fuzz SSRF layer 1 (assertSafeURL)
+        run: go test -run '^$' -fuzz '^FuzzAssertSafeURL$' -fuzztime=60s ./checks/http/
+      - name: fuzz SSRF blocked-IP classifier
+        run: go test -run '^$' -fuzz '^FuzzIsBlockedIP$' -fuzztime=60s ./checks/http/
