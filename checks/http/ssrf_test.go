@@ -57,3 +57,40 @@ func TestControlContext(t *testing.T) {
 		t.Errorf("unparseable address: got %v, want ErrSSRFBlocked", err)
 	}
 }
+
+// TestAssertSafeURL_Allocs guards the Layer 1 pass path: parsing and
+// classifying a safe URL costs the url.Parse allocations and nothing more.
+// Bound measured 2026-09-01 on go1.26.6 darwin/arm64; a Go toolchain bump may
+// require re-measuring (bounds are "<=" the measured value).
+func TestAssertSafeURL_Allocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation counts are unreliable under -race")
+	}
+	got := testing.AllocsPerRun(500, func() {
+		if err := assertSafeURL("https://example.com/healthz"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got > 2 {
+		t.Errorf("assertSafeURL allocs/op = %v, want <= 2", got)
+	}
+}
+
+// TestControlContext_Allocs guards the Layer 2 pass path, which runs on every
+// dial attempt: netip.ParseAddrPort and isBlockedIP must stay allocation-free.
+// Bound measured 2026-09-01 on go1.26.6 darwin/arm64; a Go toolchain bump may
+// require re-measuring (bounds are "<=" the measured value).
+func TestControlContext_Allocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation counts are unreliable under -race")
+	}
+	ctx := context.Background()
+	got := testing.AllocsPerRun(500, func() {
+		if err := controlContext(ctx, "tcp", "8.8.8.8:443", nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got > 0 {
+		t.Errorf("controlContext allocs/op = %v, want 0", got)
+	}
+}

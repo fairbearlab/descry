@@ -34,6 +34,27 @@ golangci-lint run ./...
 go tool govulncheck ./...
 ```
 
+PRs also run a perf gate (`.github/workflows/perf.yml`): a same-job `benchstat`
+comparison against the merge base that fails on a ≥ +10 % ns/op regression
+(p < 0.05) in the runner and sink benchmarks, the scale harness
+(`runner/scale_test.go`) with its structural criteria asserted, allocation-count
+guards (they skip under `-race`, so `go test -race` never exercises them), and
+60s coverage-guided fuzz runs. If your change touches the runner, sink, or the
+SSRF guard, run the gated tests locally before pushing:
+
+```
+go test -run 'TestScale' -v ./runner/
+go test -run 'Allocs' -v ./...
+go test -run '^$' -fuzz 'FuzzScheduler' -fuzztime=60s ./runner/
+go test -run '^$' -fuzz 'FuzzAssertSafeURL' -fuzztime=60s ./checks/http/
+go test -run '^$' -fuzz 'FuzzIsBlockedIP' -fuzztime=60s ./checks/http/
+go test -run '^$' -bench . -count=10 ./runner/ ./sink/
+```
+
+The benchmark command above measures your head only; the CI gate benchmarks the
+merge base and your head on the same runner and compares them with `benchstat`,
+so a local run is a sanity check, not the gate itself.
+
 ## PRs
 
 - Branch from `main`, PR back to `main` — no direct pushes to `main`.

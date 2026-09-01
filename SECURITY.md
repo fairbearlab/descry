@@ -6,11 +6,11 @@ descry is pre-1.0. Only the latest minor release line gets fixes.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | yes       |
-| < 0.1   | no        |
+| 0.3.x   | yes       |
+| < 0.3   | no        |
 
 Once the project reaches v1.0, this table will grow a real deprecation window.
-Until then, reproduce against the latest v0.1.x tag if you can — but report
+Until then, reproduce against the latest v0.3.x tag if you can — but report
 regardless of the version you are on.
 
 ## Reporting a vulnerability
@@ -34,6 +34,9 @@ reporting lets us assess and fix before details are public.
   `isBlockedIP`) and on `check.RedactURL`. They hunt for panics and for
   disagreements between the two layers; they do **not** make the guard a
   security boundary, and nothing in the threat model above changes because of them.
+  The two SSRF-layer targets (plus the scheduler's) get 60s of coverage-guided
+  fuzzing on every pull request via the `perf` workflow; all fuzz seed corpora
+  also run as regular tests in CI's `go test -race ./...` invocation.
 - This repository is scored by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/fairbearlab/descry).
 
 ## Response window

@@ -15,10 +15,13 @@ import (
 )
 
 // Scale harness. Real clock, real goroutines: these measure
-// what the scheduler does to a process at 10k targets. Every criterion is
-// printed as PASS/FAIL; nothing is asserted here — the harness logs these; a
-// CI gate may assert them later in a dedicated CI job. Skipped under -short
-// and under the race detector.
+// what the scheduler does to a process at 10k targets. The §3.5 structural
+// criteria are asserted (zero skips / accounting identity, Dropped()==0,
+// no starvation, scheduler-owned goroutines ≤ concurrency+8); start-lateness
+// is printed, never asserted — on shared CI runners the number is not the
+// point, and dispatch-path regressions are caught by the same-job benchstat
+// gate instead. Skipped under -short and under the race detector; CI runs
+// these in perf.yml's dedicated scale job.
 //
 // Run: go test -run 'TestScale' -v ./runner/
 
@@ -126,11 +129,14 @@ type regimeResult struct {
 	dropped                 int64
 	skipped                 int64
 	perURL                  map[string]int // Results per URL (completions + skips)
+	urls                    []string       // every configured target URL, dispatched or not
 	idleGoroutines, peak    int
 	heapDeltaKB             uint64
 	elapsed                 time.Duration
 	tracker                 *slotTracker
 	tEnd                    time.Time
+	runErr                  error // Run's return value (context.Canceled on the normal path)
+	earlyExit               bool  // Run returned before the harness canceled it
 }
 
 // runRegime executes one regime and collects everything the results table needs.
@@ -148,7 +154,11 @@ func runRegime(t *testing.T, rg regime) *regimeResult {
 
 	r := New(tracker, nopSink{}, event.Config{Source: "scale"}, targets, rg.interval, rg.concurrency)
 	r.clock = sc
-	res := &regimeResult{perURL: make(map[string]int, rg.n), idleGoroutines: idle, tracker: tracker}
+	res := &regimeResult{perURL: make(map[string]int, rg.n), idleGoroutines: idle, tracker: tracker,
+		urls: make([]string, 0, rg.n)}
+	for _, tg := range targets {
+		res.urls = append(res.urls, tg.URL)
+	}
 
 	// Sample goroutines every millisecond while Run is active.
 	stopSample := make(chan struct{})
@@ -190,8 +200,15 @@ func runRegime(t *testing.T, rg regime) *regimeResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	start := time.Now()
 	runDone := make(chan struct{})
-	go func() { _ = r.Run(ctx); close(runDone) }()
+	go func() { res.runErr = r.Run(ctx); close(runDone) }()
 	time.Sleep(rg.duration)
+	// An early Run exit leaves perURL/starts empty and every downstream assert
+	// vacuously green — detect it so the tests can fail loudly instead.
+	select {
+	case <-runDone:
+		res.earlyExit = true
+	default:
+	}
 	res.tEnd = time.Now()
 	cancel()
 	<-runDone
@@ -217,8 +234,25 @@ func pf(ok bool) string {
 	return "FAIL"
 }
 
+// assertHarnessValid fails the test when the run itself was invalid — Run
+// exited before cancel, returned something other than context.Canceled, or
+// produced zero Results. Without this, an early scheduler exit leaves every
+// structural assert below vacuously green (empty perURL, empty starts).
+func assertHarnessValid(t *testing.T, res *regimeResult) {
+	t.Helper()
+	if res.earlyExit {
+		t.Fatalf("Run exited before the harness canceled it: %v", res.runErr)
+	}
+	if !errors.Is(res.runErr, context.Canceled) {
+		t.Errorf("Run returned %v, want context.Canceled", res.runErr)
+	}
+	if res.completed+res.slow+res.queued == 0 {
+		t.Fatal("harness observed zero Results — structural asserts would be vacuous")
+	}
+}
+
 // TestScale_Healthy: 10k targets, 10s interval, 20ms check, concurrency 64.
-// Criteria: zero skips, Dropped()==0, scheduler-owned goroutines ≤
+// Asserted: zero skips, Dropped()==0, scheduler-owned goroutines ≤
 // concurrency+8; p99 start-lateness printed, never asserted.
 func TestScale_Healthy(t *testing.T) {
 	skipUnlessScale(t)
@@ -235,10 +269,24 @@ func TestScale_Healthy(t *testing.T) {
 		p50.Round(time.Microsecond), p90.Round(time.Microsecond), p99.Round(time.Microsecond), maxL.Round(time.Microsecond), len(res.tracker.lateness))
 	t.Logf("[%s] %s zero skips | %s Dropped()==0 | %s goroutines ≤ conc+8 | (lateness printed only)", rg.name,
 		pf(res.skipped == 0), pf(res.dropped == 0), pf(schedGoroutines <= rg.concurrency+8))
+
+	assertHarnessValid(t, res)
+	if len(res.perURL) != rg.n {
+		t.Errorf("targets that produced a Result = %d, want %d (undispatched targets are invisible to the skip/drop asserts)", len(res.perURL), rg.n)
+	}
+	if res.skipped != 0 {
+		t.Errorf("healthy regime skipped %d runs (slow=%d queued=%d), want 0", res.skipped, res.slow, res.queued)
+	}
+	if res.dropped != 0 {
+		t.Errorf("Dropped() = %d, want 0", res.dropped)
+	}
+	if schedGoroutines > rg.concurrency+8 {
+		t.Errorf("scheduler-owned goroutines ≈ %d, want ≤ concurrency+8 = %d", schedGoroutines, rg.concurrency+8)
+	}
 }
 
 // TestScale_Saturated: 500 targets, 100ms interval, 20ms check, concurrency 64
-// (≈156ms of work per 100ms). Criteria: accounting identity per target
+// (≈156ms of work per 100ms). Asserted: accounting identity per target
 // (completed + ErrSkipped + ErrSkippedQueued + dropped == slots processed; with
 // a real clock the boundary slot at each end is ±1), Dropped()==0, no
 // starvation (every target runs at least once per two intervals), goroutines
@@ -255,8 +303,12 @@ func TestScale_Saturated(t *testing.T) {
 	// scheduler processed. Expected slots are counted from the wall clock over
 	// [t0, tEnd]; the first and last slot can straddle Run start / cancel, so
 	// each target may differ by at most one at either end.
+	// Iterate every configured target, not just those that produced Results:
+	// a target the scheduler never dispatched has got == 0 and a nonzero
+	// expected slot count, so it breaks the identity instead of vanishing.
 	identityOK, worstDelta := true, 0
-	for url, got := range res.perURL {
+	for _, url := range res.urls {
+		got := res.perURL[url]
 		first := slotAfter(res.tracker.t0, rg.interval, phaseOf(url, rg.interval))
 		want := 0
 		if !first.After(res.tEnd) {
@@ -299,6 +351,20 @@ func TestScale_Saturated(t *testing.T) {
 		p50.Round(time.Microsecond), p90.Round(time.Microsecond), p99.Round(time.Microsecond), maxL.Round(time.Microsecond))
 	t.Logf("[%s] %s identity | %s Dropped()==0 | %s no starvation | %s goroutines flat | (lateness printed only)", rg.name,
 		pf(identityOK), pf(res.dropped == 0), pf(maxGap <= starveBound), pf(schedGoroutines <= rg.concurrency+8))
+
+	assertHarnessValid(t, res)
+	if !identityOK {
+		t.Errorf("accounting identity broken: worst per-target |results − expected slots| = %d, want ≤ 1", worstDelta)
+	}
+	if res.dropped != 0 {
+		t.Errorf("Dropped() = %d, want 0", res.dropped)
+	}
+	if maxGap > starveBound {
+		t.Errorf("starvation: max gap between a target's runs = %v, want ≤ %v", maxGap, starveBound)
+	}
+	if schedGoroutines > rg.concurrency+8 {
+		t.Errorf("scheduler-owned goroutines ≈ %d, want ≤ concurrency+8 = %d", schedGoroutines, rg.concurrency+8)
+	}
 }
 
 // TestScale_Footprint sweeps 100 / 1k / 10k targets (20ms check, concurrency
