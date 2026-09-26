@@ -443,6 +443,64 @@ func TestBackwardStep_ReanchorsWithinOneInterval(t *testing.T) {
 	}
 }
 
+// TestForwardStep_OneRunPerTargetNoReanchor is the mirror of the backward
+// step: the wall clock jumps forward 1h while the monotonic clock stands still
+// (VM restore, NTP step after boot). Nothing fires on the step itself; the
+// armed timer fires at its original monotonic deadline, the scheduler finds
+// now far past every next, and the O(1) catch-up gives each target exactly
+// one run and a phase-aligned next slot — no skip flood, no re-anchor log.
+func TestForwardStep_OneRunPerTargetNoReanchor(t *testing.T) {
+	const iv, n = 30 * time.Second, 5
+	logs := captureLogs(t, slog.LevelInfo)
+	chk := &fakeCheck{calls: make(chan call, 64)}
+	ts := targetsN(n, "http://fwd")
+	tr := newTestRunner(t, chk, ts, iv, n)
+
+	armed := firstSlot(ts[0].URL, iv) // the timer is armed for the earliest slot
+	for _, x := range ts[1:] {
+		if s := firstSlot(x.URL, iv); s.Before(armed) {
+			armed = s
+		}
+	}
+	wait := armed.Sub(epoch)
+
+	tr.fc.Step(time.Hour)
+	expectNoCall(t, chk.calls) // a step alone wakes nothing
+	tr.advance(wait - time.Nanosecond)
+	expectNoCall(t, chk.calls) // not before the monotonic deadline
+	tr.advance(time.Nanosecond)
+	now := tr.fc.Now()
+
+	ran := map[string]int{}
+	for range n {
+		c := recvCall(t, chk.calls)
+		if !c.at.Equal(now) {
+			t.Fatalf("%s ran at %v, want %v", c.url, c.at, now)
+		}
+		ran[c.url]++
+		tr.completeOne(t)
+	}
+	expectNoCall(t, chk.calls)
+	for _, x := range ts {
+		if ran[x.URL] != 1 {
+			t.Fatalf("%s ran %d times after the step, want exactly 1", x.URL, ran[x.URL])
+		}
+	}
+	if tr.Skipped() != 0 {
+		t.Fatalf("skip flood: Skipped() = %d", tr.Skipped())
+	}
+
+	tr.stop() // entries are safe to read once Run has returned
+	for _, e := range tr.entries {
+		if want := slotAfter(now, iv, e.phase); !e.next.Equal(want) {
+			t.Errorf("%s: next = %v, want the phase-aligned slot %v", e.t.URL, e.next, want)
+		}
+	}
+	if got := logs.records(slog.LevelInfo); len(got) != 0 {
+		t.Fatalf("forward step logged %d Info records, want none (no re-anchor): %+v", len(got), got)
+	}
+}
+
 // TestEarlyWake_ReArmsWithoutRunning: a timer that fires before next (wall
 // slew, spurious wake) is re-armed; nothing runs, nothing is skipped.
 func TestEarlyWake_ReArmsWithoutRunning(t *testing.T) {
