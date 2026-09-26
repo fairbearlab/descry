@@ -11,6 +11,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// MinInterval is the cadence floor: Load rejects any effective interval (the
+// top-level interval, or a per-target override) below it. Below ~1ms every
+// slot is already due before the scheduler can arm its timer, so it spins on
+// one core and Skipped()/Dropped() climb at up to millions per second behind a
+// single rate-limited warning; 1ms is generous for a network probe. This is
+// config policy: runner.New itself accepts any positive interval.
+const MinInterval = time.Millisecond
+
 // Target is a single monitored URL with opaque labels and an optional
 // per-target interval override. Interval zero means "use the config's
 // top-level interval" (which itself rides through to the runner default).
@@ -106,6 +114,9 @@ func Load(path string) (cfg Config, err error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("parse interval %q: %w", raw.Interval, err)
 		}
+		if d > 0 && d < MinInterval {
+			return Config{}, fmt.Errorf("interval %q is below the %v floor", raw.Interval, MinInterval)
+		}
 		cfg.Interval = d
 	}
 	if raw.Timeout != "" {
@@ -153,6 +164,9 @@ func Load(path string) (cfg Config, err error) {
 			}
 			if d < 0 {
 				return Config{}, fmt.Errorf("target %d: interval %q must not be negative", i, rt.Interval)
+			}
+			if d > 0 && d < MinInterval {
+				return Config{}, fmt.Errorf("target %d: interval %q is below the %v floor", i, rt.Interval, MinInterval)
 			}
 			t.Interval = d
 		}

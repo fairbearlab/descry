@@ -74,20 +74,6 @@ own design note and OPERATIONS.md entry, not a drive-by.
 
 ## Config
 
-### Cadence floor
-
-**What:** `config.Load` rejects negative per-target intervals and non-positive top-level
-ones, but nothing stops `interval: 1ns`. A sub-millisecond interval makes the scheduler
-spin (every slot is due before the timer arms) and drives `Skipped()`/`Dropped()` up at
-millions per second with one rate-limited warning. Reject, or clamp with a warning,
-effective intervals below a documented floor (1 ms is generous for a network probe) in
-`config.Load`, and state the floor in OPERATIONS.md next to the sizing formula.
-`runner.New` itself stays permissive — the floor is a CLI/config policy. Raised by two
-independent pre-merge reviewers (Claude adversarial, Codex): a 1 ns target measured ~800k
-slots/s on one pegged core with one rate-limited warning as the only signal.
-
-**Effort:** S · **Priority:** P2 · **Depends on:** none
-
 ### Fuzz shadow model does not mirror the overflow self-heal
 
 **What:** `runner/runner.go` re-derives `next` from the epoch when `k·interval` overflows
@@ -190,3 +176,21 @@ job is PR-triggered, not cron (idle repos get scheduled workflows auto-disabled)
 pipes, awk gate fails closed on zero parsed rows, alloc guards actually run in CI
 (non-`-race` step), fuzz crashers uploaded as artifacts, scale harness detects
 early `Run` exit and iterates all configured targets.
+
+### Cadence floor
+
+**What:** `config.Load` rejects negative per-target intervals and non-positive top-level
+ones, but nothing stops `interval: 1ns`. A sub-millisecond interval makes the scheduler
+spin (every slot is due before the timer arms) and drives `Skipped()`/`Dropped()` up at
+millions per second with one rate-limited warning. Reject, or clamp with a warning,
+effective intervals below a documented floor (1 ms is generous for a network probe) in
+`config.Load`, and state the floor in OPERATIONS.md next to the sizing formula.
+`runner.New` itself stays permissive — the floor is a CLI/config policy. Raised by two
+independent pre-merge reviewers (Claude adversarial, Codex): a 1 ns target measured ~800k
+slots/s on one pegged core with one rate-limited warning as the only signal.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** none
+
+**Completed:** PR #23 (2026-09-25) — rejected, not clamped: `config.Load` errors on
+any effective interval below `config.MinInterval` (1ms), naming the floor; documented in
+OPERATIONS.md next to the sizing formula. `runner.New` unchanged.
