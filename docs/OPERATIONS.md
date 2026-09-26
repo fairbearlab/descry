@@ -173,6 +173,16 @@ Upper bound worth knowing: a check that ignores its context holds a worker until
 `timeout` expires, so the pool's worst-case throughput is
 `concurrency / timeout` checks per second. Keep `timeout` tight.
 
+Lower bound worth knowing: **the cadence floor is 1ms** (`config.MinInterval`).
+`config.Load` rejects a top-level or per-target `interval` below it. Below
+roughly a millisecond every slot is already due before the scheduler can arm
+its timer, so it spins on one core and `Skipped()`/`Dropped()` climb at up to
+millions per second (a 1ns target measured ~800k slots/s) behind a single
+rate-limited warning. No network probe needs a cadence that tight; the formula
+above will have told you the pool cannot keep up long before. The floor is
+config policy — a program embedding `runner.New` directly can pass any positive
+interval and owns the consequences.
+
 Memory is not the constraint at these sizes — the scheduler heap is roughly
 7–9 MB at 10,000 targets (run to run) and goroutine count stays flat at
 `concurrency + 1` plus the runtime's own.
