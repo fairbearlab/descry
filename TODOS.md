@@ -170,7 +170,7 @@ correct once that range widens.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** widening the fuzz clock range
 
-**Completed:** PR TBD (2026-09-26) — `shadow.lap()` now re-derives `next` from
+**Completed:** PR #25 (2026-09-26) — `shadow.lap()` now re-derives `next` from
 `slotAfter` when the saturated-`Duration` add leaves it non-advancing, mirroring
 `schedule()`'s guard line-for-line.
 
