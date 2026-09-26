@@ -36,7 +36,7 @@ jobs:
           echo "total coverage: ${total}% (floor: ${COVERAGE_FLOOR}%)"
           awk -v t="$total" -v f="$COVERAGE_FLOOR" \
             'BEGIN { if (t+0 < f+0) { printf "coverage %.4f%% is below the %s%% floor\n", t, f; exit 1 } }'
-      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      - uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7.1.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
