@@ -176,7 +176,24 @@ early `Run` exit and iterates all configured targets.
 
 ### Attribute and reduce `ToCloudEvent` allocations
 
-**Completed:** 2026-09-25 — attributed with `-memprofile` (NewEvent context,
+**What:** Profile `event.ToCloudEvent` with `-memprofile`, attribute its 15 allocs/op, and
+remove the avoidable ones.
+
+**Why:** Measured 530 ns/op, 888 B/op, 15 allocs/op (darwin/arm64, Go 1.26). Not a
+bottleneck at any realistic workload, but it is the largest per-event allocation site
+and an isolated win once CI allocation guards exist to lock it in. Both sinks' `Publish`
+already sit at `MarshalJSON`'s own 3-alloc floor, so this is the remaining per-event cost.
+
+**Context:** `event/event.go` `ToCloudEvent`; the numbers above came from an ad-hoc benchmark that was not kept — add one at `event/bench_test.go` first. A first
+CPU profile was dominated by GC and scheduler noise, indicating allocation pressure rather
+than a hot loop; the individual sites were never attributed. Likely candidates:
+`Extra`/`Labels` map handling and repeated `SetExtension` calls on the `cloudevents.Event`.
+No API change expected. Best done after a CI perf gate exists so the improvement is
+guarded.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none (prefer after the CI perf gate)
+
+**Completed:** PR #24 (2026-09-25) — attributed with `-memprofile` (NewEvent context,
 ULID ×2, `url.Parse` of the source, one pointer per `Set*` attribute, the TLS
 string and its pointer, payload boxing, and 4 inside `Validate`) and cut from
 13/18 to 3/6 allocs/op (minimal/full shape). What remains is the ID string,
