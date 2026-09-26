@@ -52,10 +52,11 @@ go test -run '^$' -bench . -count=10 ./runner/ ./sink/
 ```
 
 The fuzz commands use an execution-count budget (`Nx`), not a wall-clock
-duration (`60s`) — a plain duration races a stdlib coordinator bug that can
-fail the run with a bare `context deadline exceeded` right at the deadline
-(see the `fuzz` job comment in `.github/workflows/perf.yml`). Feel free to use
-a duration for local exploration; just keep CI on the count form.
+duration (`60s`) — on the Go 1.26.x in `go.mod`, a plain duration races a
+stdlib coordinator bug ([golang/go#75804](https://github.com/golang/go/issues/75804))
+that can fail the run with a bare `context deadline exceeded` right at the
+deadline (see the `fuzz` job comment in `.github/workflows/perf.yml`). Feel
+free to use a duration for local exploration; just keep CI on the count form.
 
 The benchmark command above measures your head only; the CI gate benchmarks the
 merge base and your head on the same runner and compares them with `benchstat`,
