@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"strconv"
 	"sync"
 	"testing"
@@ -167,6 +168,46 @@ func (s *shadow) lap() {
 		}
 	}
 	s.deadline = s.next[s.min()]
+}
+
+// TestShadow_SaturatedDurationSelfHeals pins the shadow's copy of schedule()'s
+// overflow self-heal directly, because FuzzScheduler cannot reach it: its
+// largest single advance is 64*fuzzMaxInterval and its largest step is 25h,
+// nowhere near saturating time.Duration. Same scenario as
+// TestStall_SaturatedDurationSelfHeals: a wall clock ~292 years past next must
+// process exactly one slot, leave next in (now, now+interval] with phase kept,
+// and return instead of spinning on a next left in the past (without the
+// guard every overflowed add throws next back another ~292 years, forever).
+func TestShadow_SaturatedDurationSelfHeals(t *testing.T) {
+	const iv = 30 * time.Second
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	sh := newShadow([]check.Target{{URL: "http://far"}}, iv, start)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sh.advance(time.Duration(math.MaxInt64)) // now-next saturates; k*interval overflows
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shadow.lap() did not return: next left in the past, model spinning")
+	}
+
+	if sh.slots[0] != 1 || sh.total != 1 || sh.reanchors != 0 {
+		t.Fatalf("slots = %d, total = %d, reanchors = %d: want exactly one processed slot, no re-anchor",
+			sh.slots[0], sh.total, sh.reanchors)
+	}
+	next := sh.next[0]
+	if !next.After(sh.now) || next.Sub(sh.now) > iv {
+		t.Fatalf("next = %v after lap at %v: want in (now, now+interval]", next, sh.now)
+	}
+	if got := next.Sub(next.Truncate(iv)); got != sh.phase[0] {
+		t.Fatalf("phase lost: next-truncate = %v, phase = %v", got, sh.phase[0])
+	}
+	if !sh.deadline.Equal(next) {
+		t.Fatalf("deadline = %v, want re-armed for next = %v", sh.deadline, next)
+	}
 }
 
 // advance elapses d. The scheduler only re-evaluates when its timer fires, so

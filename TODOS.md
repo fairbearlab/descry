@@ -172,7 +172,10 @@ correct once that range widens.
 
 **Completed:** PR #25 (2026-09-26) — `shadow.lap()` now re-derives `next` from
 `slotAfter` when the saturated-`Duration` add leaves it non-advancing, mirroring
-`schedule()`'s guard line-for-line.
+`schedule()`'s guard line-for-line. Because the fuzz cannot reach that branch
+(largest advance 64·`fuzzMaxInterval`, largest step 25 h), the guard is pinned
+directly by `TestShadow_SaturatedDurationSelfHeals`, the shadow-side twin of
+`TestStall_SaturatedDurationSelfHeals`; removing the guard makes it spin and fail.
 
 ### Perf gate: same-job benchstat + structural asserts + fuzz job
 
