@@ -500,6 +500,22 @@ func recv(t *testing.T, ch <-chan Result) Result {
 	return Result{}
 }
 
+// awaitClosed drains ch until it is closed, or fails after 2s.
+func awaitClosed(t *testing.T, ch <-chan Result) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("Results not closed within 2s")
+		}
+	}
+}
+
 // recvCall reads one call within 2s or fails.
 func recvCall(t *testing.T, ch <-chan call) call {
 	t.Helper()
