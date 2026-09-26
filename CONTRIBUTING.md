@@ -45,11 +45,18 @@ SSRF guard, run the gated tests locally before pushing:
 ```
 go test -run 'TestScale' -v ./runner/
 go test -run 'Allocs' -v ./...
-go test -run '^$' -fuzz 'FuzzScheduler' -fuzztime=60s ./runner/
-go test -run '^$' -fuzz 'FuzzAssertSafeURL' -fuzztime=60s ./checks/http/
-go test -run '^$' -fuzz 'FuzzIsBlockedIP' -fuzztime=60s ./checks/http/
+go test -run '^$' -fuzz 'FuzzScheduler' -fuzztime=400000x ./runner/
+go test -run '^$' -fuzz 'FuzzAssertSafeURL' -fuzztime=1200000x ./checks/http/
+go test -run '^$' -fuzz 'FuzzIsBlockedIP' -fuzztime=1000000x ./checks/http/
 go test -run '^$' -bench . -count=10 ./runner/ ./sink/
 ```
+
+The fuzz commands use an execution-count budget (`Nx`), not a wall-clock
+duration (`60s`) — on the Go 1.26.x in `go.mod`, a plain duration races a
+stdlib coordinator bug ([golang/go#75804](https://github.com/golang/go/issues/75804))
+that can fail the run with a bare `context deadline exceeded` right at the
+deadline (see the `fuzz` job comment in `.github/workflows/perf.yml`). Feel
+free to use a duration for local exploration; just keep CI on the count form.
 
 The benchmark command above measures your head only; the CI gate benchmarks the
 merge base and your head on the same runner and compares them with `benchstat`,
