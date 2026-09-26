@@ -20,7 +20,8 @@ jobs:
   # the SAME job on the SAME runner, then compare with benchstat. Same-job
   # cancels machine, VM-contention, and Go-version noise, so no stored
   # baseline file and no absolute thresholds. Fails on a ≥ +10% ns/op
-  # regression with p < 0.05 on the runner dispatch and sink benchmarks.
+  # regression with p < 0.05 on the runner dispatch, sink, and event-envelope
+  # benchmarks.
   benchstat:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -44,9 +45,9 @@ jobs:
           echo "merge-base: $base"
           git worktree add ../base "$base"
           cd ../base
-          go test -run '^$' -bench . -count=10 -timeout 20m ./runner/ ./sink/ | tee "$GITHUB_WORKSPACE/base.txt"
+          go test -run '^$' -bench . -count=10 -timeout 20m ./runner/ ./sink/ ./event/ | tee "$GITHUB_WORKSPACE/base.txt"
       - name: bench head
-        run: go test -run '^$' -bench . -count=10 -timeout 20m ./runner/ ./sink/ | tee head.txt
+        run: go test -run '^$' -bench . -count=10 -timeout 20m ./runner/ ./sink/ ./event/ | tee head.txt
       - name: benchstat gate
         run: |
           benchstat base.txt head.txt | tee benchstat.txt
@@ -108,9 +109,10 @@ jobs:
         # runs -race — without this step the alloc bounds never execute in CI.
         run: go test -run 'Allocs' -v ./...
 
-  # Coverage-guided fuzzing: the scheduler oracle plus the SSRF guards from
-  # PR #14. The seed corpora still run as normal tests in every `go test`
-  # invocation (ci.yml); this job is the budgeted exploration on top.
+  # Coverage-guided fuzzing: the scheduler oracle, the SSRF guards from
+  # PR #14, and ToCloudEvent against its SDK-setter reference. The seed
+  # corpora still run as normal tests in every `go test` invocation (ci.yml);
+  # this job is the budgeted exploration on top.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -126,6 +128,8 @@ jobs:
         run: go test -run '^$' -fuzz '^FuzzAssertSafeURL$' -fuzztime=60s ./checks/http/
       - name: fuzz SSRF blocked-IP classifier
         run: go test -run '^$' -fuzz '^FuzzIsBlockedIP$' -fuzztime=60s ./checks/http/
+      - name: fuzz event envelope (ToCloudEvent vs SDK-setter reference)
+        run: go test -run '^$' -fuzz '^FuzzToCloudEvent$' -fuzztime=60s ./event/
       - name: upload fuzz crashers
         # A crasher found on the runner is written to testdata/fuzz/ and lost
         # with the VM unless preserved; without this the failure is

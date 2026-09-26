@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pre-1.0, the minor version carries breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- **`event.ToCloudEvent` allocates 3–6 times per event instead of 13–18**
+  (−31–53 % ns/op). The common path writes the CloudEvents V1 context into one
+  allocation instead of going through a setter per attribute, and skips the
+  SDK's `Validate` because every attribute it sets is valid by construction; a
+  source or type the SDK would reject, or `Extra` that does not marshal, still
+  takes the SDK path, so errors are unchanged. Output is byte-identical: a test
+  and a CI fuzz target pin it to the previous implementation.
+
 ## [0.3.0] — 2026-08-16
 
 ### Added

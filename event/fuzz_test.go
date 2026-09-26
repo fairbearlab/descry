@@ -12,7 +12,8 @@ import (
 // obs.Labels["url"], which is a target URL. The contract worth pinning is that
 // a nil error means a genuinely valid event — if SetSubject or SetData ever
 // accepts something Validate would reject, a sink downstream emits a malformed
-// envelope and nothing upstream noticed.
+// envelope and nothing upstream noticed. It also pins ToCloudEvent to the
+// SDK-setter reference implementation (legacy_test.go): same event, same error.
 //
 // Runs as an ordinary unit test in CI (seed corpus only). On-demand fuzzing:
 // go test ./event -run '^$' -fuzz FuzzToCloudEvent -fuzztime 60s
@@ -23,6 +24,8 @@ func FuzzToCloudEvent(f *testing.F) {
 	f.Add("", "", "", 500, -1)
 	f.Add("/relative-source", "x", "\x00\x7f", 999, 1<<30)
 	f.Add("urn:uuid:1234", "a.b.c", "not a url at all", -1, 0)
+	f.Add("#", "  ", "  ", 0, 0)
+	f.Add("%zz", " t ", " <&> ", 0, 0)
 
 	f.Fuzz(func(t *testing.T, source, typ, urlLabel string, statusCode, latencyMs int) {
 		obs := check.Observation{
@@ -33,6 +36,8 @@ func FuzzToCloudEvent(f *testing.F) {
 			ObservedAt: time.Unix(0, 0).UTC(),
 			Labels:     map[string]string{"url": urlLabel},
 		}
+
+		assertMatchesLegacy(t, obs, Config{Source: source, Type: typ})
 
 		e, err := ToCloudEvent(obs, Config{Source: source, Type: typ})
 		if err != nil {
