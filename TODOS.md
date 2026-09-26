@@ -45,33 +45,6 @@ coverage. `fakeClock.Step` in `runner/helpers_test.go` already supports either s
 
 **Effort:** S · **Priority:** P3 · **Depends on:** none
 
-### `testRunner.stop()` should fail, not panic, on a wedged `Run`
-
-**What:** `runner/helpers_test.go` `(*testRunner).stop` panics after 5 s if `Run` has not
-returned. Replace with a `t.Fatalf` (needs the `*testing.T` on the helper) so the test's
-own diagnostic — usually the `t.Fatalf` that fired first — is what a reader sees, not a
-goroutine dump from the helper.
-
-**Why:** Today a real scheduler hang buries the message that says what actually broke.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** none
-
-### Bounded shutdown grace
-
-**What:** `Run`'s shutdown wait for in-flight runs is unbounded by design: a `Check` or
-sink that ignores its context holds `Run` (and `Results()` open) until it returns. Add an
-optional grace deadline (a functional option or a field on `New`'s successor) after which
-`Run` returns `errors.Join(ctx.Err(), ErrShutdownTimeout)`, logs how many workers were
-still in flight, and does *not* close `Results()` (a straggler could still publish).
-
-**Why:** The bundled `httpcheck` honours ctx and its own timeout, and `cmd/descry` now
-restores default signal handling after the first signal so a second Ctrl-C terminates the
-process. A library user with a custom sink and no such escape hatch would want the bound.
-It changes the "no `Publish` after `Run` returns" guarantee for that path, so it needs its
-own design note and OPERATIONS.md entry, not a drive-by.
-
-**Effort:** S · **Priority:** P2 · **Depends on:** a consumer that needs it
-
 ## Config
 
 ### Cadence floor
@@ -190,3 +163,38 @@ job is PR-triggered, not cron (idle repos get scheduled workflows auto-disabled)
 pipes, awk gate fails closed on zero parsed rows, alloc guards actually run in CI
 (non-`-race` step), fuzz crashers uploaded as artifacts, scale harness detects
 early `Run` exit and iterates all configured targets.
+
+### `testRunner.stop()` should fail, not panic, on a wedged `Run`
+
+**What:** `runner/helpers_test.go` `(*testRunner).stop` panics after 5 s if `Run` has not
+returned. Replace with a `t.Fatalf` (needs the `*testing.T` on the helper) so the test's
+own diagnostic — usually the `t.Fatalf` that fired first — is what a reader sees, not a
+goroutine dump from the helper.
+
+**Why:** Today a real scheduler hang buries the message that says what actually broke.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** PR #21 (2026-09-25) — `stop` fails through the test's `testing.TB`
+after `stopWait`; `fakeCheck.wedge` (ignores ctx) and a recording-`TB` self-test.
+
+### Bounded shutdown grace
+
+**What:** `Run`'s shutdown wait for in-flight runs is unbounded by design: a `Check` or
+sink that ignores its context holds `Run` (and `Results()` open) until it returns. Add an
+optional grace deadline (a functional option or a field on `New`'s successor) after which
+`Run` returns `errors.Join(ctx.Err(), ErrShutdownTimeout)`, logs how many workers were
+still in flight, and does *not* close `Results()` (a straggler could still publish).
+
+**Why:** The bundled `httpcheck` honours ctx and its own timeout, and `cmd/descry` now
+restores default signal handling after the first signal so a second Ctrl-C terminates the
+process. A library user with a custom sink and no such escape hatch would want the bound.
+It changes the "no `Publish` after `Run` returns" guarantee for that path, so it needs its
+own design note and OPERATIONS.md entry, not a drive-by.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** a consumer that needs it
+
+**Completed:** PR #21 (2026-09-25) — `runner.WithShutdownGrace(d)` as a variadic
+functional option on `New`; design note in the `runner` package doc (`# Shutdown`),
+OPERATIONS.md § Shutdown → "Bounding the wait", CHANGELOG `[Unreleased]`. `Results()` stays
+open on the timeout path, per the entry; `cmd/descry` does not set it.
