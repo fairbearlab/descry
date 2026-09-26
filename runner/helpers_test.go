@@ -36,6 +36,8 @@ type call struct {
 
 // fakeCheck is the one check double. Zero value: returns StatusUp immediately.
 //   - gate != nil: Run blocks until gate is closed or ctx is done.
+//   - wedge != nil: Run blocks until wedge is closed, ignoring ctx (a
+//     misbehaving check; the test must close wedge before it ends).
 //   - calls != nil: Run sends a call at entry (buffer it generously).
 //   - delay > 0: Run sleeps that long in real time (scale tests).
 //   - err != nil: Run returns it.
@@ -44,6 +46,7 @@ type call struct {
 // peak number of concurrent runs across all targets (peak).
 type fakeCheck struct {
 	gate  chan struct{}
+	wedge chan struct{}
 	calls chan call
 	delay time.Duration
 	err   error
@@ -94,6 +97,9 @@ func (c *fakeCheck) Run(ctx context.Context, t check.Target) (check.Observation,
 		case <-c.gate:
 		case <-ctx.Done():
 		}
+	}
+	if c.wedge != nil {
+		<-c.wedge
 	}
 	if c.delay > 0 {
 		select {
@@ -377,19 +383,22 @@ func captureLogs(t *testing.T, level slog.Level) *captureHandler {
 // --- harness ---
 
 // testRunner is a Runner started under a fake clock. stop cancels Run and
-// waits for it to return, after which entries are safe to read from the test.
+// waits for it to return, after which entries are safe to read from the test;
+// a Run that does not return within stopWait fails the test through tb.
 // acks receives one signal per worker ack (via the afterDone hook), so tests
 // can wait until a completed run's done is on the channel before advancing to
 // the next slot — with a fake clock, time can otherwise outrun the worker
 // goroutine and turn a finished run into a (correct but unwanted) skip.
 type testRunner struct {
 	*Runner
-	fc     *fakeClock
-	acks   chan struct{}
-	cancel context.CancelFunc
-	ret    chan error
-	err    error
-	once   sync.Once
+	tb       testing.TB
+	fc       *fakeClock
+	acks     chan struct{}
+	cancel   context.CancelFunc
+	ret      chan error
+	err      error
+	stopWait time.Duration
+	once     sync.Once
 }
 
 // newTestRunner builds and starts a Runner on a fresh fake clock. If chk.now
@@ -410,7 +419,8 @@ func newTestRunner(t *testing.T, chk *fakeCheck, targets []check.Target,
 func startTestRunner(t *testing.T, r *Runner, fc *fakeClock) *testRunner {
 	t.Helper()
 	r.clock = fc
-	tr := &testRunner{Runner: r, fc: fc, acks: make(chan struct{}, 1024), ret: make(chan error, 1)}
+	tr := &testRunner{Runner: r, tb: t, fc: fc, acks: make(chan struct{}, 1024), ret: make(chan error, 1),
+		stopWait: 5 * time.Second}
 	r.afterDone = func() { tr.acks <- struct{}{} }
 	ctx, cancel := context.WithCancel(context.Background())
 	tr.cancel = cancel
@@ -420,14 +430,19 @@ func startTestRunner(t *testing.T, r *Runner, fc *fakeClock) *testRunner {
 	return tr
 }
 
-// stop cancels Run and waits for it to return.
+// stop cancels Run and waits for it to return. A Run that is still running
+// after stopWait fails the test with Fatalf rather than panicking: when a
+// scheduler or worker hangs, the diagnostic that says what broke is usually
+// a Fatalf the test already reported, and a panic's goroutine dump would bury
+// it. stop runs on the test goroutine (directly or as a Cleanup).
 func (tr *testRunner) stop() {
+	tr.tb.Helper()
 	tr.once.Do(func() {
 		tr.cancel()
 		select {
 		case tr.err = <-tr.ret:
-		case <-time.After(5 * time.Second):
-			panic("testRunner: Run did not return after cancel")
+		case <-time.After(tr.stopWait):
+			tr.tb.Fatalf("testRunner: Run did not return within %v of cancel (scheduler or a worker is wedged)", tr.stopWait)
 		}
 	})
 }

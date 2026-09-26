@@ -4,8 +4,10 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -756,6 +758,44 @@ func TestFakeClock_SecondTimerPanics(t *testing.T) {
 		}
 	}()
 	fc.NewTimer(time.Second)
+}
+
+// fatalRecorder stands in for the *testing.T a testRunner reports through:
+// Fatalf records the message and exits the calling goroutine, as the real
+// one does, without failing the enclosing test.
+type fatalRecorder struct {
+	testing.TB
+	msg string
+}
+
+func (f *fatalRecorder) Helper() {}
+func (f *fatalRecorder) Fatalf(format string, args ...any) {
+	f.msg = fmt.Sprintf(format, args...)
+	runtime.Goexit()
+}
+
+// TestTestRunner_StopFailsOnWedgedRun: a Run that never returns after cancel
+// fails the test through its *testing.T (so the test's own first diagnostic
+// is what a reader sees) instead of panicking the whole binary.
+func TestTestRunner_StopFailsOnWedgedRun(t *testing.T) {
+	const iv = 10 * time.Second
+	chk := &fakeCheck{wedge: make(chan struct{}), calls: make(chan call, 1)}
+	tr := newTestRunner(t, chk, []check.Target{{URL: "http://w"}}, iv, 1)
+	t.Cleanup(func() { close(chk.wedge) }) // LIFO: releases the worker before the harness's own stop
+	tr.advanceTo(firstSlot("http://w", iv))
+	recvCall(t, chk.calls) // the worker is now wedged, ignoring ctx
+
+	rec := &fatalRecorder{TB: t}
+	tr.tb, tr.stopWait = rec, 50*time.Millisecond
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		tr.stop() // must reach rec.Fatalf; a panic here would crash the binary
+	}()
+	<-exited
+	if !strings.Contains(rec.msg, "did not return") {
+		t.Fatalf("stop on a wedged Run: Fatalf message = %q, want one naming the hang", rec.msg)
+	}
 }
 
 // TestRun_SecondCallReturnsError: Run is single-use. A second call must return
