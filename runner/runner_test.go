@@ -4,10 +4,13 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -663,6 +666,116 @@ func TestRun_ShutdownDoesNotRequireResultsDrain(t *testing.T) { // real clock
 	}
 }
 
+// startWedged runs one target whose check ignores ctx, under opts, and
+// returns once that check is running. release unwedges it (idempotent; it
+// also runs at cleanup).
+func startWedged(t *testing.T, opts ...Option) (tr *testRunner, release func()) {
+	t.Helper()
+	const iv = 10 * time.Second
+	chk := &fakeCheck{wedge: make(chan struct{}), calls: make(chan call, 1)}
+	fc := newFakeClock(t)
+	chk.now = fc.Now
+	r := New(chk, nopSink{}, event.Config{Source: "test"}, []check.Target{{URL: "http://wedged"}}, iv, 1, opts...)
+	tr = startTestRunner(t, r, fc)
+	var once sync.Once
+	release = func() { once.Do(func() { close(chk.wedge) }) }
+	t.Cleanup(release) // LIFO: before the harness's stop, so Run can finish
+	tr.advanceTo(firstSlot("http://wedged", iv))
+	recvCall(t, chk.calls)
+	return tr, release
+}
+
+// TestShutdown_GraceBoundsWedgedRun: with WithShutdownGrace, a check that
+// ignores ctx no longer holds Run. Run returns ctx.Err() joined with
+// ErrShutdownTimeout after the grace, warns with the in-flight worker count,
+// and leaves Results() open — the straggler still reports on it when it
+// finally returns (a send on a closed channel would panic).
+func TestShutdown_GraceBoundsWedgedRun(t *testing.T) {
+	const grace = 50 * time.Millisecond
+	logs := captureLogs(t, slog.LevelWarn)
+	tr, release := startWedged(t, WithShutdownGrace(grace))
+
+	start := time.Now()
+	tr.stop()
+	if el := time.Since(start); el < grace {
+		t.Fatalf("Run returned after %v, before the %v grace", el, grace)
+	}
+	if !errors.Is(tr.err, context.Canceled) || !errors.Is(tr.err, ErrShutdownTimeout) {
+		t.Fatalf("Run returned %v, want context.Canceled joined with ErrShutdownTimeout", tr.err)
+	}
+	warns := logs.records(slog.LevelWarn)
+	if len(warns) != 1 || !strings.Contains(warns[0].Message, "shutdown grace expired") {
+		t.Fatalf("want one shutdown-grace Warn, got %d: %+v", len(warns), warns)
+	}
+	var workers int64 = -1
+	warns[0].Attrs(func(a slog.Attr) bool {
+		if a.Key == "workers" {
+			workers = a.Value.Int64()
+		}
+		return true
+	})
+	if workers != 1 {
+		t.Fatalf("Warn workers = %d, want 1 (the wedged run)", workers)
+	}
+	select {
+	case res, ok := <-tr.Results():
+		t.Fatalf("Results() yielded (%+v, open=%v) before the straggler returned; want open and empty", res, ok)
+	default:
+	}
+
+	release()
+	if res := recv(t, tr.Results()); res.Err != nil || res.Target.URL != "http://wedged" {
+		t.Fatalf("straggler Result = %+v, want the wedged target's completion", res)
+	}
+}
+
+// TestShutdown_GraceUnusedWhenRunsFinish: a grace that is not needed changes
+// nothing — Run returns plain ctx.Err() as soon as in-flight runs finish and
+// closes Results().
+func TestShutdown_GraceUnusedWhenRunsFinish(t *testing.T) {
+	const iv = 10 * time.Second
+	chk := &fakeCheck{gate: make(chan struct{}), calls: make(chan call, 1)}
+	fc := newFakeClock(t)
+	chk.now = fc.Now
+	r := New(chk, nopSink{}, event.Config{Source: "test"}, []check.Target{{URL: "http://g"}}, iv, 1,
+		WithShutdownGrace(time.Minute))
+	tr := startTestRunner(t, r, fc)
+	tr.advanceTo(firstSlot("http://g", iv))
+	recvCall(t, chk.calls) // running; returns on ctx
+
+	tr.stop() // well inside stopWait, so nowhere near the minute of grace
+	if !errors.Is(tr.err, context.Canceled) || errors.Is(tr.err, ErrShutdownTimeout) {
+		t.Fatalf("Run returned %v, want context.Canceled alone", tr.err)
+	}
+	awaitClosed(t, tr.Results())
+}
+
+// TestShutdown_UnboundedWithoutGrace: the default (and a grace <= 0) keeps
+// the unbounded wait — Run holds until the wedged check returns, then closes
+// Results() and returns plain ctx.Err().
+func TestShutdown_UnboundedWithoutGrace(t *testing.T) {
+	for name, opts := range map[string][]Option{
+		"default": nil,
+		"zero":    {WithShutdownGrace(0)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tr, release := startWedged(t, opts...)
+			tr.cancel()
+			select {
+			case err := <-tr.ret:
+				t.Fatalf("Run returned %v while a run was still in flight", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			release()
+			tr.stop()
+			if !errors.Is(tr.err, context.Canceled) || errors.Is(tr.err, ErrShutdownTimeout) {
+				t.Fatalf("Run returned %v, want context.Canceled alone", tr.err)
+			}
+			awaitClosed(t, tr.Results())
+		})
+	}
+}
+
 // ---------- results channel ----------
 
 // TestReportResult_DropCountedAndWarnedOncePerInterval: a full channel
@@ -756,6 +869,44 @@ func TestFakeClock_SecondTimerPanics(t *testing.T) {
 		}
 	}()
 	fc.NewTimer(time.Second)
+}
+
+// fatalRecorder stands in for the *testing.T a testRunner reports through:
+// Fatalf records the message and exits the calling goroutine, as the real
+// one does, without failing the enclosing test.
+type fatalRecorder struct {
+	testing.TB
+	msg string
+}
+
+func (f *fatalRecorder) Helper() {}
+func (f *fatalRecorder) Fatalf(format string, args ...any) {
+	f.msg = fmt.Sprintf(format, args...)
+	runtime.Goexit()
+}
+
+// TestTestRunner_StopFailsOnWedgedRun: a Run that never returns after cancel
+// fails the test through its *testing.T (so the test's own first diagnostic
+// is what a reader sees) instead of panicking the whole binary.
+func TestTestRunner_StopFailsOnWedgedRun(t *testing.T) {
+	const iv = 10 * time.Second
+	chk := &fakeCheck{wedge: make(chan struct{}), calls: make(chan call, 1)}
+	tr := newTestRunner(t, chk, []check.Target{{URL: "http://w"}}, iv, 1)
+	t.Cleanup(func() { close(chk.wedge) }) // LIFO: releases the worker before the harness's own stop
+	tr.advanceTo(firstSlot("http://w", iv))
+	recvCall(t, chk.calls) // the worker is now wedged, ignoring ctx
+
+	rec := &fatalRecorder{TB: t}
+	tr.tb, tr.stopWait = rec, 50*time.Millisecond
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		tr.stop() // must reach rec.Fatalf; a panic here would crash the binary
+	}()
+	<-exited
+	if !strings.Contains(rec.msg, "did not return") {
+		t.Fatalf("stop on a wedged Run: Fatalf message = %q, want one naming the hang", rec.msg)
+	}
 }
 
 // TestRun_SecondCallReturnsError: Run is single-use. A second call must return

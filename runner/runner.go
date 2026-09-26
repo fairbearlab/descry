@@ -43,6 +43,7 @@
 //	                  │   }                                                   │
 //	                  │                                                      │
 //	                  │  ctx.Done: close(work) → wg.Wait() → close(results)  │
+//	                  │    (bounded by WithShutdownGrace; see Shutdown)      │
 //	                  └──────────────────────────────────────────────────────┘
 //
 // Ownership: the heap, e.next and e.inflight are touched ONLY by the scheduler
@@ -96,6 +97,31 @@
 // drops only the fleet-wide sum "+ dropped" is checkable. It is the only path a
 // Result can take that is not on the channel, and it is counted and warned once
 // per runner-default interval.
+//
+// # Shutdown
+//
+// Cancelling Run's ctx stops dispatch; queued entries are acked without
+// running, and Run waits for in-flight runs before closing Results() and
+// returning. Because every worker has returned by then, no Publish happens
+// after Run returns, which is what makes a deferred sink Close safe.
+//
+// By default that wait is unbounded: a Check or sink that ignores its ctx
+// holds Run until it returns. WithShutdownGrace(d) bounds it. If runs are
+// still in flight d after the scheduler stops, Run logs how many workers are
+// still running and returns errors.Join(ctx.Err(), ErrShutdownTimeout)
+// without closing Results(). That path trades the guarantee above for a
+// bounded return, explicitly:
+//
+//   - A straggler may still Publish after Run returns, so a sink closed
+//     right after Run must tolerate a late Publish (or not be closed until the
+//     process exits).
+//   - Results() is never closed, because a straggler still reports its
+//     outcome on it and a send on a closed channel would panic. A consumer
+//     ranging over Results() must also stop on Run's return, not only on the
+//     channel closing.
+//
+// The straggling workers are not killed (Go cannot); they exit when their
+// Check or Publish returns.
 package runner
 
 import (
@@ -133,6 +159,12 @@ var ErrSkipped = errors.New("runner: slot skipped; prior run still in flight")
 // errors.Is(err, ErrSkipped) is true for both; check ErrSkippedQueued first
 // when classifying.
 var ErrSkippedQueued = fmt.Errorf("%w: prior run queued behind a saturated pool", ErrSkipped)
+
+// ErrShutdownTimeout is joined with ctx.Err() in Run's return when the
+// WithShutdownGrace deadline passes with runs still in flight. When it is
+// returned, Results() is left open and a straggling run may still Publish;
+// see the package doc's Shutdown section.
+var ErrShutdownTimeout = errors.New("runner: shutdown grace expired with runs still in flight")
 
 // Result is the outcome of a single scheduled slot: a completed run (Err nil or
 // the check/publish error), or a skipped slot (Err is ErrSkipped or
@@ -206,6 +238,8 @@ type Runner struct {
 	lastDropWarn atomic.Int64 // unix nanos of the last "results channel full" warning; 0 = never
 	running      atomic.Bool  // Run is single-use; a second call is an error, not a panic
 
+	grace time.Duration // shutdown wait bound; <= 0 = unbounded (see WithShutdownGrace)
+
 	clock clock
 
 	// afterDone, when non-nil, is called by a worker immediately after it has
@@ -214,11 +248,23 @@ type Runner struct {
 	afterDone func()
 }
 
+// Option configures optional Runner behavior; pass options to New.
+type Option func(*Runner)
+
+// WithShutdownGrace bounds how long Run waits, after ctx is cancelled, for
+// in-flight runs to finish. If runs are still in flight after d, Run returns
+// errors.Join(ctx.Err(), ErrShutdownTimeout) and leaves Results() open; see the
+// package doc's Shutdown section for what that path gives up. d <= 0 (the
+// default) keeps the unbounded wait.
+func WithShutdownGrace(d time.Duration) Option {
+	return func(r *Runner) { r.grace = d }
+}
+
 // New creates a Runner. interval is the default cadence for targets whose
 // Interval is <= 0 and must be > 0 (New panics otherwise). concurrency < 1 is
 // treated as 1.
 func New(chk check.Check, s sink.EventSink, evtCfg event.Config, targets []check.Target,
-	interval time.Duration, concurrency int) *Runner {
+	interval time.Duration, concurrency int, opts ...Option) *Runner {
 	if interval <= 0 {
 		panic(fmt.Sprintf("runner.New: default interval must be > 0, got %v", interval))
 	}
@@ -243,7 +289,7 @@ func New(chk check.Check, s sink.EventSink, evtCfg event.Config, targets []check
 			redacted: check.RedactURL(t.URL),
 		}
 	}
-	return &Runner{
+	r := &Runner{
 		chk:         chk,
 		sink:        s,
 		evtCfg:      evtCfg,
@@ -258,6 +304,10 @@ func New(chk check.Check, s sink.EventSink, evtCfg event.Config, targets []check
 		results: make(chan Result, 2*len(targets)+1),
 		clock:   realClock{},
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // phaseOf returns the target's stable offset within its interval:
@@ -301,9 +351,12 @@ func (r *Runner) Dropped() int64 { return r.dropped.Load() }
 // On shutdown it stops dispatching, waits for all in-flight runs to finish, then
 // closes the results channel so a draining consumer can exit cleanly. Entries
 // that were queued but not yet started are acked, not run. Waiting for in-flight
-// runs also guarantees no Publish races with a deferred sink Close. That wait is
-// unbounded by design: a Check or sink that ignores its context holds shutdown
-// until it returns (the bundled httpcheck honours ctx and its own timeout).
+// runs also guarantees no Publish races with a deferred sink Close. By default
+// that wait is unbounded: a Check or sink that ignores its context holds
+// shutdown until it returns (the bundled httpcheck honours ctx and its own
+// timeout). WithShutdownGrace bounds it; when the bound is hit Run returns
+// errors.Join(ctx.Err(), ErrShutdownTimeout), Results() stays open, and a
+// straggler may still Publish (see the package doc's Shutdown section).
 //
 // Run is single-use: a second call on the same Runner returns an error.
 func (r *Runner) Run(ctx context.Context) error {
@@ -317,19 +370,43 @@ func (r *Runner) Run(ctx context.Context) error {
 	done := make(chan *entry, len(r.entries))
 
 	var wg sync.WaitGroup
+	var live atomic.Int64 // workers not yet exited; reported if the grace expires
 	for range r.concurrency {
 		wg.Add(1)
+		live.Add(1)
 		go func() {
 			defer wg.Done()
+			defer live.Add(-1)
 			r.worker(ctx, work, done)
 		}()
 	}
 
 	err := r.schedule(ctx, work, done)
 	close(work)
-	wg.Wait()
-	close(r.results)
-	return err
+	if r.grace <= 0 {
+		wg.Wait()
+		close(r.results)
+		return err
+	}
+
+	// Bounded wait. On expiry the waiter goroutine outlives Run until the
+	// stragglers return; results stays open for their reportResult sends.
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+	gt := time.NewTimer(r.grace)
+	defer gt.Stop()
+	select {
+	case <-finished:
+		close(r.results)
+		return err
+	case <-gt.C:
+		slog.Warn("shutdown grace expired; returning with runs still in flight (Results left open)",
+			"workers", live.Load(), "grace", r.grace)
+		return errors.Join(err, ErrShutdownTimeout)
+	}
 }
 
 // schedule is the scheduler goroutine's loop; it is the sole owner of the heap
