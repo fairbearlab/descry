@@ -157,6 +157,14 @@ func (s *shadow) lap() {
 		// processed slot (invariant 5).
 		k := (s.now.Sub(s.next[i]) / s.interval[i]) + 1
 		s.next[i] = s.next[i].Add(k * s.interval[i])
+		if !s.next[i].After(s.now) {
+			// Mirrors runner.go's overflow self-heal: only reachable when
+			// now-next saturated time.Duration and k*interval overflowed.
+			// Re-derive the slot from the epoch instead of leaving next in
+			// the past, exactly as schedule() does. See TODOS.md "Fuzz
+			// shadow model does not mirror the overflow self-heal".
+			s.next[i] = slotAfter(s.now, s.interval[i], s.phase[i])
+		}
 	}
 	s.deadline = s.next[s.min()]
 }
