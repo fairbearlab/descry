@@ -137,10 +137,11 @@ jobs:
   # context cancellation — no race. Each count is a floor: it sits just under
   # the FEWEST execs the target managed in 60s across recent perf runs on a
   # GitHub Actions runner (FuzzScheduler 440k-1.28M, FuzzAssertSafeURL
-  # 1.35M-2.44M, FuzzIsBlockedIP 1.39M-2.37M, Sept 2026), so a slow runner
-  # does the same work it used to, while a fast runner does less than a 60s
-  # budget would have bought it. Raise the counts to buy more exploration;
-  # the job's timeout-minutes and go test's default 10m -timeout bound how far.
+  # 1.35M-2.44M, FuzzIsBlockedIP 1.39M-2.37M, FuzzToCloudEvent 1.38M-1.95M,
+  # Sept 2026), so a slow runner does the same work it used to, while a fast
+  # runner does less than a 60s budget would have bought it. Raise the counts
+  # to buy more exploration; the job's timeout-minutes and go test's default
+  # 10m -timeout bound how far.
   # Once go.mod moves to a Go release carrying the fix, the duration form is
   # safe again.
   fuzz:
@@ -159,7 +160,7 @@ jobs:
       - name: fuzz SSRF blocked-IP classifier
         run: go test -run '^$' -fuzz '^FuzzIsBlockedIP$' -fuzztime=1000000x ./checks/http/
       - name: fuzz event envelope (ToCloudEvent vs SDK-setter reference)
-        run: go test -run '^$' -fuzz '^FuzzToCloudEvent$' -fuzztime=60s ./event/
+        run: go test -run '^$' -fuzz '^FuzzToCloudEvent$' -fuzztime=1300000x ./event/
       - name: upload fuzz crashers
         # A crasher found on the runner is written to testdata/fuzz/ and lost
         # with the VM unless preserved; without this the failure is
