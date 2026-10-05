@@ -30,20 +30,6 @@ API generic — no consumer vocabulary.
 
 **Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
 
-### Forward wall-clock step test
-
-**What:** A runner test in which the wall clock jumps *forward* while the monotonic clock
-does not (the mirror of `TestBackwardStep_ReanchorsWithinOneInterval`): the armed timer
-still fires at its monotonic deadline, the scheduler finds `now` far past `next`, and the
-O(1) catch-up (`next += k·interval`) must yield exactly one run and a phase-aligned next
-slot, with no skip flood and no re-anchor log.
-
-**Why:** `TestStall_OneRunNoSkipFlood` advances both clocks together (a host sleep), and
-the fuzz target's step is backward-only. A forward wall step with the monotonic clock
-standing still (VM restore, NTP step after boot) is the one clock-movement case with zero
-coverage. `fakeClock.Step` in `runner/helpers_test.go` already supports either sign.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** none
 
 ## Config
 
@@ -60,17 +46,6 @@ independent pre-merge reviewers (Claude adversarial, Codex): a 1 ns target measu
 slots/s on one pegged core with one rate-limited warning as the only signal.
 
 **Effort:** S · **Priority:** P2 · **Depends on:** none
-
-### Fuzz shadow model does not mirror the overflow self-heal
-
-**What:** `runner/runner.go` re-derives `next` from the epoch when `k·interval` overflows
-(a wall clock centuries ahead saturates `Sub` at the max `Duration`). `FuzzScheduler`'s
-`shadow.lap()` does not model that branch. Unreachable at the fuzz's clock excursions
-(~12.8 h forward / 25 h back), so assertion (g) exact-`next` still holds; if the decoder's
-advance range is ever widened past the saturation point, (g) will diverge and look like
-a scheduler bug when it is a model gap. Mirror the guard in the shadow at that time.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** widening the fuzz clock range
 
 ## Event
 
@@ -141,6 +116,44 @@ consumer asks, not speculatively.
 **Effort:** M · **Priority:** P3 · **Depends on:** a consumer that needs it; v0.3.0 (landed)
 
 ## Completed
+
+### Fuzz shadow model does not mirror the overflow self-heal
+
+**What:** `runner/runner.go` re-derives `next` from the epoch when `k·interval` overflows
+(a wall clock centuries ahead saturates `Sub` at the max `Duration`). `FuzzScheduler`'s
+`shadow.lap()` did not model that branch. Unreachable at the fuzz's clock excursions
+(~12.8 h forward / 25 h back), so assertion (g) exact-`next` still held; if the decoder's
+advance range is ever widened past the saturation point, (g) would diverge and look like
+a scheduler bug when it is a model gap. Mirrored the guard in the shadow so it stays
+correct once that range widens.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** widening the fuzz clock range
+
+**Completed:** PR #25 (2026-09-26) — `shadow.lap()` now re-derives `next` from
+`slotAfter` when the saturated-`Duration` add leaves it non-advancing, mirroring
+`schedule()`'s guard line-for-line. Because the fuzz cannot reach that branch
+(largest advance 64·`fuzzMaxInterval`, largest step 25 h), the guard is pinned
+directly by `TestShadow_SaturatedDurationSelfHeals`, the shadow-side twin of
+`TestStall_SaturatedDurationSelfHeals`; removing the guard makes it spin and fail.
+
+### Forward wall-clock step test
+
+**What:** A runner test in which the wall clock jumps *forward* while the monotonic clock
+does not (the mirror of `TestBackwardStep_ReanchorsWithinOneInterval`): the armed timer
+still fires at its monotonic deadline, the scheduler finds `now` far past `next`, and the
+O(1) catch-up (`next += k·interval`) must yield exactly one run and a phase-aligned next
+slot, with no skip flood and no re-anchor log.
+
+**Why:** `TestStall_OneRunNoSkipFlood` advances both clocks together (a host sleep), and
+the fuzz target's step is backward-only. A forward wall step with the monotonic clock
+standing still (VM restore, NTP step after boot) is the one clock-movement case with zero
+coverage. `fakeClock.Step` in `runner/helpers_test.go` already supports either sign.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** PR #22 (2026-09-25) — `TestForwardStep_OneRunPerTargetNoReanchor`: 1h
+forward `fakeClock.Step` across 5 targets; one run each at the monotonic deadline,
+phase-aligned `next`, zero skips, no Info log.
 
 ### Perf gate: same-job benchstat + structural asserts + fuzz job
 
