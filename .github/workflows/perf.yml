@@ -113,6 +113,36 @@ jobs:
   # PR #14, and ToCloudEvent against its SDK-setter reference. The seed
   # corpora still run as normal tests in every `go test` invocation (ci.yml);
   # this job is the budgeted exploration on top.
+  #
+  # -fuzztime is given as an execution COUNT (the "Nx" form), not a wall-clock
+  # duration. With a duration, `go test -fuzz` sets internal/fuzz's coordinator
+  # context to context.WithTimeout(ctx, opts.Timeout); the moment that deadline
+  # fires while a worker's fuzz RPC is in flight, the coordinator can surface
+  # the low-level error as "context deadline exceeded" and fail the whole run
+  # instead of stopping cleanly. That is golang/go#75804 ("Fuzz testing with
+  # fuzztime flag sometimes fails incorrectly with context deadline
+  # exceeded"): the parent context's Done channel closes before the derived
+  # worker context's Err() is set, so the coordinator's `err == fuzzCtx.Err()`
+  # suppression check misses. Fixed on tip by go.dev/cl/774140 and backported
+  # to the go1.27 release branch (go.dev/cl/804900); the Go 1.26.x in go.mod
+  # still has the race. Seen intermittently on FuzzAssertSafeURL right at the
+  # 60s mark:
+  #
+  #   fuzz: elapsed: 1m0s, execs: 1353260 (22251/sec), ...
+  #   --- FAIL: FuzzAssertSafeURL (60.10s)
+  #       context deadline exceeded
+  #
+  # A count-based budget never sets that deadline (opts.Timeout stays 0), so
+  # the run always stops via the plain execution-count check instead of a
+  # context cancellation — no race. Each count is a floor: it sits just under
+  # the FEWEST execs the target managed in 60s across recent perf runs on a
+  # GitHub Actions runner (FuzzScheduler 440k-1.28M, FuzzAssertSafeURL
+  # 1.35M-2.44M, FuzzIsBlockedIP 1.39M-2.37M, Sept 2026), so a slow runner
+  # does the same work it used to, while a fast runner does less than a 60s
+  # budget would have bought it. Raise the counts to buy more exploration;
+  # the job's timeout-minutes and go test's default 10m -timeout bound how far.
+  # Once go.mod moves to a Go release carrying the fix, the duration form is
+  # safe again.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -123,11 +153,11 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: fuzz scheduler
-        run: go test -run '^$' -fuzz '^FuzzScheduler$' -fuzztime=60s ./runner/
+        run: go test -run '^$' -fuzz '^FuzzScheduler$' -fuzztime=400000x ./runner/
       - name: fuzz SSRF layer 1 (assertSafeURL)
-        run: go test -run '^$' -fuzz '^FuzzAssertSafeURL$' -fuzztime=60s ./checks/http/
+        run: go test -run '^$' -fuzz '^FuzzAssertSafeURL$' -fuzztime=1200000x ./checks/http/
       - name: fuzz SSRF blocked-IP classifier
-        run: go test -run '^$' -fuzz '^FuzzIsBlockedIP$' -fuzztime=60s ./checks/http/
+        run: go test -run '^$' -fuzz '^FuzzIsBlockedIP$' -fuzztime=1000000x ./checks/http/
       - name: fuzz event envelope (ToCloudEvent vs SDK-setter reference)
         run: go test -run '^$' -fuzz '^FuzzToCloudEvent$' -fuzztime=60s ./event/
       - name: upload fuzz crashers

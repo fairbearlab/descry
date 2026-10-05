@@ -4,10 +4,13 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -443,6 +446,64 @@ func TestBackwardStep_ReanchorsWithinOneInterval(t *testing.T) {
 	}
 }
 
+// TestForwardStep_OneRunPerTargetNoReanchor is the mirror of the backward
+// step: the wall clock jumps forward 1h while the monotonic clock stands still
+// (VM restore, NTP step after boot). Nothing fires on the step itself; the
+// armed timer fires at its original monotonic deadline, the scheduler finds
+// now far past every next, and the O(1) catch-up gives each target exactly
+// one run and a phase-aligned next slot — no skip flood, no re-anchor log.
+func TestForwardStep_OneRunPerTargetNoReanchor(t *testing.T) {
+	const iv, n = 30 * time.Second, 5
+	logs := captureLogs(t, slog.LevelInfo)
+	chk := &fakeCheck{calls: make(chan call, 64)}
+	ts := targetsN(n, "http://fwd")
+	tr := newTestRunner(t, chk, ts, iv, n)
+
+	armed := firstSlot(ts[0].URL, iv) // the timer is armed for the earliest slot
+	for _, x := range ts[1:] {
+		if s := firstSlot(x.URL, iv); s.Before(armed) {
+			armed = s
+		}
+	}
+	wait := armed.Sub(epoch)
+
+	tr.fc.Step(time.Hour)
+	expectNoCall(t, chk.calls) // a step alone wakes nothing
+	tr.advance(wait - time.Nanosecond)
+	expectNoCall(t, chk.calls) // not before the monotonic deadline
+	tr.advance(time.Nanosecond)
+	now := tr.fc.Now()
+
+	ran := map[string]int{}
+	for range n {
+		c := recvCall(t, chk.calls)
+		if !c.at.Equal(now) {
+			t.Fatalf("%s ran at %v, want %v", c.url, c.at, now)
+		}
+		ran[c.url]++
+		tr.completeOne(t)
+	}
+	expectNoCall(t, chk.calls)
+	for _, x := range ts {
+		if ran[x.URL] != 1 {
+			t.Fatalf("%s ran %d times after the step, want exactly 1", x.URL, ran[x.URL])
+		}
+	}
+	if tr.Skipped() != 0 {
+		t.Fatalf("skip flood: Skipped() = %d", tr.Skipped())
+	}
+
+	tr.stop() // entries are safe to read once Run has returned
+	for _, e := range tr.entries {
+		if want := slotAfter(now, iv, e.phase); !e.next.Equal(want) {
+			t.Errorf("%s: next = %v, want the phase-aligned slot %v", e.t.URL, e.next, want)
+		}
+	}
+	if got := logs.records(slog.LevelInfo); len(got) != 0 {
+		t.Fatalf("forward step logged %d Info records, want none (no re-anchor): %+v", len(got), got)
+	}
+}
+
 // TestEarlyWake_ReArmsWithoutRunning: a timer that fires before next (wall
 // slew, spurious wake) is re-armed; nothing runs, nothing is skipped.
 func TestEarlyWake_ReArmsWithoutRunning(t *testing.T) {
@@ -663,6 +724,116 @@ func TestRun_ShutdownDoesNotRequireResultsDrain(t *testing.T) { // real clock
 	}
 }
 
+// startWedged runs one target whose check ignores ctx, under opts, and
+// returns once that check is running. release unwedges it (idempotent; it
+// also runs at cleanup).
+func startWedged(t *testing.T, opts ...Option) (tr *testRunner, release func()) {
+	t.Helper()
+	const iv = 10 * time.Second
+	chk := &fakeCheck{wedge: make(chan struct{}), calls: make(chan call, 1)}
+	fc := newFakeClock(t)
+	chk.now = fc.Now
+	r := New(chk, nopSink{}, event.Config{Source: "test"}, []check.Target{{URL: "http://wedged"}}, iv, 1, opts...)
+	tr = startTestRunner(t, r, fc)
+	var once sync.Once
+	release = func() { once.Do(func() { close(chk.wedge) }) }
+	t.Cleanup(release) // LIFO: before the harness's stop, so Run can finish
+	tr.advanceTo(firstSlot("http://wedged", iv))
+	recvCall(t, chk.calls)
+	return tr, release
+}
+
+// TestShutdown_GraceBoundsWedgedRun: with WithShutdownGrace, a check that
+// ignores ctx no longer holds Run. Run returns ctx.Err() joined with
+// ErrShutdownTimeout after the grace, warns with the in-flight worker count,
+// and leaves Results() open — the straggler still reports on it when it
+// finally returns (a send on a closed channel would panic).
+func TestShutdown_GraceBoundsWedgedRun(t *testing.T) {
+	const grace = 50 * time.Millisecond
+	logs := captureLogs(t, slog.LevelWarn)
+	tr, release := startWedged(t, WithShutdownGrace(grace))
+
+	start := time.Now()
+	tr.stop()
+	if el := time.Since(start); el < grace {
+		t.Fatalf("Run returned after %v, before the %v grace", el, grace)
+	}
+	if !errors.Is(tr.err, context.Canceled) || !errors.Is(tr.err, ErrShutdownTimeout) {
+		t.Fatalf("Run returned %v, want context.Canceled joined with ErrShutdownTimeout", tr.err)
+	}
+	warns := logs.records(slog.LevelWarn)
+	if len(warns) != 1 || !strings.Contains(warns[0].Message, "shutdown grace expired") {
+		t.Fatalf("want one shutdown-grace Warn, got %d: %+v", len(warns), warns)
+	}
+	var workers int64 = -1
+	warns[0].Attrs(func(a slog.Attr) bool {
+		if a.Key == "workers" {
+			workers = a.Value.Int64()
+		}
+		return true
+	})
+	if workers != 1 {
+		t.Fatalf("Warn workers = %d, want 1 (the wedged run)", workers)
+	}
+	select {
+	case res, ok := <-tr.Results():
+		t.Fatalf("Results() yielded (%+v, open=%v) before the straggler returned; want open and empty", res, ok)
+	default:
+	}
+
+	release()
+	if res := recv(t, tr.Results()); res.Err != nil || res.Target.URL != "http://wedged" {
+		t.Fatalf("straggler Result = %+v, want the wedged target's completion", res)
+	}
+}
+
+// TestShutdown_GraceUnusedWhenRunsFinish: a grace that is not needed changes
+// nothing — Run returns plain ctx.Err() as soon as in-flight runs finish and
+// closes Results().
+func TestShutdown_GraceUnusedWhenRunsFinish(t *testing.T) {
+	const iv = 10 * time.Second
+	chk := &fakeCheck{gate: make(chan struct{}), calls: make(chan call, 1)}
+	fc := newFakeClock(t)
+	chk.now = fc.Now
+	r := New(chk, nopSink{}, event.Config{Source: "test"}, []check.Target{{URL: "http://g"}}, iv, 1,
+		WithShutdownGrace(time.Minute))
+	tr := startTestRunner(t, r, fc)
+	tr.advanceTo(firstSlot("http://g", iv))
+	recvCall(t, chk.calls) // running; returns on ctx
+
+	tr.stop() // well inside stopWait, so nowhere near the minute of grace
+	if !errors.Is(tr.err, context.Canceled) || errors.Is(tr.err, ErrShutdownTimeout) {
+		t.Fatalf("Run returned %v, want context.Canceled alone", tr.err)
+	}
+	awaitClosed(t, tr.Results())
+}
+
+// TestShutdown_UnboundedWithoutGrace: the default (and a grace <= 0) keeps
+// the unbounded wait — Run holds until the wedged check returns, then closes
+// Results() and returns plain ctx.Err().
+func TestShutdown_UnboundedWithoutGrace(t *testing.T) {
+	for name, opts := range map[string][]Option{
+		"default": nil,
+		"zero":    {WithShutdownGrace(0)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tr, release := startWedged(t, opts...)
+			tr.cancel()
+			select {
+			case err := <-tr.ret:
+				t.Fatalf("Run returned %v while a run was still in flight", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			release()
+			tr.stop()
+			if !errors.Is(tr.err, context.Canceled) || errors.Is(tr.err, ErrShutdownTimeout) {
+				t.Fatalf("Run returned %v, want context.Canceled alone", tr.err)
+			}
+			awaitClosed(t, tr.Results())
+		})
+	}
+}
+
 // ---------- results channel ----------
 
 // TestReportResult_DropCountedAndWarnedOncePerInterval: a full channel
@@ -756,6 +927,44 @@ func TestFakeClock_SecondTimerPanics(t *testing.T) {
 		}
 	}()
 	fc.NewTimer(time.Second)
+}
+
+// fatalRecorder stands in for the *testing.T a testRunner reports through:
+// Fatalf records the message and exits the calling goroutine, as the real
+// one does, without failing the enclosing test.
+type fatalRecorder struct {
+	testing.TB
+	msg string
+}
+
+func (f *fatalRecorder) Helper() {}
+func (f *fatalRecorder) Fatalf(format string, args ...any) {
+	f.msg = fmt.Sprintf(format, args...)
+	runtime.Goexit()
+}
+
+// TestTestRunner_StopFailsOnWedgedRun: a Run that never returns after cancel
+// fails the test through its *testing.T (so the test's own first diagnostic
+// is what a reader sees) instead of panicking the whole binary.
+func TestTestRunner_StopFailsOnWedgedRun(t *testing.T) {
+	const iv = 10 * time.Second
+	chk := &fakeCheck{wedge: make(chan struct{}), calls: make(chan call, 1)}
+	tr := newTestRunner(t, chk, []check.Target{{URL: "http://w"}}, iv, 1)
+	t.Cleanup(func() { close(chk.wedge) }) // LIFO: releases the worker before the harness's own stop
+	tr.advanceTo(firstSlot("http://w", iv))
+	recvCall(t, chk.calls) // the worker is now wedged, ignoring ctx
+
+	rec := &fatalRecorder{TB: t}
+	tr.tb, tr.stopWait = rec, 50*time.Millisecond
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		tr.stop() // must reach rec.Fatalf; a panic here would crash the binary
+	}()
+	<-exited
+	if !strings.Contains(rec.msg, "did not return") {
+		t.Fatalf("stop on a wedged Run: Fatalf message = %q, want one naming the hang", rec.msg)
+	}
 }
 
 // TestRun_SecondCallReturnsError: Run is single-use. A second call must return

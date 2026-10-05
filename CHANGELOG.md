@@ -8,7 +8,29 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`runner.WithShutdownGrace(d)` bounds `Run`'s shutdown wait.** By default
+  `Run` still waits for in-flight runs without limit. With the option, if runs
+  are still in flight `d` after the scheduler stops, `Run` logs a Warn with the
+  count of workers still running and returns
+  `errors.Join(ctx.Err(), runner.ErrShutdownTimeout)`. On that path `Results()`
+  is **not** closed and a straggling run may still `Publish` after `Run`
+  returns — see `docs/OPERATIONS.md` § Shutdown before closing a sink right
+  after `Run`. `runner.New` gains a trailing `...runner.Option` parameter for
+  it; existing calls compile unchanged (a program that stores `runner.New` as a
+  function value of the old type does not).
+
 ### Changed
+
+- **Breaking (config): `config.Load` rejects an effective interval below 1ms**
+  — a top-level `interval` or a `targets[].interval` override — with an error
+  naming the floor, exported as `config.MinInterval`. Below that the scheduler
+  spins on one core and drives `Skipped()`/`Dropped()` up at millions per
+  second behind one rate-limited warning; no network probe needs it. Zero
+  still means "inherit" and a negative per-target value is still its own
+  error. `runner.New` is unchanged and accepts any positive interval: the floor
+  is config/CLI policy.
 
 - **`event.ToCloudEvent` allocates 3–6 times per event instead of 13–18**
   (−31–53 % ns/op). The common path writes the CloudEvents V1 context into one
@@ -153,6 +175,7 @@ two-layer SSRF guard, and the YAML-configured `descry` binary.
 <!-- Entries for 0.1.0–0.2.1 were reconstructed from git history when this file
      was added in 0.3.0; the GitHub release notes are authoritative for those tags. -->
 
+[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/fairbearlab/descry/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/fairbearlab/descry/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/fairbearlab/descry/compare/v0.1.2...v0.2.0
