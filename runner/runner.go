@@ -227,7 +227,8 @@ func (h *schedHeap) Pop() any          { old := *h; n := len(old); e := old[n-1]
 type Runner struct {
 	chk         check.Check
 	sink        sink.EventSink
-	evtCfg      event.Config
+	enc         *event.Encoder // built once in New; nil when encErr != nil
+	encErr      error          // event config rejected by New; surfaced by Run
 	entries     []*entry
 	interval    time.Duration // default for targets with Interval <= 0; also the drop-warn rate-limit window
 	concurrency int
@@ -276,6 +277,10 @@ func New(chk check.Check, s sink.EventSink, evtCfg event.Config, targets []check
 		// targets can never be busy at once; don't spend goroutines on them.
 		concurrency = len(targets)
 	}
+	// Build the encoder once: the config is invariant for the Runner's life, so
+	// validating it per event is wasted work. New keeps its signature, so a bad
+	// config is stored and reported by Run (after the single-use check).
+	enc, encErr := event.NewEncoder(evtCfg)
 	entries := make([]*entry, len(targets))
 	for i, t := range targets {
 		iv := t.Interval
@@ -292,7 +297,8 @@ func New(chk check.Check, s sink.EventSink, evtCfg event.Config, targets []check
 	r := &Runner{
 		chk:         chk,
 		sink:        s,
-		evtCfg:      evtCfg,
+		enc:         enc,
+		encErr:      encErr,
 		entries:     entries,
 		interval:    interval,
 		concurrency: concurrency,
@@ -346,7 +352,9 @@ func (r *Runner) Dropped() int64 { return r.dropped.Load() }
 // Run starts the scheduler and worker pool and blocks until ctx is cancelled.
 // Each target first fires at its phase offset within its interval (up to one
 // interval after Run starts), then every interval on the same wall-clock slot.
-// Returns ctx.Err() when ctx is cancelled — this is not considered fatal.
+// Returns ctx.Err() when ctx is cancelled — this is not considered fatal — or,
+// immediately, the event-config error described below, so callers must check
+// Run's error.
 //
 // On shutdown it stops dispatching, waits for all in-flight runs to finish, then
 // closes the results channel so a draining consumer can exit cleanly. Entries
@@ -358,10 +366,18 @@ func (r *Runner) Dropped() int64 { return r.dropped.Load() }
 // errors.Join(ctx.Err(), ErrShutdownTimeout), Results() stays open, and a
 // straggler may still Publish (see the package doc's Shutdown section).
 //
-// Run is single-use: a second call on the same Runner returns an error.
+// Run is single-use: a second call on the same Runner returns an error. If New
+// rejected the event config, Run closes Results() and returns that error
+// (wrapped) without starting any check.
 func (r *Runner) Run(ctx context.Context) error {
 	if !r.running.CompareAndSwap(false, true) {
 		return errors.New("runner: Run called more than once on the same Runner")
+	}
+	if r.encErr != nil {
+		// No workers or checks have started; close results so a consumer that
+		// drains to close terminates instead of hanging.
+		close(r.results)
+		return fmt.Errorf("runner: event config: %w", r.encErr)
 	}
 	work := make(chan *entry, len(r.entries))
 	// done is sized so a worker's ack never blocks: an entry is dispatched only
@@ -557,7 +573,7 @@ func (r *Runner) runOne(ctx context.Context, t check.Target) {
 		r.reportResult(Result{Target: t, Err: err})
 		return
 	}
-	e, err := event.ToCloudEvent(obs, r.evtCfg)
+	e, err := r.enc.Encode(obs)
 	if err != nil {
 		r.reportResult(Result{Target: t, Err: err})
 		return

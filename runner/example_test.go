@@ -69,5 +69,7 @@ func ExampleNew_perTargetIntervals() {
 			}
 		}
 	}()
-	_ = r.Run(ctx)
+	if err := r.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Println("run:", err) // e.g. an invalid event config
+	}
 }
