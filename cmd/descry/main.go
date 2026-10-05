@@ -33,26 +33,41 @@ var (
 )
 
 func main() {
-	cfgPath := flag.String("config", "", "path to YAML config")
-	sinkOverride := flag.String("sink", "", `override config sink ("stdout" | "file")`)
-	fileOverride := flag.String("file", "", "override config file_path (sink=file)")
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run is main's testable body: it returns the process exit code (0 ok, 1
+// runtime failure, 2 usage/config error) instead of calling os.Exit, so
+// deferred cleanup runs and tests can drive it.
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("descry", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "", "path to YAML config")
+	sinkOverride := fs.String("sink", "", `override config sink ("stdout" | "file")`)
+	fileOverride := fs.String("file", "", "override config file_path (sink=file)")
+	showVersion := fs.Bool("version", false, "print version and exit")
+	if err := fs.Parse(args); err != nil {
+		// -h/--help printed usage; exit 0 as flag.Parse's ExitOnError did.
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
 
 	if *showVersion {
-		fmt.Printf("descry %s (%s) %s\n", version, commit, date)
-		return
+		_, _ = fmt.Fprintf(stdout, "descry %s (%s) %s\n", version, commit, date)
+		return 0
 	}
 
 	if *cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "error: --config is required")
-		os.Exit(2)
+		_, _ = fmt.Fprintln(stderr, "error: --config is required")
+		return 2
 	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(2)
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
 	}
 
 	// CLI flags override config values; re-validate the combined result through
@@ -64,24 +79,33 @@ func main() {
 		cfg.FilePath = *fileOverride
 	}
 	if err := config.ValidateSink(cfg.Sink, cfg.FilePath); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(2)
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+
+	// Validate the event config before opening the sink: config.Load accepts
+	// any non-empty source, but an unusable one would otherwise only surface
+	// from Run, after the sink was created (and a file sink truncated/created).
+	evCfg := event.Config{Source: cfg.Source}
+	if _, err := event.NewEncoder(evCfg); err != nil {
+		_, _ = fmt.Fprintf(stderr, "error: invalid event config (source %q): %v\n", cfg.Source, err)
+		return 2
 	}
 
 	// Build the event sink.
-	var s sink.EventSink = sink.NewStdoutSink(os.Stdout)
+	var s sink.EventSink = sink.NewStdoutSink(stdout)
 	if cfg.Sink == "file" {
-		fs, err := sink.NewFileSink(cfg.FilePath)
+		fsink, err := sink.NewFileSink(cfg.FilePath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(2)
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 2
 		}
 		defer func() {
-			if err := fs.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "error: closing file sink: %v\n", err)
+			if err := fsink.Close(); err != nil {
+				_, _ = fmt.Fprintf(stderr, "error: closing file sink: %v\n", err)
 			}
 		}()
-		s = fs
+		s = fsink
 	}
 
 	targets := buildTargets(cfg, slog.Default())
@@ -92,7 +116,7 @@ func main() {
 	r := runner.New(
 		httpcheck.New(cfg.Timeout),
 		s,
-		event.Config{Source: cfg.Source},
+		evCfg,
 		targets,
 		cfg.Interval,
 		cfg.Concurrency,
@@ -104,7 +128,7 @@ func main() {
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		failures.Store(drainResults(r.Results(), os.Stderr, cfg.Interval, time.Now))
+		failures.Store(drainResults(r.Results(), stderr, cfg.Interval, time.Now))
 	}()
 
 	// Once the first signal has cancelled ctx, restore default signal handling
@@ -115,12 +139,30 @@ func main() {
 		stop()
 	}()
 
-	// Run until interrupted. ctx.Err() on shutdown is not fatal. Run closes
-	// Results() before returning; wait for the drain so the last buffered
-	// diagnostics reach stderr before the process exits.
-	_ = r.Run(ctx)
+	// Run until interrupted. context.Canceled on shutdown is not fatal; any
+	// other error is. Without WithShutdownGrace (never set here: this wait
+	// relies on it) Run closes Results() before returning on every path; wait
+	// for the drain so the last buffered diagnostics reach stderr before the
+	// process exits.
+	runErr := r.Run(ctx)
 	<-drained
 	_ = failures.Load() // available for future exit-code logic
+	code := exitCodeFor(runErr)
+	if code != 0 {
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", runErr)
+	}
+	return code
+}
+
+// exitCodeFor maps Run's return to the process exit code: nil or a
+// cancellation (the normal signal-driven shutdown) is 0; any other error is a
+// runtime failure. A grace timeout joined with ctx.Err() also maps to 0, but
+// run never sets WithShutdownGrace.
+func exitCodeFor(runErr error) int {
+	if runErr == nil || errors.Is(runErr, context.Canceled) {
+		return 0
+	}
+	return 1
 }
 
 // drainResults prints each Result's diagnostic to w until results is closed
