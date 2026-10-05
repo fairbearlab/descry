@@ -30,60 +30,6 @@ API generic — no consumer vocabulary.
 
 **Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
 
-### Forward wall-clock step test
-
-**What:** A runner test in which the wall clock jumps *forward* while the monotonic clock
-does not (the mirror of `TestBackwardStep_ReanchorsWithinOneInterval`): the armed timer
-still fires at its monotonic deadline, the scheduler finds `now` far past `next`, and the
-O(1) catch-up (`next += k·interval`) must yield exactly one run and a phase-aligned next
-slot, with no skip flood and no re-anchor log.
-
-**Why:** `TestStall_OneRunNoSkipFlood` advances both clocks together (a host sleep), and
-the fuzz target's step is backward-only. A forward wall step with the monotonic clock
-standing still (VM restore, NTP step after boot) is the one clock-movement case with zero
-coverage. `fakeClock.Step` in `runner/helpers_test.go` already supports either sign.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** none
-
-### `testRunner.stop()` should fail, not panic, on a wedged `Run`
-
-**What:** `runner/helpers_test.go` `(*testRunner).stop` panics after 5 s if `Run` has not
-returned. Replace with a `t.Fatalf` (needs the `*testing.T` on the helper) so the test's
-own diagnostic — usually the `t.Fatalf` that fired first — is what a reader sees, not a
-goroutine dump from the helper.
-
-**Why:** Today a real scheduler hang buries the message that says what actually broke.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** none
-
-### Bounded shutdown grace
-
-**What:** `Run`'s shutdown wait for in-flight runs is unbounded by design: a `Check` or
-sink that ignores its context holds `Run` (and `Results()` open) until it returns. Add an
-optional grace deadline (a functional option or a field on `New`'s successor) after which
-`Run` returns `errors.Join(ctx.Err(), ErrShutdownTimeout)`, logs how many workers were
-still in flight, and does *not* close `Results()` (a straggler could still publish).
-
-**Why:** The bundled `httpcheck` honours ctx and its own timeout, and `cmd/descry` now
-restores default signal handling after the first signal so a second Ctrl-C terminates the
-process. A library user with a custom sink and no such escape hatch would want the bound.
-It changes the "no `Publish` after `Run` returns" guarantee for that path, so it needs its
-own design note and OPERATIONS.md entry, not a drive-by.
-
-**Effort:** S · **Priority:** P2 · **Depends on:** a consumer that needs it
-
-## Config
-
-### Fuzz shadow model does not mirror the overflow self-heal
-
-**What:** `runner/runner.go` re-derives `next` from the epoch when `k·interval` overflows
-(a wall clock centuries ahead saturates `Sub` at the max `Duration`). `FuzzScheduler`'s
-`shadow.lap()` does not model that branch. Unreachable at the fuzz's clock excursions
-(~12.8 h forward / 25 h back), so assertion (g) exact-`next` still holds; if the decoder's
-advance range is ever widened past the saturation point, (g) will diverge and look like
-a scheduler bug when it is a model gap. Mirror the guard in the shadow at that time.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** widening the fuzz clock range
 
 ## Event
 
@@ -155,6 +101,44 @@ consumer asks, not speculatively.
 
 ## Completed
 
+### Fuzz shadow model does not mirror the overflow self-heal
+
+**What:** `runner/runner.go` re-derives `next` from the epoch when `k·interval` overflows
+(a wall clock centuries ahead saturates `Sub` at the max `Duration`). `FuzzScheduler`'s
+`shadow.lap()` did not model that branch. Unreachable at the fuzz's clock excursions
+(~12.8 h forward / 25 h back), so assertion (g) exact-`next` still held; if the decoder's
+advance range is ever widened past the saturation point, (g) would diverge and look like
+a scheduler bug when it is a model gap. Mirrored the guard in the shadow so it stays
+correct once that range widens.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** widening the fuzz clock range
+
+**Completed:** PR #25 (2026-09-26) — `shadow.lap()` now re-derives `next` from
+`slotAfter` when the saturated-`Duration` add leaves it non-advancing, mirroring
+`schedule()`'s guard line-for-line. Because the fuzz cannot reach that branch
+(largest advance 64·`fuzzMaxInterval`, largest step 25 h), the guard is pinned
+directly by `TestShadow_SaturatedDurationSelfHeals`, the shadow-side twin of
+`TestStall_SaturatedDurationSelfHeals`; removing the guard makes it spin and fail.
+
+### Forward wall-clock step test
+
+**What:** A runner test in which the wall clock jumps *forward* while the monotonic clock
+does not (the mirror of `TestBackwardStep_ReanchorsWithinOneInterval`): the armed timer
+still fires at its monotonic deadline, the scheduler finds `now` far past `next`, and the
+O(1) catch-up (`next += k·interval`) must yield exactly one run and a phase-aligned next
+slot, with no skip flood and no re-anchor log.
+
+**Why:** `TestStall_OneRunNoSkipFlood` advances both clocks together (a host sleep), and
+the fuzz target's step is backward-only. A forward wall step with the monotonic clock
+standing still (VM restore, NTP step after boot) is the one clock-movement case with zero
+coverage. `fakeClock.Step` in `runner/helpers_test.go` already supports either sign.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** PR #22 (2026-09-25) — `TestForwardStep_OneRunPerTargetNoReanchor`: 1h
+forward `fakeClock.Step` across 5 targets; one run each at the monotonic deadline,
+phase-aligned `next`, zero skips, no Info log.
+
 ### Perf gate: same-job benchstat + structural asserts + fuzz job
 
 **What:** A PR-triggered workflow that (1) benchmarks merge-base and head in the same job
@@ -176,6 +160,41 @@ job is PR-triggered, not cron (idle repos get scheduled workflows auto-disabled)
 pipes, awk gate fails closed on zero parsed rows, alloc guards actually run in CI
 (non-`-race` step), fuzz crashers uploaded as artifacts, scale harness detects
 early `Run` exit and iterates all configured targets.
+
+### `testRunner.stop()` should fail, not panic, on a wedged `Run`
+
+**What:** `runner/helpers_test.go` `(*testRunner).stop` panics after 5 s if `Run` has not
+returned. Replace with a `t.Fatalf` (needs the `*testing.T` on the helper) so the test's
+own diagnostic — usually the `t.Fatalf` that fired first — is what a reader sees, not a
+goroutine dump from the helper.
+
+**Why:** Today a real scheduler hang buries the message that says what actually broke.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** PR #21 (2026-09-25) — `stop` fails through the test's `testing.TB`
+after `stopWait`; `fakeCheck.wedge` (ignores ctx) and a recording-`TB` self-test.
+
+### Bounded shutdown grace
+
+**What:** `Run`'s shutdown wait for in-flight runs is unbounded by design: a `Check` or
+sink that ignores its context holds `Run` (and `Results()` open) until it returns. Add an
+optional grace deadline (a functional option or a field on `New`'s successor) after which
+`Run` returns `errors.Join(ctx.Err(), ErrShutdownTimeout)`, logs how many workers were
+still in flight, and does *not* close `Results()` (a straggler could still publish).
+
+**Why:** The bundled `httpcheck` honours ctx and its own timeout, and `cmd/descry` now
+restores default signal handling after the first signal so a second Ctrl-C terminates the
+process. A library user with a custom sink and no such escape hatch would want the bound.
+It changes the "no `Publish` after `Run` returns" guarantee for that path, so it needs its
+own design note and OPERATIONS.md entry, not a drive-by.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** a consumer that needs it
+
+**Completed:** PR #21 (2026-09-25) — `runner.WithShutdownGrace(d)` as a variadic
+functional option on `New`; design note in the `runner` package doc (`# Shutdown`),
+OPERATIONS.md § Shutdown → "Bounding the wait", CHANGELOG `[Unreleased]`. `Results()` stays
+open on the timeout path, per the entry; `cmd/descry` does not set it.
 
 ### Cadence floor
 

@@ -8,6 +8,19 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`runner.WithShutdownGrace(d)` bounds `Run`'s shutdown wait.** By default
+  `Run` still waits for in-flight runs without limit. With the option, if runs
+  are still in flight `d` after the scheduler stops, `Run` logs a Warn with the
+  count of workers still running and returns
+  `errors.Join(ctx.Err(), runner.ErrShutdownTimeout)`. On that path `Results()`
+  is **not** closed and a straggling run may still `Publish` after `Run`
+  returns — see `docs/OPERATIONS.md` § Shutdown before closing a sink right
+  after `Run`. `runner.New` gains a trailing `...runner.Option` parameter for
+  it; existing calls compile unchanged (a program that stores `runner.New` as a
+  function value of the old type does not).
+
 ### Changed
 
 - **Breaking (config): `config.Load` rejects an effective interval below 1ms**

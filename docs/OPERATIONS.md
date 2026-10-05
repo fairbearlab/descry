@@ -214,13 +214,15 @@ Fix it by raising that target's `interval` above `timeout`, or by lowering
 | INFO | `clock stepped back; re-anchored schedule` | once per backward wall-clock step |
 | WARN | `check timeout exceeds interval; …` | startup, once per offending target |
 | WARN | `dropping results; results channel full …` | consumer not draining; rate-limited to once per default interval |
+| WARN | `shutdown grace expired; …` | `WithShutdownGrace` only: `Run` returned with `workers` runs still in flight; see [Shutdown](#bounding-the-wait-withshutdowngrace) |
 | ERROR | `publish failed after retries` | the sink rejected an event 3 times (linear back-off, 100ms × attempt). The observation is lost; the scheduler continues |
 
 Publishing is best-effort by design: bounded retry, then log and continue. The
 scheduler goroutine is never blocked by a sink — a slow `Publish` holds one
 worker, and the target's later slots surface as `ErrSkipped`. A sink or `Check`
-that ignores its context altogether holds that worker (and, at shutdown, `Run`)
-until it returns; the bundled `httpcheck` honours both.
+that ignores its context altogether holds that worker (and, at shutdown, `Run`,
+unless `WithShutdownGrace` bounds it) until it returns; the bundled `httpcheck`
+honours both.
 
 Logging itself is synchronous `slog`: the two lines the scheduler goroutine can
 emit (the re-anchor Info and the rate-limited drop Warn) are written inline. If
@@ -240,11 +242,44 @@ Cancel the context passed to `Run`. The runner stops dispatching, waits for
 in-flight runs to finish, then closes `Results()` so a draining consumer's loop
 exits. Targets that were queued but not yet started are acked without running, so
 shutdown produces no burst of `context.Canceled` results. No `Publish` happens
-after `Run` returns — which is what makes a deferred sink `Close()` safe. The wait
-for in-flight runs is unbounded by design (see above); `cmd/descry` restores
-default signal handling once the first signal has been received, so a second
-Ctrl-C terminates the process if a check or sink will not return. A `Runner` is
-single-use: a second `Run` returns an error.
+after `Run` returns — which is what makes a deferred sink `Close()` safe. By
+default the wait for in-flight runs is unbounded (see above); `cmd/descry`
+restores default signal handling once the first signal has been received, so a
+second Ctrl-C terminates the process if a check or sink will not return. A
+`Runner` is single-use: a second `Run` returns an error.
+
+### Bounding the wait: `WithShutdownGrace`
+
+A program embedding the runner, with a custom `Check` or sink and no second-signal
+escape hatch, can bound the wait:
+
+```go
+r := runner.New(chk, s, evtCfg, targets, interval, concurrency,
+    runner.WithShutdownGrace(10*time.Second))
+```
+
+If runs are still in flight when the grace expires, `Run` logs
+
+```
+level=WARN msg="shutdown grace expired; returning with runs still in flight (Results left open)" workers=1 grace=10s
+```
+
+and returns `errors.Join(ctx.Err(), runner.ErrShutdownTimeout)`. That return
+gives up two guarantees of the unbounded path, deliberately:
+
+- **A straggler may still `Publish` after `Run` returns.** Closing the sink
+  right after `Run` can race a late write; either make the sink's `Publish`
+  safe after `Close` (the bundled `FileSink` returns an error, which the
+  straggler logs), or skip the `Close` and let process exit reclaim it.
+- **`Results()` is not closed**, because a straggler still reports its outcome
+  on it. A consumer draining `Results()` must also stop when `Run` returns —
+  `for range r.Results()` alone would wait forever.
+
+Test for it with `errors.Is(err, runner.ErrShutdownTimeout)`; `errors.Is(err,
+context.Canceled)` stays true as well. Stragglers are not killed — Go cannot —
+they exit when their `Check` or `Publish` returns. Size the grace above the
+check `timeout` plus the sink's worst honest `Publish` latency, so it only
+fires on a run that is genuinely wedged. The `descry` binary does not set it.
 
 ## Triage quick reference
 
