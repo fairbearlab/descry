@@ -65,6 +65,9 @@ targets:
     interval: 30s      # this target's own cadence; others use the top-level interval
 ```
 
+Intervals below 1ms (`config.MinInterval`) are rejected at load: at that
+cadence the scheduler can only spin.
+
 If a target's interval is not longer than the check `timeout`, descry
 logs one startup warning naming it; a slow response on that target will then
 surface as `ErrSkipped` rather than blocking its next slot.

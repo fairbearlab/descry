@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -85,6 +86,35 @@ func TestLoad_Errors(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Load(writeConfig(t, body)); err == nil {
 				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+}
+
+// TestLoad_CadenceFloor: an effective interval below MinInterval would spin
+// the scheduler, so Load rejects it and names the floor; exactly MinInterval
+// loads, and a per-target zero still inherits the top-level interval.
+func TestLoad_CadenceFloor(t *testing.T) {
+	p := writeConfig(t, "source: s\ninterval: 1ms\ntargets:\n"+
+		"  - url: https://a.example.com\n    interval: 1ms\n"+
+		"  - url: https://b.example.com\n    interval: 0s\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("interval at the floor: %v", err)
+	}
+	if cfg.Interval != MinInterval || cfg.Targets[0].Interval != MinInterval || cfg.Targets[1].Interval != 0 {
+		t.Fatalf("intervals = %v / %v / %v, want %v / %v / 0", cfg.Interval,
+			cfg.Targets[0].Interval, cfg.Targets[1].Interval, MinInterval, MinInterval)
+	}
+
+	for name, body := range map[string]string{
+		"top-level":  "source: s\ninterval: 500us\ntargets:\n  - url: https://x.com\n",
+		"per-target": "source: s\ntargets:\n  - url: https://x.com\n    interval: 1ns\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, body))
+			if err == nil || !strings.Contains(err.Error(), MinInterval.String()) {
+				t.Fatalf("err = %v, want a below-floor error naming %v", err, MinInterval)
 			}
 		})
 	}

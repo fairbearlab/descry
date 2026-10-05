@@ -31,22 +31,6 @@ API generic — no consumer vocabulary.
 **Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
 
 
-## Config
-
-### Cadence floor
-
-**What:** `config.Load` rejects negative per-target intervals and non-positive top-level
-ones, but nothing stops `interval: 1ns`. A sub-millisecond interval makes the scheduler
-spin (every slot is due before the timer arms) and drives `Skipped()`/`Dropped()` up at
-millions per second with one rate-limited warning. Reject, or clamp with a warning,
-effective intervals below a documented floor (1 ms is generous for a network probe) in
-`config.Load`, and state the floor in OPERATIONS.md next to the sizing formula.
-`runner.New` itself stays permissive — the floor is a CLI/config policy. Raised by two
-independent pre-merge reviewers (Claude adversarial, Codex): a 1 ns target measured ~800k
-slots/s on one pegged core with one rate-limited warning as the only signal.
-
-**Effort:** S · **Priority:** P2 · **Depends on:** none
-
 ## Event
 
 ### Attribute and reduce `ToCloudEvent` allocations
@@ -211,3 +195,21 @@ own design note and OPERATIONS.md entry, not a drive-by.
 functional option on `New`; design note in the `runner` package doc (`# Shutdown`),
 OPERATIONS.md § Shutdown → "Bounding the wait", CHANGELOG `[Unreleased]`. `Results()` stays
 open on the timeout path, per the entry; `cmd/descry` does not set it.
+
+### Cadence floor
+
+**What:** `config.Load` rejects negative per-target intervals and non-positive top-level
+ones, but nothing stops `interval: 1ns`. A sub-millisecond interval makes the scheduler
+spin (every slot is due before the timer arms) and drives `Skipped()`/`Dropped()` up at
+millions per second with one rate-limited warning. Reject, or clamp with a warning,
+effective intervals below a documented floor (1 ms is generous for a network probe) in
+`config.Load`, and state the floor in OPERATIONS.md next to the sizing formula.
+`runner.New` itself stays permissive — the floor is a CLI/config policy. Raised by two
+independent pre-merge reviewers (Claude adversarial, Codex): a 1 ns target measured ~800k
+slots/s on one pegged core with one rate-limited warning as the only signal.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** none
+
+**Completed:** PR #23 (2026-09-25) — rejected, not clamped: `config.Load` errors on
+any effective interval below `config.MinInterval` (1ms), naming the floor; documented in
+OPERATIONS.md next to the sizing formula. `runner.New` unchanged.

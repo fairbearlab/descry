@@ -21,6 +21,17 @@ Pre-1.0, the minor version carries breaking changes.
   it; existing calls compile unchanged (a program that stores `runner.New` as a
   function value of the old type does not).
 
+### Changed
+
+- **Breaking (config): `config.Load` rejects an effective interval below 1ms**
+  — a top-level `interval` or a `targets[].interval` override — with an error
+  naming the floor, exported as `config.MinInterval`. Below that the scheduler
+  spins on one core and drives `Skipped()`/`Dropped()` up at millions per
+  second behind one rate-limited warning; no network probe needs it. Zero
+  still means "inherit" and a negative per-target value is still its own
+  error. `runner.New` is unchanged and accepts any positive interval: the floor
+  is config/CLI policy.
+
 ## [0.3.0] — 2026-08-16
 
 ### Added
