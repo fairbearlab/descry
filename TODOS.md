@@ -30,20 +30,6 @@ API generic — no consumer vocabulary.
 
 **Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
 
-### Forward wall-clock step test
-
-**What:** A runner test in which the wall clock jumps *forward* while the monotonic clock
-does not (the mirror of `TestBackwardStep_ReanchorsWithinOneInterval`): the armed timer
-still fires at its monotonic deadline, the scheduler finds `now` far past `next`, and the
-O(1) catch-up (`next += k·interval`) must yield exactly one run and a phase-aligned next
-slot, with no skip flood and no re-anchor log.
-
-**Why:** `TestStall_OneRunNoSkipFlood` advances both clocks together (a host sleep), and
-the fuzz target's step is backward-only. A forward wall step with the monotonic clock
-standing still (VM restore, NTP step after boot) is the one clock-movement case with zero
-coverage. `fakeClock.Step` in `runner/helpers_test.go` already supports either sign.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** none
 
 ### `testRunner.stop()` should fail, not panic, on a wedged `Run`
 
@@ -176,6 +162,25 @@ correct once that range widens.
 (largest advance 64·`fuzzMaxInterval`, largest step 25 h), the guard is pinned
 directly by `TestShadow_SaturatedDurationSelfHeals`, the shadow-side twin of
 `TestStall_SaturatedDurationSelfHeals`; removing the guard makes it spin and fail.
+
+### Forward wall-clock step test
+
+**What:** A runner test in which the wall clock jumps *forward* while the monotonic clock
+does not (the mirror of `TestBackwardStep_ReanchorsWithinOneInterval`): the armed timer
+still fires at its monotonic deadline, the scheduler finds `now` far past `next`, and the
+O(1) catch-up (`next += k·interval`) must yield exactly one run and a phase-aligned next
+slot, with no skip flood and no re-anchor log.
+
+**Why:** `TestStall_OneRunNoSkipFlood` advances both clocks together (a host sleep), and
+the fuzz target's step is backward-only. A forward wall step with the monotonic clock
+standing still (VM restore, NTP step after boot) is the one clock-movement case with zero
+coverage. `fakeClock.Step` in `runner/helpers_test.go` already supports either sign.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** PR #22 (2026-09-25) — `TestForwardStep_OneRunPerTargetNoReanchor`: 1h
+forward `fakeClock.Step` across 5 targets; one run each at the monotonic deadline,
+phase-aligned `next`, zero skips, no Info log.
 
 ### Perf gate: same-job benchstat + structural asserts + fuzz job
 
