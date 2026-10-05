@@ -31,26 +31,57 @@ API generic — no consumer vocabulary.
 **Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
 
 
+## CLI
+
+### File-sink close failure exits 0
+
+**What:** When the deferred `fsink.Close()` in `cmd/descry/main.go` `run()` fails
+(final bufio flush or `f.Close`), set the exit code to 1 instead of only printing
+`error: closing file sink` to stderr.
+
+**Why:** The buffered tail of events is lost, yet the process exits 0. `run()` now
+documents 0 ok / 1 runtime failure / 2 usage-config error, so this is the one
+data-loss path a supervisor or script cannot see.
+
+**Context:** Pre-existing; raised by the /ship red team on the event Encoder branch
+and deferred. Fix with a named return (`func run(...) (code int)`) and have the
+deferred closure set `code = 1` when Close fails and code is 0. A test needs a seam to
+inject a sink whose Close fails; none exists today.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** none
+
+### Redact `source` in the invalid-event-config error
+
+**What:** `run()` prints `error: invalid event config (source %q): ...` with the raw
+configured `source`; pass it through `check.RedactURL` (or drop it) first.
+
+**Why:** If an operator puts credentials in the source URI's userinfo part, they
+land in stderr / journald at startup. Low risk: `source` is an identity URI,
+not a credential slot.
+
+**Context:** Raised by the /ship adversarial review on the event Encoder branch and
+deferred. One line at the `event.NewEncoder` pre-check in `cmd/descry/main.go`;
+extend `TestRun_InvalidSourceFailsBeforeSink` with a userinfo case.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+
 ## Event
 
-### Attribute and reduce `ToCloudEvent` allocations
+### Encoder docs cite `regexp.MustCompile`; should be `regexp.Compile`
 
-**What:** Profile `event.ToCloudEvent` with `-memprofile`, attribute its 15 allocs/op, and
-remove the avoidable ones.
+**What:** Replace "regexp.MustCompile" with "regexp.Compile" in the `Encoder` and
+`ToCloudEvent` doc comments (`event/event.go`), `docs/ARCHITECTURE.md`, and the
+CHANGELOG Added bullet.
 
-**Why:** Measured 530 ns/op, 888 B/op, 15 allocs/op (darwin/arm64, Go 1.26). Not a
-bottleneck at any realistic workload, but it is the largest per-event allocation site
-and an isolated win once CI allocation guards exist to lock it in. Both sinks' `Publish`
-already sit at `MarshalJSON`'s own 3-alloc floor, so this is the remaining per-event cost.
+**Why:** `NewEncoder` returns an error and never panics; the MustCompile comparison
+suggests a panic and invites skipping the error check.
 
-**Context:** `event/event.go` `ToCloudEvent`; the numbers above came from an ad-hoc benchmark that was not kept — add one at `event/bench_test.go` first. A first
-CPU profile was dominated by GC and scheduler noise, indicating allocation pressure rather
-than a hot loop; the individual sites were never attributed. Likely candidates:
-`Extra`/`Labels` map handling and repeated `SetExtension` calls on the `cloudevents.Event`.
-No API change expected. Best done after a CI perf gate exists so the improvement is
-guarded.
+**Context:** Found in the third /ship review pass on the event Encoder branch;
+deferred so the ship would not hit the three-fix-cycle cap. Pure wording.
 
-**Effort:** S · **Priority:** P3 · **Depends on:** none (prefer after the CI perf gate)
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
 
 ## Sink
 
@@ -213,3 +244,30 @@ slots/s on one pegged core with one rate-limited warning as the only signal.
 **Completed:** PR #23 (2026-09-25) — rejected, not clamped: `config.Load` errors on
 any effective interval below `config.MinInterval` (1ms), naming the floor; documented in
 OPERATIONS.md next to the sizing formula. `runner.New` unchanged.
+
+### Attribute and reduce `ToCloudEvent` allocations
+
+**What:** Profile `event.ToCloudEvent` with `-memprofile`, attribute its 15 allocs/op, and
+remove the avoidable ones.
+
+**Why:** Measured 530 ns/op, 888 B/op, 15 allocs/op (darwin/arm64, Go 1.26). Not a
+bottleneck at any realistic workload, but it is the largest per-event allocation site
+and an isolated win once CI allocation guards exist to lock it in. Both sinks' `Publish`
+already sit at `MarshalJSON`'s own 3-alloc floor, so this is the remaining per-event cost.
+
+**Context:** `event/event.go` `ToCloudEvent`; the numbers above came from an ad-hoc benchmark that was not kept — add one at `event/bench_test.go` first. A first
+CPU profile was dominated by GC and scheduler noise, indicating allocation pressure rather
+than a hot loop; the individual sites were never attributed. Likely candidates:
+`Extra`/`Labels` map handling and repeated `SetExtension` calls on the `cloudevents.Event`.
+No API change expected. Best done after a CI perf gate exists so the improvement is
+guarded.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none (prefer after the CI perf gate)
+
+**Completed:** event encoder PR (2026-10-05) — `event.NewEncoder(cfg)` validates the
+config once and `Encode` builds per-event fields only (no per-event `Validate`);
+`runner.New` builds one and `cmd/descry` checks it before opening the sink.
+`ToCloudEvent` is now a one-shot wrapper. Pre-built Encoder: 8 allocs/op minimal, 13
+full (was 13 / 18 for `ToCloudEvent`), guarded by `TestEncoder_Allocs` in the perf
+workflow's alloc step; benchmarks in `event/bench_test.go`, equivalence oracle against
+the legacy implementation in `event/equivalence_test.go` and `FuzzToCloudEvent`.

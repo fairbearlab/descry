@@ -13,16 +13,24 @@ the seam is defined by the interfaces, not by who implements them.
 ## The pipe
 
 ```
-Check.Run ──▶ Observation ──▶ event.ToCloudEvent ──▶ EventSink.Publish
-(checks/http)   (check)            (event)              (sink / consumer)
+Check.Run ──▶ Observation ──▶ event.Encoder.Encode ──▶ EventSink.Publish
+(checks/http)   (check)            (event)               (sink / consumer)
 ```
+
+The event config (`Source`, `Type`) is validated **once**, by
+`event.NewEncoder`, which `runner.New` calls at construction (the compile-once
+idiom of `regexp.MustCompile`): an invalid config surfaces as an error from
+`Run` (or exit 2 from the CLI) instead of a per-event failure, and `Encode` then
+only builds the per-event fields and marshals the payload. `event.ToCloudEvent`
+remains as a one-shot wrapper (`NewEncoder` then `Encode`) for tests and
+one-off use; repeated callers should hold an `Encoder`.
 
 ```mermaid
 flowchart LR
   subgraph engine["descry (this module) — generic, consumer-agnostic"]
     CFG["cmd/descry<br/>YAML config"] --> RUN["runner<br/>(heap scheduler, per-target interval,<br/>phase spread, bounded pool,<br/>per-check timeout, ErrSkipped/ErrSkippedQueued)"]
     RUN --> CHK["checks/http<br/>(Check.Run → Observation)"]
-    CHK --> EVT["event<br/>(Observation → CloudEvent 1.0)"]
+    CHK --> EVT["event<br/>(Encoder: Observation → CloudEvent 1.0)"]
     EVT --> SINK["sink: EventSink<br/>(stdout | file in v1)"]
   end
   subgraph consumer["A consumer — separate module, out of scope here"]
