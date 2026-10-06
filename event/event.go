@@ -3,12 +3,13 @@
 package event
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/cloudevents/sdk-go/v2/event/datacodec"
 	"github.com/oklog/ulid/v2"
 
 	"github.com/fairbearlab/descry/check"
@@ -78,8 +79,9 @@ func NewEncoder(cfg Config) (*Encoder, error) {
 
 // Encode maps an Observation to a CloudEvents 1.0 event. It returns a zero
 // Event and an error, prefixed "set data: ", only when the payload cannot be
-// marshaled to JSON (e.g. a chan or NaN in obs.Extra); the Encoder stays
-// usable for the next call.
+// encoded (e.g. a chan or NaN in obs.Extra); the Encoder stays usable for the
+// next call. The payload goes through the SDK's application/json data codec,
+// so an encoder registered with datacodec.AddEncoder is honoured.
 //
 // Encode skips the per-event Validate. That is sound because every attribute
 // Validate checks is either fixed or valid by construction:
@@ -106,7 +108,9 @@ func (enc *Encoder) Encode(obs check.Observation) (cloudevents.Event, error) {
 		s := obs.TLSExpiry.UTC().Format(time.RFC3339)
 		tls = &s
 	}
-	data, err := json.Marshal(&payload{
+	// datacodec.Encode, as SetData does, so a codec an embedder registers with
+	// datacodec.AddEncoder for application/json still applies.
+	data, err := datacodec.Encode(context.Background(), cloudevents.ApplicationJSON, &payload{
 		Status:     obs.Status,
 		StatusCode: obs.StatusCode,
 		LatencyMs:  obs.LatencyMs,

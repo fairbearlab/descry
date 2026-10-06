@@ -1,7 +1,9 @@
 package event
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"strings"
@@ -10,6 +12,8 @@ import (
 	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/cloudevents/sdk-go/v2/event/datacodec"
+	cejson "github.com/cloudevents/sdk-go/v2/event/datacodec/json"
 
 	"github.com/fairbearlab/descry/check"
 )
@@ -231,6 +235,37 @@ func TestEncoder_DataErrorDoesNotPoison(t *testing.T) {
 				t.Fatalf("Encode after a data error: %v", err)
 			}
 		})
+	}
+}
+
+// TestEncoder_HonoursRegisteredJSONCodec: an application/json encoder an
+// embedder registers with datacodec.AddEncoder is used for the payload, as it
+// was on the SDK's SetData path, and its errors surface as "set data: ".
+// It swaps a process-global codec, so it must not run in parallel.
+func TestEncoder_HonoursRegisteredJSONCodec(t *testing.T) {
+	t.Cleanup(func() { datacodec.AddEncoder(cloudevents.ApplicationJSON, cejson.Encode) })
+	enc, err := NewEncoder(Config{Source: "descry/test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	datacodec.AddEncoder(cloudevents.ApplicationJSON, func(context.Context, any) ([]byte, error) {
+		return []byte(`{"custom":true}`), nil
+	})
+	e, err := enc.Encode(benchObs())
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if got := string(e.Data()); got != `{"custom":true}` {
+		t.Fatalf("data = %s, want the registered codec's output", got)
+	}
+
+	errCodec := errors.New("codec refused")
+	datacodec.AddEncoder(cloudevents.ApplicationJSON, func(context.Context, any) ([]byte, error) {
+		return nil, errCodec
+	})
+	if _, err := enc.Encode(benchObs()); !errors.Is(err, errCodec) || !strings.HasPrefix(err.Error(), "set data: ") {
+		t.Fatalf("error = %v, want a \"set data: \" error wrapping the codec's", err)
 	}
 }
 
