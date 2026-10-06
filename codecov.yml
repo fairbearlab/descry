@@ -14,4 +14,10 @@ coverage:
         informational: true
     patch:
       default:
+        # A fixed target, not the default "auto" (the base commit's total, ~86%
+        # and rising): against auto, any patch with an uncovered error print
+        # renders a red x in the PR comment. 90% passes every feature PR to date
+        # (#15 at 90.5%, the lowest) and still flags one that leaves a tenth of
+        # its new lines untested.
+        target: 90%
         informational: true
