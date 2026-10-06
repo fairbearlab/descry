@@ -34,6 +34,8 @@ var (
 
 // notifyContext is signal.NotifyContext; tests swap it for a context they
 // cancel, to drive run's signal-driven shutdown without signalling the process.
+// It is package state: a test that swaps it, or calls run while another test
+// may have swapped it, must not use t.Parallel.
 var notifyContext = signal.NotifyContext
 
 func main() {

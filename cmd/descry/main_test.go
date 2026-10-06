@@ -7,8 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -372,7 +375,7 @@ func (b *lockedBuffer) String() string {
 }
 
 // Value: protects=run's steady state: a valid config builds the runner, writes events to the file sink, and a cancelled signal context shuts down with exit 0
-// Value: fails_when=shutdown maps cancellation to a non-zero code, the drain wait deadlocks, or the file sink never receives an event
+// Value: fails_when=shutdown maps cancellation to a non-zero code, the drain wait deadlocks, the file sink never receives an event, run stops listening for SIGINT or SIGTERM, or stop is never called
 // Value: why_new=every other run test exits before the runner starts; seam=notifyContext swapped for a context the test cancels
 func TestRun_EmitsEventsAndExitsZeroOnSignal(t *testing.T) {
 	dir := t.TempDir()
@@ -389,8 +392,11 @@ func TestRun_EmitsEventsAndExitsZeroOnSignal(t *testing.T) {
 	defer cancel()
 	orig := notifyContext
 	t.Cleanup(func() { notifyContext = orig })
-	notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
-		return ctx, func() {}
+	var gotSignals []os.Signal
+	var stops atomic.Int32
+	notifyContext = func(_ context.Context, sigs ...os.Signal) (context.Context, context.CancelFunc) {
+		gotSignals = sigs
+		return ctx, func() { stops.Add(1) }
 	}
 
 	var stdout bytes.Buffer
@@ -420,6 +426,16 @@ func TestRun_EmitsEventsAndExitsZeroOnSignal(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not return after its context was cancelled")
+	}
+	if want := []os.Signal{os.Interrupt, syscall.SIGTERM}; !reflect.DeepEqual(gotSignals, want) {
+		t.Errorf("run listens for %v, want %v", gotSignals, want)
+	}
+	// run's deferred stop is one call; the goroutine that restores default
+	// handling after the first signal is the other. It may lag run's return.
+	for deadline := time.Now().Add(5 * time.Second); stops.Load() < 2; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stop called %d times, want 2: a second signal would not restore default handling", stops.Load())
+		}
 	}
 	if stdout.Len() != 0 {
 		t.Errorf("file sink run wrote to stdout: %q", stdout.String())
