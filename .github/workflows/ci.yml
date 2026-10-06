@@ -15,18 +15,19 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go test -race -coverprofile=coverage.out ./...
-      # Coverage floor. Measured 76.0-76.4% of statements at the time this was
-      # added (238/313 without -race; the runner package's concurrent paths make
-      # the total drift a few tenths between runs). The floor is the low end minus
-      # one point, rounded down, so neither that drift nor ordinary churn trips it
-      # but a real regression does. Raise it as cmd/descry (0%) gains tests.
+      # Coverage floor. Measured 85.7% of statements on main when last raised
+      # (2026-10-05; identical across five -race runs and in CI). It was added at
+      # 75 against 76.0-76.4%, when the runner package's concurrent paths made the
+      # total drift a few tenths between runs. The floor is the low end minus one
+      # point, rounded down, so neither that drift nor ordinary churn trips it but
+      # a real regression does. Re-measure and raise it as coverage grows.
       #
       # This number is Go's *statement* coverage and will not match the Codecov
-      # badge, which counts *lines* (74.55% for the same commit). Both are correct;
-      # they measure different things.
+      # badge, which counts *lines*. Both are correct; they measure different
+      # things.
       - name: coverage floor
         env:
-          COVERAGE_FLOOR: '75'
+          COVERAGE_FLOOR: '84'
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
           if [ -z "$total" ]; then
