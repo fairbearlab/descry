@@ -32,6 +32,10 @@ var (
 	date    = "unknown"
 )
 
+// notifyContext is signal.NotifyContext; tests swap it for a context they
+// cancel, to drive run's signal-driven shutdown without signalling the process.
+var notifyContext = signal.NotifyContext
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -110,7 +114,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	targets := buildTargets(cfg, slog.Default())
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	r := runner.New(

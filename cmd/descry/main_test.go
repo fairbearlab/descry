@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -348,5 +349,82 @@ func TestExitCodeFor(t *testing.T) {
 				t.Errorf("exitCodeFor(%v) = %d, want %d", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for run's drain goroutine to write while
+// the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Value: protects=run's steady state: a valid config builds the runner, writes events to the file sink, and a cancelled signal context shuts down with exit 0
+// Value: fails_when=shutdown maps cancellation to a non-zero code, the drain wait deadlocks, or the file sink never receives an event
+// Value: why_new=every other run test exits before the runner starts; seam=notifyContext swapped for a context the test cancels
+func TestRun_EmitsEventsAndExitsZeroOnSignal(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "descry.yaml")
+	// A loopback target is refused by the SSRF guard without any network I/O,
+	// and still yields an observation and an event.
+	yaml := "source: https://example.com/descry\ninterval: 1s\ntimeout: 500ms\ntargets:\n  - url: http://127.0.0.1:1/\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(dir, "events.jsonl")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	orig := notifyContext
+	t.Cleanup(func() { notifyContext = orig })
+	notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	}
+
+	var stdout bytes.Buffer
+	var stderr lockedBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run([]string{"--config", cfgPath, "--sink", "file", "--file", outFile}, &stdout, &stderr)
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if b, err := os.ReadFile(outFile); err == nil && bytes.Contains(b, []byte("dev.descry.observation.v1")) {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("no event in the file sink after 10s; stderr:\n%s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel() // the "signal"
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0; stderr:\n%s", code, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after its context was cancelled")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("file sink run wrote to stdout: %q", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "error:") {
+		t.Errorf("clean shutdown printed an error: %q", stderr.String())
 	}
 }
