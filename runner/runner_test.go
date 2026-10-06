@@ -982,6 +982,45 @@ func TestRun_SecondCallReturnsError(t *testing.T) {
 	}
 }
 
+// TestRun_BadEventConfig: New keeps its signature, so a rejected event config
+// surfaces from Run: wrapped error, Results() closed (a drain-to-close consumer
+// must not hang), no check ever called, and a second Run is the double-Run
+// error rather than a panic on the already-closed channel. Also under
+// WithShutdownGrace, whose Run path must not be reached.
+func TestRun_BadEventConfig(t *testing.T) {
+	for name, opts := range map[string][]Option{
+		"default": nil,
+		"grace":   {WithShutdownGrace(time.Second)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			chk := &fakeCheck{}
+			r := New(chk, nopSink{}, event.Config{Source: "%zz"}, []check.Target{{URL: "http://bad"}}, time.Second, 1, opts...)
+			err := r.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "runner: event config:") {
+				t.Fatalf("Run err = %v, want wrapped 'runner: event config:' error", err)
+			}
+			if errors.Unwrap(err) == nil {
+				t.Fatalf("Run err %v does not wrap the encoder error", err)
+			}
+			select {
+			case _, ok := <-r.Results():
+				if ok {
+					t.Fatal("Results() delivered a Result; want closed with none")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Results() not closed after Run returned the config error")
+			}
+			if n := chk.total.Load(); n != 0 {
+				t.Fatalf("check called %d times, want 0", n)
+			}
+			err = r.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "more than once") {
+				t.Fatalf("second Run err = %v, want 'called more than once' error", err)
+			}
+		})
+	}
+}
+
 // TestNew_ConcurrencyCappedAtTargets: more workers than targets can never be
 // busy at once (an entry is dispatched only while not in flight), so New caps
 // the pool at len(targets); zero targets keeps the requested value.

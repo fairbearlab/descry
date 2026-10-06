@@ -2,9 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -219,5 +226,221 @@ func TestDrainResults_SkipWindowUsesTargetInterval(t *testing.T) {
 	}
 	if n := strings.Count(s, "check skipped: https://dflt.example/"); n != 1 {
 		t.Errorf("dflt.example skip lines = %d, want 1 (30s default window):\n%s", n, s)
+	}
+}
+
+// TestRun_InvalidSourceFailsBeforeSink: a source config.Load accepts but the
+// event encoder rejects ("%zz" is a bad percent-escape) must exit 2 with a
+// clear message, before the sink is opened: nothing on stdout and no file
+// created for a file sink.
+func TestRun_InvalidSourceFailsBeforeSink(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "descry.yaml")
+	yaml := "source: \"%zz\"\ninterval: 30s\ntimeout: 5s\ntargets:\n  - url: https://example.com/\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(dir, "events.jsonl")
+
+	for name, args := range map[string][]string{
+		"stdout": {"--config", cfgPath},
+		"file":   {"--config", cfgPath, "--sink", "file", "--file", outFile},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(args, &stdout, &stderr); code != 2 {
+				t.Fatalf("exit code = %d, want 2; stderr:\n%s", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("sink wrote output despite invalid source: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), "invalid event config") || !strings.Contains(stderr.String(), "%zz") {
+				t.Errorf("stderr lacks a clear message: %q", stderr.String())
+			}
+			if _, err := os.Stat(outFile); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("file sink was opened before validation (stat err = %v)", err)
+			}
+		})
+	}
+}
+
+// TestRun_FlagParseExitCodes: -h/--help print usage and exit 0 (as the old
+// flag.Parse ExitOnError path did); an unknown flag is a usage error, exit 2.
+func TestRun_FlagParseExitCodes(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"-h"}, 0},
+		{[]string{"--help"}, 0},
+		{[]string{"--no-such-flag"}, 2},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(tc.args, &stdout, &stderr); code != tc.want {
+				t.Fatalf("exit code = %d, want %d; stderr:\n%s", code, tc.want, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "-config") {
+				t.Errorf("usage not printed to stderr: %q", stderr.String())
+			}
+		})
+	}
+}
+
+// Value: protects=run's exit-code contract: -version 0 and prints; missing/unreadable config, bad sink override, unopenable file sink exit 2
+// Value: fails_when=a refactor returns the wrong code, drops a message, or -version stops printing the build info line
+// Value: why_new=existing run tests cover only -h, unknown flag and an invalid source; these pre-run branches were untested; seam=none
+func TestRun_UsageAndConfigErrors(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "descry.yaml")
+	yaml := "source: https://example.com/descry\ninterval: 30s\ntimeout: 5s\ntargets:\n  - url: https://example.com/\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unopenable := filepath.Join(dir, "no-such-dir", "events.jsonl")
+
+	for _, tc := range []struct {
+		name       string
+		args       []string
+		wantCode   int
+		wantStdout string
+		wantStderr string
+	}{
+		{"version", []string{"-version"}, 0, "descry ", ""},
+		{"missing config flag", nil, 2, "", "--config is required"},
+		{"config file absent", []string{"--config", filepath.Join(dir, "absent.yaml")}, 2, "", "open config"},
+		{"sink override invalid", []string{"--config", cfgPath, "--sink", "bogus"}, 2, "", "must be"},
+		{"file override without path", []string{"--config", cfgPath, "--sink", "file"}, 2, "", "file_path is required"},
+		{"file sink unopenable", []string{"--config", cfgPath, "--sink", "file", "--file", unopenable}, 2, "", "error:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(tc.args, &stdout, &stderr); code != tc.wantCode {
+				t.Fatalf("exit code = %d, want %d; stderr:\n%s", code, tc.wantCode, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), tc.wantStdout) {
+				t.Errorf("stdout = %q, want substring %q", stdout.String(), tc.wantStdout)
+			}
+			if tc.wantStdout == "" && stdout.Len() != 0 {
+				t.Errorf("unexpected stdout: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Errorf("stderr = %q, want substring %q", stderr.String(), tc.wantStderr)
+			}
+		})
+	}
+}
+
+// TestExitCodeFor: a signal-driven shutdown (ctx cancelled, alone or joined
+// with ErrShutdownTimeout under WithShutdownGrace) exits 0; any other Run
+// error exits 1. Guards against a refactor that drops the Canceled filter and
+// turns every Ctrl-C into a failure exit.
+func TestExitCodeFor(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"nil", nil, 0},
+		{"canceled", context.Canceled, 0},
+		{"canceled with shutdown timeout", errors.Join(context.Canceled, runner.ErrShutdownTimeout), 0},
+		{"other error", errors.New("runner: event config: boom"), 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := exitCodeFor(tc.err); got != tc.want {
+				t.Errorf("exitCodeFor(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for run's drain goroutine to write while
+// the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Value: protects=run's steady state: a valid config builds the runner, writes events to the file sink, and a cancelled signal context shuts down with exit 0
+// Value: fails_when=shutdown maps cancellation to a non-zero code, the drain wait deadlocks, the file sink never receives an event, run stops listening for SIGINT or SIGTERM, or stop is never called
+// Value: why_new=every other run test exits before the runner starts; seam=notifyContext swapped for a context the test cancels
+func TestRun_EmitsEventsAndExitsZeroOnSignal(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "descry.yaml")
+	// A loopback target is refused by the SSRF guard without any network I/O,
+	// and still yields an observation and an event.
+	yaml := "source: https://example.com/descry\ninterval: 1s\ntimeout: 500ms\ntargets:\n  - url: http://127.0.0.1:1/\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(dir, "events.jsonl")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	orig := notifyContext
+	t.Cleanup(func() { notifyContext = orig })
+	var gotSignals []os.Signal
+	var stops atomic.Int32
+	notifyContext = func(_ context.Context, sigs ...os.Signal) (context.Context, context.CancelFunc) {
+		gotSignals = sigs
+		return ctx, func() { stops.Add(1) }
+	}
+
+	var stdout bytes.Buffer
+	var stderr lockedBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run([]string{"--config", cfgPath, "--sink", "file", "--file", outFile}, &stdout, &stderr)
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if b, err := os.ReadFile(outFile); err == nil && bytes.Contains(b, []byte("dev.descry.observation.v1")) {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("no event in the file sink after 10s; stderr:\n%s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel() // the "signal"
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0; stderr:\n%s", code, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after its context was cancelled")
+	}
+	if want := []os.Signal{os.Interrupt, syscall.SIGTERM}; !reflect.DeepEqual(gotSignals, want) {
+		t.Errorf("run listens for %v, want %v", gotSignals, want)
+	}
+	// run's deferred stop is one call; the goroutine that restores default
+	// handling after the first signal is the other. It may lag run's return.
+	for deadline := time.Now().Add(5 * time.Second); stops.Load() < 2; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stop called %d times, want 2: a second signal would not restore default handling", stops.Load())
+		}
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("file sink run wrote to stdout: %q", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "error:") {
+		t.Errorf("clean shutdown printed an error: %q", stderr.String())
 	}
 }

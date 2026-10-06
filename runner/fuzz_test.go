@@ -265,7 +265,7 @@ func (c *fuzzCheck) Run(ctx context.Context, t check.Target) (check.Observation,
 		case <-ctx.Done():
 		}
 	}
-	// Same shape fakeCheck returns, so event.ToCloudEvent always succeeds and a
+	// Same shape fakeCheck returns, so the runner's event Encoder always succeeds and a
 	// non-nil Result.Err can only be a skip sentinel (assertion (h)).
 	return check.Observation{
 		Status: check.StatusUp, StatusCode: 200, ObservedAt: time.Now().UTC(),
