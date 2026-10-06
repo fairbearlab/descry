@@ -34,9 +34,10 @@ reporting lets us assess and fix before details are public.
   `isBlockedIP`) and on `check.RedactURL`. They hunt for panics and for
   disagreements between the two layers; they do **not** make the guard a
   security boundary, and nothing in the threat model above changes because of them.
-  The two SSRF-layer targets (plus the scheduler's) get 60s of coverage-guided
-  fuzzing on every pull request via the `perf` workflow; all fuzz seed corpora
-  also run as regular tests in CI's `go test -race ./...` invocation.
+  The two SSRF-layer targets (plus the scheduler's and the event encoder's) get
+  count-budgeted coverage-guided fuzzing on every pull request via the `perf`
+  workflow; all fuzz seed corpora also run as regular tests in CI's
+  `go test -race ./...` invocation.
 - This repository is scored by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/fairbearlab/descry).
 
 ## Response window

@@ -10,6 +10,23 @@ Pre-1.0, the minor version carries breaking changes.
 
 ### Added
 
+- **`event.Encoder` / `event.NewEncoder(cfg)`: validate the event config once,
+  encode many.** Like `regexp.MustCompile`, `NewEncoder` does the config work
+  (default type, source/type validation) up front and returns
+  `invalid cloudevent: ...` on a bad config; `Encode(obs)` then builds only the
+  per-event fields and marshals the payload, with no per-event `Validate`. An
+  `Encoder` is safe for concurrent use and each event owns its own context. A
+  nil or zero `Encoder` returns an error from `Encode` rather than panicking.
+  `runner.New` builds one at construction. Measured with a pre-built Encoder
+  (darwin/arm64, go1.26.6, cloudevents/sdk-go v2.16.2): minimal event 8
+  allocs/op and 488 B/op (was 13 and 800), full event 13 allocs/op and 688 B/op
+  (was 18 and 1001); about 280-300 ns/op vs 480-550 minimal and 460-495 vs
+  670-700 full (ns/op noisy, load average ~6.5). The `ToCloudEvent` wrapper
+  builds an Encoder per call and is about 15-20% *slower* than before: 22 / 17
+  allocs/op and 1641 / 1441 B/op full / minimal (was 18 / 13 and 1001 / 800,
+  so +4 allocs and 64-80% more memory per call). Repeated callers should hold
+  an `Encoder`. `Encode`'s 8 / 13 allocs/op also hold on linux/amd64.
+
 - **`runner.WithShutdownGrace(d)` bounds `Run`'s shutdown wait.** By default
   `Run` still waits for in-flight runs without limit. With the option, if runs
   are still in flight `d` after the scheduler stops, `Run` logs a Warn with the
@@ -23,6 +40,20 @@ Pre-1.0, the minor version carries breaking changes.
 
 ### Changed
 
+- **Breaking (behaviour): an invalid event config is now a startup error.**
+  `runner.New` validates the event config once; if it is invalid, `Run` closes
+  `Results()` and returns `runner: event config: ...` before any check starts,
+  instead of every event failing with a `Result.Err`. The `descry` CLI checks
+  the config before opening the sink, prints `error: invalid event config` and
+  exits 2 like any other config error. `runner.New`'s signature is unchanged.
+- The `descry` CLI now reports a non-cancellation error from `Run` on stderr
+  and exits 1, instead of discarding it.
+- **Breaking (behaviour): `event.ToCloudEvent` validates the config before the
+  payload.** When both are bad, the config error is returned (previously the
+  `set data` error could win), and every error return is a zero `Event`. Output
+  for valid inputs is byte-identical apart from the id, enforced by an
+  equivalence test against the previous implementation plus `FuzzToCloudEvent`,
+  which now runs in the `perf` workflow.
 - **Breaking (config): `config.Load` rejects an effective interval below 1ms**
   — a top-level `interval` or a `targets[].interval` override — with an error
   naming the floor, exported as `config.MinInterval`. Below that the scheduler
