@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -15,9 +16,12 @@ import (
 	"testing"
 	"time"
 
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+
 	"github.com/fairbearlab/descry/check"
 	"github.com/fairbearlab/descry/config"
 	"github.com/fairbearlab/descry/runner"
+	"github.com/fairbearlab/descry/sink"
 )
 
 // TestBuildTargets_WarnsWhenIntervalShorterThanTimeout: exactly one Warn per
@@ -232,35 +236,113 @@ func TestDrainResults_SkipWindowUsesTargetInterval(t *testing.T) {
 // TestRun_InvalidSourceFailsBeforeSink: a source config.Load accepts but the
 // event encoder rejects ("%zz" is a bad percent-escape) must exit 2 with a
 // clear message, before the sink is opened: nothing on stdout and no file
-// created for a file sink.
+// created for a file sink. The message names the source only through
+// check.RedactURL: an unparseable source prints as <unparseable>, so neither
+// the bad escape nor any userinfo it carries reaches stderr.
 func TestRun_InvalidSourceFailsBeforeSink(t *testing.T) {
+	pw := "secret" // joined into the URL at runtime: no literal basic-auth URL in source
+	for _, src := range []struct {
+		name   string
+		source string
+		leaks  []string // must not appear on stderr
+	}{
+		{"bad escape", "%zz", []string{"%zz"}},
+		{"userinfo and bad escape", "https://user:" + pw + "@host/%zz", []string{pw, "%zz"}},
+	} {
+		dir := t.TempDir()
+		cfgPath := filepath.Join(dir, "descry.yaml")
+		yaml := "source: \"" + src.source + "\"\ninterval: 30s\ntimeout: 5s\ntargets:\n  - url: https://example.com/\n"
+		if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		outFile := filepath.Join(dir, "events.jsonl")
+
+		for name, args := range map[string][]string{
+			"stdout": {"--config", cfgPath},
+			"file":   {"--config", cfgPath, "--sink", "file", "--file", outFile},
+		} {
+			t.Run(src.name+"/"+name, func(t *testing.T) {
+				var stdout, stderr bytes.Buffer
+				if code := run(args, &stdout, &stderr); code != 2 {
+					t.Fatalf("exit code = %d, want 2; stderr:\n%s", code, stderr.String())
+				}
+				if stdout.Len() != 0 {
+					t.Errorf("sink wrote output despite invalid source: %q", stdout.String())
+				}
+				if !strings.Contains(stderr.String(), "invalid event config") || !strings.Contains(stderr.String(), "<unparseable>") {
+					t.Errorf("stderr lacks a clear, redacted message: %q", stderr.String())
+				}
+				for _, leak := range src.leaks {
+					if strings.Contains(stderr.String(), leak) {
+						t.Errorf("stderr echoes the raw source (%q): %q", leak, stderr.String())
+					}
+				}
+				if _, err := os.Stat(outFile); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("file sink was opened before validation (stat err = %v)", err)
+				}
+			})
+		}
+	}
+}
+
+// failingCloseSink accepts every event and fails on Close: the shape of a
+// file sink whose final flush fails.
+type failingCloseSink struct{}
+
+func (failingCloseSink) Publish(context.Context, cloudevents.Event) error { return nil }
+func (failingCloseSink) Close() error                                     { return errors.New("flush: disk full") }
+
+// Value: protects=run's exit-code contract on the one data-loss path a supervisor could not see: a failing file-sink Close turns a clean shutdown's 0 into 1 and names the failure on stderr
+// Value: fails_when=the deferred Close stops setting the named return, its message is dropped, or Run rather than Close supplies the 1
+// Value: why_new=no test could reach this branch; seam=newFileSink swapped for a sink whose Close fails, notifyContext for an already-cancelled context so Run returns at once
+func TestRun_FileSinkCloseFailureExitsOne(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "descry.yaml")
-	yaml := "source: \"%zz\"\ninterval: 30s\ntimeout: 5s\ntargets:\n  - url: https://example.com/\n"
+	yaml := "source: https://example.com/descry\ninterval: 1s\ntimeout: 500ms\ntargets:\n  - url: http://127.0.0.1:1/\n"
 	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	outFile := filepath.Join(dir, "events.jsonl")
 
-	for name, args := range map[string][]string{
-		"stdout": {"--config", cfgPath},
-		"file":   {"--config", cfgPath, "--sink", "file", "--file", outFile},
-	} {
-		t.Run(name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			if code := run(args, &stdout, &stderr); code != 2 {
-				t.Fatalf("exit code = %d, want 2; stderr:\n%s", code, stderr.String())
-			}
-			if stdout.Len() != 0 {
-				t.Errorf("sink wrote output despite invalid source: %q", stdout.String())
-			}
-			if !strings.Contains(stderr.String(), "invalid event config") || !strings.Contains(stderr.String(), "%zz") {
-				t.Errorf("stderr lacks a clear message: %q", stderr.String())
-			}
-			if _, err := os.Stat(outFile); !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("file sink was opened before validation (stat err = %v)", err)
-			}
-		})
+	origSink := newFileSink
+	t.Cleanup(func() { newFileSink = origSink })
+	var gotPath string
+	newFileSink = func(path string) (interface {
+		sink.EventSink
+		io.Closer
+	}, error) {
+		gotPath = path
+		return failingCloseSink{}, nil
+	}
+
+	// The "signal" has already arrived: Run returns context.Canceled at once,
+	// which maps to exit 0, so only the failing Close can make this a 1.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	origNotify := notifyContext
+	t.Cleanup(func() { notifyContext = origNotify })
+	notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--config", cfgPath, "--sink", "file", "--file", outFile}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr:\n%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "closing file sink") {
+		t.Errorf("stderr does not name the Close failure: %q", stderr.String())
+	}
+	// run prints "error: <runErr>" whenever exitCodeFor is non-zero, so a
+	// second error line would mean the 1 came from Run, not from Close.
+	if n := strings.Count(stderr.String(), "error:"); n != 1 {
+		t.Errorf("want exactly one error line (the Close failure) on stderr, got %d: %q", n, stderr.String())
+	}
+	if gotPath != outFile {
+		t.Errorf("newFileSink called with %q, want %q", gotPath, outFile)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("file sink run wrote to stdout: %q", stdout.String())
 	}
 }
 

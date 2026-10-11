@@ -38,14 +38,27 @@ var (
 // may have swapped it, must not use t.Parallel.
 var notifyContext = signal.NotifyContext
 
+// newFileSink is sink.NewFileSink behind an interface so a test can inject a
+// sink whose Close fails and drive run's exit code without a real file. Same
+// package-state caveat as notifyContext: no t.Parallel in tests that touch it.
+var newFileSink = func(path string) (interface {
+	sink.EventSink
+	io.Closer
+}, error) {
+	return sink.NewFileSink(path)
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
 // run is main's testable body: it returns the process exit code (0 ok, 1
 // runtime failure, 2 usage/config error) instead of calling os.Exit, so
-// deferred cleanup runs and tests can drive it.
-func run(args []string, stdout, stderr io.Writer) int {
+// deferred cleanup runs and tests can drive it. code is a named return so the
+// deferred file-sink Close can turn a would-be 0 into 1: a failed Close (the
+// final flush or the file close itself) is a sink failure a supervisor must be
+// able to see.
+func run(args []string, stdout, stderr io.Writer) (code int) {
 	fs := flag.NewFlagSet("descry", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to YAML config")
@@ -94,14 +107,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// from Run, after the sink was created (and a file sink truncated/created).
 	evCfg := event.Config{Source: cfg.Source}
 	if _, err := event.NewEncoder(evCfg); err != nil {
-		_, _ = fmt.Fprintf(stderr, "error: invalid event config (source %q): %v\n", cfg.Source, err)
+		_, _ = fmt.Fprintf(stderr, "error: invalid event config (source %q): %v\n", check.RedactURL(cfg.Source), err)
 		return 2
 	}
 
 	// Build the event sink.
 	var s sink.EventSink = sink.NewStdoutSink(stdout)
 	if cfg.Sink == "file" {
-		fsink, err := sink.NewFileSink(cfg.FilePath)
+		fsink, err := newFileSink(cfg.FilePath)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 			return 2
@@ -109,6 +122,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		defer func() {
 			if err := fsink.Close(); err != nil {
 				_, _ = fmt.Fprintf(stderr, "error: closing file sink: %v\n", err)
+				if code == 0 {
+					code = 1
+				}
 			}
 		}()
 		s = fsink
@@ -153,7 +169,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	runErr := r.Run(ctx)
 	<-drained
 	_ = failures.Load() // available for future exit-code logic
-	code := exitCodeFor(runErr)
+	code = exitCodeFor(runErr)
 	if code != 0 {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", runErr)
 	}
