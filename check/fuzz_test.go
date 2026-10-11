@@ -7,9 +7,10 @@ import (
 
 // RedactURL is the last thing standing between a target URL's credentials and
 // the log. It is a thin wrapper over url.Parse + (*url.URL).Redacted(), and its
-// documented failure mode — "on parse failure it returns the input unchanged" —
-// is the interesting one: a string that url.Parse rejects is echoed verbatim,
-// credentials included. This target pins the contract on both paths.
+// documented failure mode — "on parse failure it returns <unparseable>" — is
+// the interesting one: a string that url.Parse rejects must never be echoed,
+// because it may still carry credentials. This target pins the contract on
+// both paths.
 //
 // Runs as an ordinary unit test in CI (seed corpus only). On-demand fuzzing:
 // go test ./check -run '^$' -fuzz FuzzRedactURL -fuzztime 60s
@@ -25,9 +26,11 @@ func FuzzRedactURL(f *testing.F) {
 		// substring-based redaction would false-positive on these.
 		"https://a:example.com@example.com/",
 		"https://a:xxxxx@example.com/",
-		// Inputs that url.Parse rejects, exercising the pass-through path.
+		// Inputs that url.Parse rejects, exercising the placeholder path.
 		"https://user:pw@exa mple.com", "://", "http://[::1",
 		"%%", "\x7f", "",
+		// The placeholder itself: a fixed point, never re-escaped.
+		"<unparseable>",
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -36,14 +39,18 @@ func FuzzRedactURL(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw string) {
 		got := RedactURL(raw)
 
+		if raw == "<unparseable>" {
+			if got != raw {
+				t.Fatalf("RedactURL(%q) = %q; the placeholder must be a fixed point", raw, got)
+			}
+			return
+		}
 		u, err := url.Parse(raw)
 		if err != nil {
-			// Documented contract: unparseable input is returned unchanged.
-			// This is also where credentials survive into the log — the
-			// behaviour is intentional, but it must stay exactly this
-			// predictable, so assert it rather than leave it to chance.
-			if got != raw {
-				t.Fatalf("RedactURL(%q) = %q; unparseable input must be returned unchanged", raw, got)
+			// Documented contract: unparseable input yields the fixed
+			// placeholder, never the input, which may still hold credentials.
+			if got != "<unparseable>" {
+				t.Fatalf("RedactURL(%q) = %q; unparseable input must yield <unparseable>", raw, got)
 			}
 			return
 		}
@@ -88,6 +95,8 @@ func FuzzRedactURL(f *testing.F) {
 // redacting an already-redacted URL is a no-op. Without it, a URL that passes
 // through two logging paths could be mangled differently each time, and the
 // second pass is exactly where an unnoticed re-parse difference would surface.
+// The <unparseable> placeholder is included because url.Parse accepts it and
+// Redacted would otherwise percent-escape the angle brackets on the second pass.
 func FuzzRedactURLIdempotent(f *testing.F) {
 	for _, s := range []string{
 		"https://user:hunter2@example.com/path",
@@ -95,6 +104,7 @@ func FuzzRedactURLIdempotent(f *testing.F) {
 		"https://a:xxxxx@example.com/",
 		"http://[::1]:8080/x",
 		"://",
+		"<unparseable>",
 	} {
 		f.Add(s)
 	}
