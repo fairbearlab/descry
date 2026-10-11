@@ -68,6 +68,12 @@ Pre-1.0, the minor version carries breaking changes.
   that does not parse now show `<unparseable>` rather than the URL. The
   placeholder is a fixed point, so redacting twice is the same as redacting
   once.
+- **Go toolchain: `go.mod` now requires go 1.26.9 (was 1.26.6).** go1.26.9
+  carries the fixes for nine standard-library advisories (GO-2026-6603 through
+  GO-2026-6617, in `net/http`, `net/textproto` and `crypto/tls`) that
+  `govulncheck` reports against 1.26.6. Builders on an older patch release get
+  the toolchain fetched automatically under `GOTOOLCHAIN=auto`; `.tool-versions`
+  moves with it.
 
 ### Fixed
 
