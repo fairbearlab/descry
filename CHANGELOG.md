@@ -62,6 +62,26 @@ Pre-1.0, the minor version carries breaking changes.
   still means "inherit" and a negative per-target value is still its own
   error. `runner.New` is unchanged and accepts any positive interval: the floor
   is config/CLI policy.
+- **Breaking (behaviour): `check.RedactURL` returns the fixed placeholder
+  `<unparseable>` when the input does not parse**, instead of echoing input
+  that may still carry credentials; log and diagnostic lines for a target URL
+  that does not parse now show `<unparseable>` rather than the URL. The
+  placeholder is a fixed point, so redacting twice is the same as redacting
+  once.
+- **Go toolchain: `go.mod` now requires go 1.26.9 (was 1.26.6).** go1.26.9
+  carries the fixes for nine standard-library advisories (GO-2026-6603 through
+  GO-2026-6617, in `net/http`, `net/textproto` and `crypto/tls`) that
+  `govulncheck` reports against 1.26.6. Builders on an older patch release get
+  the toolchain fetched automatically under `GOTOOLCHAIN=auto`; `.tool-versions`
+  moves with it.
+
+### Fixed
+
+- The `descry` CLI exits 1 when the file sink's `Close` fails (the final flush
+  or the file close itself), instead of printing the error and exiting 0.
+- The `descry` CLI's `invalid event config` error prints the configured
+  `source` through `check.RedactURL`, so userinfo in the source URI no longer
+  lands on stderr.
 
 ## [0.3.0] — 2026-08-16
 

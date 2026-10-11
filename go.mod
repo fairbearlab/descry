@@ -1,6 +1,6 @@
 module github.com/fairbearlab/descry
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/cloudevents/sdk-go/v2 v2.16.2

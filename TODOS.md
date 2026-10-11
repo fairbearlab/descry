@@ -31,41 +31,6 @@ API generic — no consumer vocabulary.
 **Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
 
 
-## CLI
-
-### File-sink close failure exits 0
-
-**What:** When the deferred `fsink.Close()` in `cmd/descry/main.go` `run()` fails
-(final bufio flush or `f.Close`), set the exit code to 1 instead of only printing
-`error: closing file sink` to stderr.
-
-**Why:** The buffered tail of events is lost, yet the process exits 0. `run()` now
-documents 0 ok / 1 runtime failure / 2 usage-config error, so this is the one
-data-loss path a supervisor or script cannot see.
-
-**Context:** Pre-existing; raised by the /ship red team on the event Encoder branch
-and deferred. Fix with a named return (`func run(...) (code int)`) and have the
-deferred closure set `code = 1` when Close fails and code is 0. A test needs a seam to
-inject a sink whose Close fails; none exists today.
-
-**Effort:** S · **Priority:** P2 · **Depends on:** none
-
-### Redact `source` in the invalid-event-config error
-
-**What:** `run()` prints `error: invalid event config (source %q): ...` with the raw
-configured `source`; pass it through `check.RedactURL` (or drop it) first.
-
-**Why:** If an operator puts credentials in the source URI's userinfo part, they
-land in stderr / journald at startup. Low risk: `source` is an identity URI,
-not a credential slot.
-
-**Context:** Raised by the /ship adversarial review on the event Encoder branch and
-deferred. One line at the `event.NewEncoder` pre-check in `cmd/descry/main.go`;
-extend `TestRun_InvalidSourceFailsBeforeSink` with a userinfo case.
-
-**Effort:** S · **Priority:** P3 · **Depends on:** none
-
-
 ## Event
 
 ### Encoder docs cite `regexp.MustCompile`; should be `regexp.Compile`
@@ -271,3 +236,49 @@ config once and `Encode` builds per-event fields only (no per-event `Validate`);
 full (was 13 / 18 for `ToCloudEvent`), guarded by `TestEncoder_Allocs` in the perf
 workflow's alloc step; benchmarks in `event/bench_test.go`, equivalence oracle against
 the legacy implementation in `event/equivalence_test.go` and `FuzzToCloudEvent`.
+
+### File-sink close failure exits 0
+
+**What:** When the deferred `fsink.Close()` in `cmd/descry/main.go` `run()` fails
+(final bufio flush or `f.Close`), set the exit code to 1 instead of only printing
+`error: closing file sink` to stderr.
+
+**Why:** The buffered tail of events is lost, yet the process exits 0. `run()` now
+documents 0 ok / 1 runtime failure / 2 usage-config error, so this is the one
+data-loss path a supervisor or script cannot see.
+
+**Context:** Pre-existing; raised by the /ship red team on the event Encoder branch
+and deferred. Fix with a named return (`func run(...) (code int)`) and have the
+deferred closure set `code = 1` when Close fails and code is 0. A test needs a seam to
+inject a sink whose Close fails; none exists today.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** none
+
+**Completed:** 2026-10-10 (`fix/cli-close-exit-and-redact-source`, the CLI fixes landed
+before v0.4.0) — `run()` has a named return; the deferred file-sink Close sets `code = 1`
+when it fails and the code is still 0. The seam is a package-level `newFileSink` typed
+`interface{ sink.EventSink; io.Closer }`, so `TestRun_FileSinkCloseFailureExitsOne` injects
+a sink whose Close fails. The Why above overstates the loss: `Publish` flushes per event, so
+a failed Close loses at most the torn-line terminator; the fix surfaces a sink failure, it
+does not recover events.
+
+### Redact `source` in the invalid-event-config error
+
+**What:** `run()` prints `error: invalid event config (source %q): ...` with the raw
+configured `source`; pass it through `check.RedactURL` (or drop it) first.
+
+**Why:** If an operator puts credentials in the source URI's userinfo part, they
+land in stderr / journald at startup. Low risk: `source` is an identity URI,
+not a credential slot.
+
+**Context:** Raised by the /ship adversarial review on the event Encoder branch and
+deferred. One line at the `event.NewEncoder` pre-check in `cmd/descry/main.go`;
+extend `TestRun_InvalidSourceFailsBeforeSink` with a userinfo case.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** 2026-10-10 (`fix/cli-close-exit-and-redact-source`, the CLI fixes landed
+before v0.4.0) — `run()` prints `check.RedactURL(cfg.Source)`. `RedactURL` itself now returns the fixed placeholder
+`<unparseable>` on parse failure, covering every call site rather than this one, and the
+placeholder is a fixed point so the idempotency fuzz still holds.
+`TestRun_InvalidSourceFailsBeforeSink` gained a userinfo row.

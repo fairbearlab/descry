@@ -14,11 +14,18 @@ import (
 // log: a password becomes "xxxxx" (the username stays, as in url.URL.Redacted),
 // and a bare username with no password — the shape of a token-in-URL such as
 // https://<token>@api.example.com — is masked too, since there it is the secret.
-// Query strings are left alone. On parse failure it returns the input unchanged.
+// Query strings are left alone. On parse failure it returns the fixed
+// placeholder "<unparseable>" rather than echoing input that may still carry
+// credentials; the placeholder itself passes through unchanged, so redacting
+// twice is the same as redacting once.
 func RedactURL(raw string) string {
+	const unparseable = "<unparseable>"
+	if raw == unparseable {
+		return raw
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return raw
+		return unparseable
 	}
 	if u.User != nil {
 		if _, hasPW := u.User.Password(); !hasPW && u.User.Username() != "" {
