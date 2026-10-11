@@ -82,7 +82,7 @@ channel and two counters. Nothing is silent.
 |---|---|---|---|
 | `Result{Err: nil}` | channel | Check ran, event published | nothing |
 | `Result{Err: <check, mapping, or publish error>}` | channel | The check itself returned an error (only possible with a custom `Check` implementation — the bundled `httpcheck` never returns one), or the observation could not be delivered: the event could not be encoded (a payload that will not marshal — an `Extra` value such as a channel or NaN), or the sink rejected it up to 3 times (fewer if the context was cancelled mid-retry) | your check, your `Extra` payload, or your sink — **not** the target |
-| `Run` returns `runner: event config: ...` | error | The event config (`Source`, `Type`) is invalid. The runner validates it once in `New` and `Run` refuses to start: `Results()` is closed with no `Result` and no check runs. The `descry` CLI checks the same config before opening the sink and exits 2 (config error) with `error: invalid event config` | fix `source` / the event config; this is a startup error, never a per-event one |
+| `Run` returns `runner: event config: ...` | error | The event config (`Source`, `Type`) is invalid. The runner validates it once in `New` and `Run` refuses to start: `Results()` is closed with no `Result` and no check runs. The `descry` CLI checks the same config before opening the sink and exits 2 (config error) with `error: invalid event config`; the `source` in that message is printed through `check.RedactURL`, so one that does not parse shows as `<unparseable>` | fix `source` / the event config; this is a startup error, never a per-event one |
 | `Result{Err: runner.ErrSkipped}` | channel | Slot skipped: the prior run **had started** and was still running. The check is slower than the target's interval | lengthen that target's interval, or shorten `timeout` |
 | `Result{Err: runner.ErrSkippedQueued}` | channel | Slot skipped: the prior run was still **queued** behind a saturated worker pool and had not started. The pool is too small | raise `concurrency` (see sizing below) |
 | `Runner.Skipped() int64` | counter | Total skipped slots, both kinds | trend it; a nonzero rate in steady state means undersized |
@@ -243,7 +243,10 @@ Cancel the context passed to `Run`. The runner stops dispatching, waits for
 in-flight runs to finish, then closes `Results()` so a draining consumer's loop
 exits. Targets that were queued but not yet started are acked without running, so
 shutdown produces no burst of `context.Canceled` results. No `Publish` happens
-after `Run` returns — which is what makes a deferred sink `Close()` safe. By
+after `Run` returns — which is what makes a deferred sink `Close()` safe. If
+that `Close` fails (the file sink's final flush or the file close itself), the
+`descry` binary prints `error: closing file sink: …` and exits 1 even though
+`Run` itself returned cleanly, so a supervisor sees the sink failure. By
 default the wait for in-flight runs is unbounded (see above); `cmd/descry`
 restores default signal handling once the first signal has been received, so a
 second Ctrl-C terminates the process if a check or sink will not return. A
@@ -293,3 +296,4 @@ fires on a run that is genuinely wedged. The `descry` binary does not set it.
 | One gap of ~2 intervals after a deploy | restart across a slot boundary | expected; the slot is not made up |
 | All targets late by exactly one interval, once | wall-clock step | look for the INFO re-anchor line |
 | Goroutines growing with target count | not this runner | it is O(concurrency); look at `net/http` connections |
+| `descry` exits 1 after a clean shutdown with `error: closing file sink: …` | the file sink's final flush or file close failed (e.g. ENOSPC) | check disk space and the file's tail; a torn last line is terminated on the next open |
