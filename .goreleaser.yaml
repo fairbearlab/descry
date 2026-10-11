@@ -23,3 +23,6 @@ checksum:
   algorithm: sha256
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
+release:
+  prerelease: auto
+  mode: replace

@@ -6,11 +6,11 @@ descry is pre-1.0. Only the latest minor release line gets fixes.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.3.x   | yes       |
-| < 0.3   | no        |
+| 0.4.x   | yes       |
+| < 0.4   | no        |
 
 Once the project reaches v1.0, this table will grow a real deprecation window.
-Until then, reproduce against the latest v0.3.x tag if you can — but report
+Until then, reproduce against the latest v0.4.x tag if you can — but report
 regardless of the version you are on.
 
 ## Reporting a vulnerability

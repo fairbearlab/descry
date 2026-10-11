@@ -8,6 +8,8 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-10
+
 ### Added
 
 - **`event.Encoder` / `event.NewEncoder(cfg)`: validate the event config once,
@@ -218,7 +220,8 @@ two-layer SSRF guard, and the YAML-configured `descry` binary.
 <!-- Entries for 0.1.0–0.2.1 were reconstructed from git history when this file
      was added in 0.3.0; the GitHub release notes are authoritative for those tags. -->
 
-[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/fairbearlab/descry/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fairbearlab/descry/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/fairbearlab/descry/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/fairbearlab/descry/compare/v0.1.2...v0.2.0
