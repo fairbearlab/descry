@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: descry
+  labels:
+    app.kubernetes.io/name: descry
+spec:
+  # One replica on purpose: descry has no leader election, so a second replica
+  # probes every target a second time and doubles every event and series.
+  replicas: 1
+  # Recreate, not the default RollingUpdate: a rolling update starts the new
+  # pod before the old one stops, and for that overlap both probe every
+  # target at the same instant. Recreate trades a few seconds with no prober
+  # on each rollout for no overlap during the rollout. It does not cover an
+  # eviction or a node failure, where the replacement can start before the
+  # old pod is gone.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: descry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: descry
+      annotations:
+        # Conventions read by Prometheus setups that discover pods by
+        # annotation. The Prometheus Operator ignores them and needs a
+        # PodMonitor instead; contrib/prometheus/README.md has one, next to
+        # the PrometheusRule. Use one or the other: where both kinds of scrape
+        # job exist, keeping these with a PodMonitor scrapes the pod twice.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      # On SIGTERM descry cancels in-flight checks and waits for them to
+      # return (each is also bounded by the 5s timeout in the config), then
+      # gives the admin server up to 5s to finish in-flight requests. 30s is
+      # the Kubernetes default, kept explicit.
+      terminationGracePeriodSeconds: 30
+      # descry never calls the Kubernetes API, so it gets no API credential.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: descry
+          # The tag is set by the images entry in kustomization.yaml; apply this
+          # directory with `kubectl apply -k`, not `kubectl apply -f`. No image
+          # is published yet; build one locally, see README.md.
+          image: ghcr.io/fairbearlab/descry
+          args:
+            - --config
+            - /etc/descry/config.yaml
+            # The metrics, liveness and readiness server. Unauthenticated, and
+            # :9090 binds every interface of the pod, so it is reachable from
+            # other pods in the cluster; networkpolicy.yaml restricts that.
+            - --listen=:9090
+          env:
+            # A soft limit a little under the 64Mi memory limit below, so the
+            # Go runtime collects harder before the kernel OOM-kills the pod.
+            # Keep the two in sync.
+            - name: GOMEMLIMIT
+              value: 56MiB
+          ports:
+            - name: metrics
+              containerPort: 9090
+          # Liveness is a TCP connect, not GET /healthz: a client holding the
+          # listener's connection slots stalls HTTP probes, and an HTTP
+          # liveness probe would restart the pod for it. Readiness stays HTTP.
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # No CPU limit, only a request: CFS throttling would stall checks
+          # mid-request and inflate the latency descry measures. The request
+          # is the pod's share under contention, and a tiny one inflates the
+          # measured latency the same way on a busy node.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/descry
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: descry

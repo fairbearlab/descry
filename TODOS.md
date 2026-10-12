@@ -79,6 +79,30 @@ CONTRIBUTING.md.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
+### A check cancelled at shutdown is published as a `down` event
+
+**What:** When `Run`'s context is cancelled, a check that is already in flight
+should not produce an event (or a failed-run metric) for the target. Either
+`runOne` drops the observation when `ctx.Err() != nil` after the check returns,
+or the outcome is marked as cancelled so the sink and the collector can skip it.
+
+**Why:** On SIGTERM the runner hands the cancelled context to the in-flight
+check. The bundled `httpcheck` returns the cancelled request as an
+`Observation` with status `down` (class `unknown` in most cases) and a nil
+error, the collector records a failed run, and a sink that ignores its context
+(the stdout sink does) still publishes it. Every rollout, eviction, node drain
+or liveness kill that catches a check mid-run therefore emits a false `down`
+event for that target, which downstream alerting cannot tell from a real
+outage.
+
+**Context:** 2026-10-12 — found while documenting the Kubernetes example, whose
+README now warns about it ("A restart can log a false `down`"; drop that bullet
+with the fix). Start at `runner.runOne` and `httpcheck.Run`; the fix must keep
+the shutdown invariant that no `Publish` happens after `Run` returns, and
+decide whether a custom check's own ctx error should still reach `Results()`.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
 
 ## Event
 
@@ -214,6 +238,28 @@ leaves the suite green and reopens the leak.
 keep `run()` free of a check seam) or a probe the guard lets through.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
+### Publish the container image before v0.5.0 is tagged
+
+**What:** Publish `ghcr.io/fairbearlab/descry` images from the release workflow
+(a `kos` or `dockers` section in `.goreleaser.yaml`, plus the registry login and
+`packages: write` permission it needs), starting with v0.5.0.
+
+**Why:** `examples/kubernetes/kustomization.yaml` sets `newTag: v0.5.0` for
+`ghcr.io/fairbearlab/descry`, but nothing publishes that image today, so
+`kubectl apply -k examples/kubernetes` ends in `ImagePullBackOff`. The example
+README and the changelog say no image is published yet and build one locally
+with ko; once the image exists, drop that caveat from the README, the
+kustomization and deployment comments, and the changelog.
+
+**Context:** 2026-10-12 — release gate for v0.5.0: either the image is
+published by then, or `newTag` and the docs move to whatever release first
+ships one. The published tag must match `newTag: v0.5.0`, with the `v`:
+goreleaser's `{{.Version}}` drops it, so either tag the image with
+`{{.Tag}}` or change `newTag` (and the docs) to `0.5.0`. Start at
+`.goreleaser.yaml` and `.github/workflows/release.yml`.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
 
 ## Check
 

@@ -1,0 +1,406 @@
+# promtool unit tests for descry-rules.yaml. CI extracts the plain rule groups
+# next to this file (see README.md) and runs `promtool test rules` on it.
+rule_files:
+  - descry-rules.extracted.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # --- DescryProberAbsent -------------------------------------------------
+  - name: prober absent fires when build_info is missing
+    interval: 1m
+    input_series:
+      # An unrelated series keeps the test honest: only build_info matters.
+      - series: 'descry_runner_targets'
+        values: '3+0x20'
+    alert_rule_test:
+      # absent() holds from 0m, so with `for: 5m` it is pending at 4m and
+      # firing at 5m: the pair fails for any `for` other than 5m.
+      - eval_time: 4m
+        alertname: DescryProberAbsent
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: DescryProberAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: no descry instance is reporting metrics
+              description: >-
+                No descry_build_info series has been scraped from any instance
+                for 5 minutes. Every descry prober is down, or none of their
+                --listen endpoints is being scraped. Either nothing is being
+                checked, or its results are not reaching Prometheus: check the
+                scrape config (a missing PodMonitor, say) before restarting
+                probers.
+
+  - name: prober absent does not fire while build_info is present
+    interval: 1m
+    input_series:
+      - series: 'descry_build_info{version="v0.4.0",commit="abc1234"}'
+        values: '1+0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DescryProberAbsent
+        exp_alerts: []
+
+  # Pins the limit the rule comment describes: absent() is fleet-wide, so a
+  # dead instance is masked by any other instance that still reports.
+  - name: prober absent does not fire for one dead instance while another reports
+    interval: 1m
+    input_series:
+      - series: 'descry_build_info{instance="a",version="v0.4.0",commit="abc1234"}'
+        values: '1+0x20'
+      # Instance b stops being scraped after 2m.
+      - series: 'descry_build_info{instance="b",version="v0.4.0",commit="abc1234"}'
+        values: '1 1 _x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DescryProberAbsent
+        exp_alerts: []
+
+  # --- DescryTargetDown ---------------------------------------------------
+  - name: target down fires after 5m and only for the down target
+    interval: 1m
+    input_series:
+      - series: 'descry_check_up{url="https://down.example/health"}'
+        values: '1 1 0+0x20'
+      - series: 'descry_check_up{url="https://up.example/health"}'
+        values: '1+0x22'
+    alert_rule_test:
+      # Down from 2m, so with `for: 5m` it is pending at 6m and firing at 7m:
+      # the pair fails for any `for` other than 5m.
+      - eval_time: 6m
+        alertname: DescryTargetDown
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: DescryTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              url: https://down.example/health
+            exp_annotations:
+              summary: descry target https://down.example/health is down
+              description: >-
+                The last run of https://down.example/health was not up, and it
+                has stayed that way for 5 minutes.
+
+  - name: target down does not fire on a blip shorter than 5m
+    interval: 1m
+    input_series:
+      - series: 'descry_check_up{url="https://blip.example/"}'
+        values: '1 1 0 0 0 1+0x20'
+    alert_rule_test:
+      # 4m is the last 0 sample, where a short `for` would already fire; by
+      # 12m the target is back up and nothing can be firing.
+      - eval_time: 4m
+        alertname: DescryTargetDown
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: DescryTargetDown
+        exp_alerts: []
+
+  # --- DescryChecksStale -------------------------------------------------
+  # The timestamp series holds unix seconds, and promtool's time() at an
+  # eval_time is that many seconds since 0, so a series whose value climbs by
+  # 60 per 1m sample is a target completing a run every minute.
+  - name: checks stale fires on a frozen timestamp past the 15m budget, only for that target
+    interval: 1m
+    input_series:
+      # Runs until 5m, then never completes another: the value stays at 300.
+      - series: 'descry_check_last_run_timestamp_seconds{url="https://wedged.example/"}'
+        values: '0+60x5 300+0x30'
+      - series: 'descry_check_last_run_timestamp_seconds{url="https://fine.example/"}'
+        values: '0+60x36'
+    alert_rule_test:
+      # 19m is 14m since the last run, under the budget; at 20m it is exactly
+      # 15m, which is not over it; at 21m it is 16m. Quiet at 19m and 20m and
+      # firing at 21m fails for a budget other than 15m, for >= instead of >,
+      # and for any `for`.
+      # Value: protects=DescryChecksStale fires on the first evaluation past
+      # its 15m budget; fails_when=the budget or `for` changes; why_new=no
+      # other alert fires for a wedged scheduler; seam=none;
+      # no_claim=real scrape timing or clock skew (synthetic 1m samples)
+      - eval_time: 19m
+        alertname: DescryChecksStale
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: DescryChecksStale
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: DescryChecksStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              url: https://wedged.example/
+            exp_annotations:
+              summary: descry has not completed a check of https://wedged.example/ in 15 minutes
+              description: >-
+                The last completed run of https://wedged.example/ is more than
+                15 minutes old, but descry is still being scraped. Its
+                per-target series, descry_check_up included, are frozen at
+                their last values. Check descry's stderr and the sink, and
+                restart descry if it is wedged.
+
+  - name: checks stale does not fire while the timestamp advances
+    interval: 1m
+    input_series:
+      # A slow target: one completed run every 5m, so the gap is up to 5m.
+      - series: 'descry_check_last_run_timestamp_seconds{url="https://slow.example/"}'
+        values: '0 0 0 0 0 300 300 300 300 300 600 600 600 600 600 900 900 900 900 900 1200 1200 1200 1200 1200 1500 1500 1500 1500 1500 1800'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: DescryChecksStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: DescryChecksStale
+        exp_alerts: []
+
+  # --- DescrySkipsClimbing ------------------------------------------------
+  - name: skips climbing fires on the exact total while the best-effort kind series stays flat
+    interval: 1m
+    input_series:
+      - series: 'descry_runner_skipped_slots_total'
+        values: '0+1x40'
+      - series: 'descry_runner_skips_observed_total{kind="queued"}'
+        values: '0+0x40'
+      - series: 'descry_runner_skips_observed_total{kind="in_flight"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DescrySkipsClimbing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: DescrySkipsClimbing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: descry is skipping check slots
+              description: >-
+                descry has skipped slots at least once in every 10-minute window
+                for 15 minutes, because a target's previous run was still in
+                flight or the worker queue was full. Those targets are checked
+                less often than configured. Raise the concurrency or lengthen the
+                interval. descry_runner_skips_observed_total shows which kind of
+                skip it is.
+
+  - name: skips climbing does not fire when the total is flat
+    interval: 1m
+    input_series:
+      - series: 'descry_runner_skipped_slots_total'
+        values: '7+0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: DescrySkipsClimbing
+        exp_alerts: []
+
+  # The next four pin where the 10m window and the 15m wait put the boundary.
+  - name: skips climbing does not fire on a 7m burst
+    interval: 1m
+    input_series:
+      # Climbs for 7 minutes, then stops.
+      - series: 'descry_runner_skipped_slots_total'
+        values: '0+1x7 7+0x40'
+    alert_rule_test:
+      # 15m is the last evaluation that still sees a skip in the window, so
+      # any `for` shorter than 15m has the alert firing here; 30m alone would
+      # only see it after it resolved.
+      # Value: protects=DescrySkipsClimbing waits the full 15m before firing;
+      # fails_when=its `for` is shortened below 15m; why_new=the 30m-only eval
+      # passed with for: 10m; seam=none; no_claim=real scrape timing (synthetic 1m samples)
+      - eval_time: 15m
+        alertname: DescrySkipsClimbing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: DescrySkipsClimbing
+        exp_alerts: []
+
+  - name: skips climbing fires on an 8m burst
+    interval: 1m
+    input_series:
+      # Climbs for 8 minutes, then stops: with a 1m scrape the window keeps
+      # seeing a skip until 16m, just long enough for the 15m wait.
+      - series: 'descry_runner_skipped_slots_total'
+        values: '0+1x8 8+0x40'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: DescrySkipsClimbing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations: &skipsAnnotations
+              summary: descry is skipping check slots
+              description: >-
+                descry has skipped slots at least once in every 10-minute window
+                for 15 minutes, because a target's previous run was still in
+                flight or the worker queue was full. Those targets are checked
+                less often than configured. Raise the concurrency or lengthen the
+                interval. descry_runner_skips_observed_total shows which kind of
+                skip it is.
+
+  - name: skips climbing fires on two single skips 9m apart
+    interval: 1m
+    input_series:
+      # One skip at 1m and one at 10m: every 10-minute window ending
+      # between 1m and 18m holds one of them, so the alert fires from 16m
+      # and resolves at 19m.
+      - series: 'descry_runner_skipped_slots_total'
+        values: '0 1 1 1 1 1 1 1 1 1 2+0x30'
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: DescrySkipsClimbing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations: *skipsAnnotations
+      - eval_time: 19m
+        alertname: DescrySkipsClimbing
+        exp_alerts: []
+
+  - name: skips climbing does not fire on two single skips 12m apart
+    interval: 1m
+    input_series:
+      # One skip at 1m and one at 13m: the window is empty in between, so
+      # the condition holds 1m-9m and 13m-21m and never for 15m. 21m is the
+      # last evaluation that still sees the second skip: a wider window or a
+      # shorter `for` has the alert firing there.
+      - series: 'descry_runner_skipped_slots_total'
+        values: '0 1 1 1 1 1 1 1 1 1 1 1 1 2+0x30'
+    alert_rule_test:
+      - eval_time: 21m
+        alertname: DescrySkipsClimbing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: DescrySkipsClimbing
+        exp_alerts: []
+
+  # --- DescryResultsDropped -----------------------------------------------
+  - name: results dropped fires at once with no wait
+    interval: 1m
+    input_series:
+      - series: 'descry_runner_dropped_results_total'
+        values: '0 0 0 4 4 4 4 4 4 4 4 4 4 4 4 4'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DescryResultsDropped
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DescryResultsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations: &droppedAnnotations
+              summary: descry is dropping results
+              description: >-
+                The runner discarded results in the last 10 minutes because the
+                results channel was full, so the drain is not keeping up. A
+                dropped Result can hide a failed check or publish (an event that
+                was never sent): its diagnostics are lost, and the best-effort
+                counters (skips seen, result errors) undercount while this
+                happens.
+      # With no `for`, the window alone sets how long the alert fires. The
+      # step at 3m is still inside a 10m window at 11m and has left it at
+      # 12m, so the pair fails for any window other than 10m.
+      - eval_time: 11m
+        alertname: DescryResultsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations: *droppedAnnotations
+      - eval_time: 12m
+        alertname: DescryResultsDropped
+        exp_alerts: []
+      # The increase leaves the 10m window, so the alert resolves.
+      - eval_time: 15m
+        alertname: DescryResultsDropped
+        exp_alerts: []
+
+  # Pins the gap the rule comment describes: a series whose first sample is
+  # already above 0 (a new pod after a rollout) has no increase to report.
+  - name: results dropped does not fire on a new series that starts above 0
+    interval: 1m
+    input_series:
+      - series: 'descry_runner_dropped_results_total{instance="new"}'
+        values: '_ _ _ 3 3 3 3 3 3 3 3'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DescryResultsDropped
+        exp_alerts: []
+
+  # --- DescryPublishErrors ------------------------------------------------
+  - name: publish errors fires at once with no wait
+    interval: 1m
+    input_series:
+      - series: 'descry_runner_result_errors_total'
+        values: '0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DescryPublishErrors
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DescryPublishErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations: &publishAnnotations
+              summary: descry is failing to publish events
+              description: >-
+                Results failed in the last 10 minutes: events were not delivered
+                after retries, or could not be built. Check the sink (disk space,
+                permissions, the receiving end) and descry's stderr for the
+                "check failed" lines.
+      # As for the drop alert: firing at 11m and quiet at 12m pins the 10m
+      # window.
+      - eval_time: 11m
+        alertname: DescryPublishErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations: *publishAnnotations
+      - eval_time: 12m
+        alertname: DescryPublishErrors
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: DescryPublishErrors
+        exp_alerts: []
+
+  - name: publish errors fires after a counter reset in the same series
+    interval: 1m
+    input_series:
+      # A container restart that keeps the series: 5, then 2 after the reset.
+      - series: 'descry_runner_result_errors_total'
+        values: '5 5 5 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DescryPublishErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: descry is failing to publish events
+              description: >-
+                Results failed in the last 10 minutes: events were not delivered
+                after retries, or could not be built. Check the sink (disk space,
+                permissions, the receiving end) and descry's stderr for the
+                "check failed" lines.
+
+  - name: publish errors does not fire on a new series that starts above 0
+    interval: 1m
+    input_series:
+      - series: 'descry_runner_result_errors_total{instance="new"}'
+        values: '_ _ _ 3 3 3 3 3 3 3 3'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DescryPublishErrors
+        exp_alerts: []
+
+  - name: publish errors does not fire on a flat counter
+    interval: 1m
+    input_series:
+      - series: 'descry_runner_result_errors_total'
+        values: '12+0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DescryPublishErrors
+        exp_alerts: []
