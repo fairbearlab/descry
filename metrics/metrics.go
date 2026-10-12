@@ -210,7 +210,10 @@ func New(opts Options) (*Collector, error) {
 // both read 0 until it is called. Call it once per Collector: a later call
 // switches the source, and the counters would jump. A nil stats is ignored,
 // but a typed nil (a nil *runner.Runner in the interface) is not detected: it
-// is stored and panics at scrape time.
+// is stored, and every Gather then panics in the caller's goroutine. Served
+// through net/http the panic is recovered per request and the scrape fails
+// with a dropped connection; a direct Gather call panics the caller. Pass the
+// value runner.New returned.
 func (c *Collector) SetRunner(stats RunnerStats) {
 	if stats != nil {
 		c.stats.Store(&runnerRef{stats})

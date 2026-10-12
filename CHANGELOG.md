@@ -31,6 +31,13 @@ Pre-1.0, the minor version carries breaking changes.
   v1.25.0 to the module; the engine packages do not import it, and CI now
   fails if they ever do.
 
+### Fixed
+
+- `metrics.Collector.SetRunner`'s doc describes the typed-nil behaviour
+  accurately: every Gather panics in the caller's goroutine, which net/http
+  recovers per request (the scrape fails with a dropped connection), while a
+  direct `Gather` call panics the caller.
+
 ## [0.4.0] — 2026-10-11
 
 ### Added
