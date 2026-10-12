@@ -49,8 +49,8 @@ spec:
       containers:
         - name: descry
           # The tag is set by the images entry in kustomization.yaml; apply this
-          # directory with `kubectl apply -k`, not `kubectl apply -f`. No image
-          # is published yet; build one locally, see README.md.
+          # directory with `kubectl apply -k`, not `kubectl apply -f`. Releases
+          # from v0.5.0 publish this image; to build one locally, see README.md.
           image: ghcr.io/fairbearlab/descry
           args:
             - --config

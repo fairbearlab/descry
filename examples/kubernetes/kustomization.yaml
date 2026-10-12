@@ -5,9 +5,10 @@ resources:
   - deployment.yaml
 images:
   - name: ghcr.io/fairbearlab/descry
-    # newTag is the release this example is written for, but no image is
-    # published under this name yet. README.md builds one locally and
-    # overrides this entry from a throwaway overlay, so leave it as is.
+    # newTag is the release this example is written for. The release
+    # workflow publishes this image, tagged with the v, from v0.5.0 on.
+    # README.md also builds one locally and overrides this entry from a
+    # throwaway overlay, so leave it as is.
     newTag: v0.5.0
 labels:
   # Added to every object and to the pod template, but not to the Deployment's

@@ -239,28 +239,6 @@ keep `run()` free of a check seam) or a probe the guard lets through.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
-### Publish the container image before v0.5.0 is tagged
-
-**What:** Publish `ghcr.io/fairbearlab/descry` images from the release workflow
-(a `kos` or `dockers` section in `.goreleaser.yaml`, plus the registry login and
-`packages: write` permission it needs), starting with v0.5.0.
-
-**Why:** `examples/kubernetes/kustomization.yaml` sets `newTag: v0.5.0` for
-`ghcr.io/fairbearlab/descry`, but nothing publishes that image today, so
-`kubectl apply -k examples/kubernetes` ends in `ImagePullBackOff`. The example
-README and the changelog say no image is published yet and build one locally
-with ko; once the image exists, drop that caveat from the README, the
-kustomization and deployment comments, and the changelog.
-
-**Context:** 2026-10-12 — release gate for v0.5.0: either the image is
-published by then, or `newTag` and the docs move to whatever release first
-ships one. The published tag must match `newTag: v0.5.0`, with the `v`:
-goreleaser's `{{.Version}}` drops it, so either tag the image with
-`{{.Tag}}` or change `newTag` (and the docs) to `0.5.0`. Start at
-`.goreleaser.yaml` and `.github/workflows/release.yml`.
-
-**Effort:** S · **Priority:** P1 · **Depends on:** nothing
-
 ## Check
 
 ### `check.RedactURL` leaves passwords in misparsed URLs
@@ -387,7 +365,73 @@ the write, then assert a third request still gets 200, not 503.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
+## Release
+
+### Make the first published image public and verify its signatures
+
+**What:** After the v0.5.0 release workflow runs, set the
+`ghcr.io/fairbearlab/descry` package's visibility to public (GHCR creates a
+new package private), confirm it is linked to this repository, then run the
+`cosign verify` and `cosign verify-blob` commands from README.md's "Verify a
+release" against v0.5.0, and `kubectl apply -k examples/kubernetes` on a kind
+cluster without the local overlay.
+
+**Why:** The push, the image signature and the checksums signature first run
+on the v0.5.0 tag: the CI snapshot builds the image but skips publishing and
+signing. A private package makes anonymous pulls, `cosign verify` and the
+Kubernetes example fail with an authorization error.
+
+**Context:** 2026-10-12 — if the release fails after the image push (the
+image is signed before the GitHub release is created), patch forward with
+v0.5.1 rather than retagging; `newTag` and the README examples then move to
+the release that worked.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** the v0.5.0 release
+
+### Verify Scorecard credits the signed releases
+
+**What:** After v0.5.0, check the OpenSSF Scorecard result for this
+repository and confirm the Signed-Releases check counts the release's
+signature (`descry_<version>_checksums.txt.sigstore.json`).
+
+**Why:** Releases are signed with keyless cosign: `docker_signs` on the image
+and `signs` on the checksums file, from the release workflow's OIDC identity.
+That is the one signing mechanism; build-provenance attestations
+(`actions/attest-build-provenance`, SLSA provenance files) are not planned. If
+Scorecard does not recognise the `.sigstore.json` bundle name, note that here
+rather than adding a second signing mechanism for the score.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** the v0.5.0 release
+
 ## Completed
+
+### Publish the container image before v0.5.0 is tagged
+
+**What:** Publish `ghcr.io/fairbearlab/descry` images from the release workflow
+(a `kos` or `dockers` section in `.goreleaser.yaml`, plus the registry login and
+`packages: write` permission it needs), starting with v0.5.0.
+
+**Why:** `examples/kubernetes/kustomization.yaml` sets `newTag: v0.5.0` for
+`ghcr.io/fairbearlab/descry`, but nothing publishes that image today, so
+`kubectl apply -k examples/kubernetes` ends in `ImagePullBackOff`. The example
+README and the changelog say no image is published yet and build one locally
+with ko; once the image exists, drop that caveat from the README, the
+kustomization and deployment comments, and the changelog.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+**Completed:** 2026-10-12 — `.goreleaser.yaml` has a `kos` entry that the
+release workflow pushes as `ghcr.io/fairbearlab/descry:{{ .Tag }}`, with the
+`v`, so it matches `newTag: v0.5.0`, plus `latest` on final releases; the
+first tag that publishes it is v0.5.0. `release.yml` logs in to GHCR with
+`packages: write`. cosign signs the image and the checksums file keylessly.
+The example README, kustomization and deployment comments and the changelog
+now say the release workflow publishes the image from v0.5.0, and keep the
+local ko build for before that release and for local changes.
+`TestReleaseImageMatchesKustomization` in `cmd/descry` fails if the kos
+repository and the kustomization image name drift apart, if the kos tags use
+`{{ .Version }}` or lose `{{ .Tag }}`, or if `newTag` loses its `v`. The
+release-day steps are tracked under Release.
 
 ### Prometheus deny-list fails open on new packages
 

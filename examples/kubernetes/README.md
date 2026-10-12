@@ -120,8 +120,10 @@ NetworkPolicy. kind's default CNI does enforce it.
 
 ## Try it on a kind cluster
 
-No image is published to `ghcr.io/fairbearlab/descry` yet, so these steps
-build one from this checkout and load it straight into kind. You need Docker,
+The release workflow publishes `ghcr.io/fairbearlab/descry` starting with
+v0.5.0, the tag `kustomization.yaml` pins. Until that release exists, and
+whenever you want to run your own changes, these steps build an image from this
+checkout and load it straight into kind. You need Docker,
 [kind](https://kind.sigs.k8s.io/), `kubectl` and Go. Run everything from the
 root of the repository.
 
@@ -166,9 +168,9 @@ root of the repository.
    kubectl rollout status deployment/descry --timeout=120s
    ```
 
-   Once a release image is published, `kubectl apply -k examples/kubernetes`
+   With a published release image, `kubectl apply -k examples/kubernetes`
    is all you need, with `newTag` in `kustomization.yaml` set to the release
-   you want.
+   you want (v0.5.0 or later, with the `v`).
 
 4. Port-forward the metrics port. This holds the terminal, so run the next step
    in another one.
