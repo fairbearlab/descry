@@ -83,9 +83,10 @@ jobs:
           version: v2.12.2
   # Validates .goreleaser.yaml and runs a snapshot release with publishing
   # and signing skipped. The ko pipe still runs: it builds the linux/amd64
-  # and linux/arm64 images and loads them into the runner's Docker daemon
-  # under goreleaser.ko.local, which is the only check of the image config
-  # before a tag. The push and the cosign signatures first run on a tag.
+  # and linux/arm64 images and loads the linux/amd64 one into the runner's
+  # Docker daemon under goreleaser.ko.local (the daemon publisher loads a
+  # single platform). That is the only check of the image config before a
+  # tag. The push and the cosign signatures first run on a tag.
   release-check:
     runs-on: ubuntu-latest
     steps:
