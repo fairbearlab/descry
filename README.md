@@ -110,7 +110,7 @@ curl -s 127.0.0.1:9090/metrics | grep '^descry_check_up'
 
 | Endpoint | Answers |
 |---|---|
-| `GET /metrics` | the `descry_*` series in the Prometheus text format (no Go or process collectors). At most 2 scrapes run at once (a third gets 503) and a scrape times out after 10s |
+| `GET /metrics` | the `descry_*` series in the Prometheus text format (no Go or process collectors). At most 2 scrapes run at once (a third gets 503, and so can a scrape that follows a timed-out or abandoned one while its gather finishes) and a scrape times out after 10s |
 | `GET /healthz` | 200 `ok` whenever the server is serving |
 | `GET /readyz` | 503 `not ready` until the runner starts, 200 while it runs, 503 again from the first shutdown signal on. It does **not** wait for a first observation (see "First fire" above) |
 
@@ -118,8 +118,8 @@ curl -s 127.0.0.1:9090/metrics | grep '^descry_check_up'
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--listen host:port` | empty (off) | serve the three endpoints there. `:9090` binds every interface. An address that is not `host:port` exits 2; a bind failure (port in use, permission) exits 1 before the sink is opened |
-| `--metrics-per-target` | `true` | export the per-target `descry_check_*` series, labelled `url="scheme://host[:port]/path"`. `false` keeps only the fleet-wide series. Only has an effect with `--listen` |
+| `--listen host:port` | empty (off) | serve the three endpoints there. `:9090` binds every interface. An address that is not `host:port`, or whose port is empty (`127.0.0.1:`), not a number or above 65535, exits 2; a bind failure (port in use, permission) exits 1 before the sink is opened |
+| `--metrics-per-target` | `true` | export the per-target `descry_check_*` series, labelled `url="scheme://host[:port]/path"`. `false` keeps only the fleet-wide series. Only has an effect with `--listen`; set without it, descry logs a WARN |
 
 The endpoints are **unauthenticated**. Bind them to loopback or a private
 interface, not a public one.

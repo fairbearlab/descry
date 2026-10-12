@@ -28,7 +28,10 @@ Pre-1.0, the minor version carries breaking changes.
   dropped parts share one series set. `Options.DisablePerTarget` drops the
   per-target family (about seven series per target) for large fleets. Adds
   `github.com/prometheus/client_golang` v1.25.0 to the module; the engine
-  packages do not import it, and CI now fails if they ever do.
+  packages do not import it, and CI now fails if they ever do (the engine set
+  is every package except `metrics/` and `cmd/`, derived from `go list` for
+  the linux, darwin and windows builds, so a new package is covered
+  automatically).
 
 - **`descry --listen host:port` serves `/metrics`, `/healthz` and `/readyz`.**
   Off by default; without it no port is opened and no collector is built.
@@ -36,16 +39,23 @@ Pre-1.0, the minor version carries breaking changes.
   third gets 503; 10s scrape timeout). `/healthz` is 200 whenever the server is
   serving. `/readyz` is 503 until the runner starts, 200 while it runs and 503
   from the first shutdown signal on; it does not wait for a first observation.
-  At shutdown the run drains first, so a final scrape sees every counter, then
-  the admin server shuts down (5s, then forced with a WARN), then the sink is
-  closed. A bind failure exits 1 before the sink is opened, an address that is
-  not `host:port` exits 2, and an admin server error cancels the run and exits
-  1. The endpoints are unauthenticated: bind them to loopback or a private
+  At shutdown the run drains first, so a scrape still in flight sees every
+  counter (there is no linger for a later one), then the admin server shuts
+  down (5s, then forced with a WARN), then the sink is closed. A bind failure
+  exits 1 before the sink is opened, an address that is not `host:port` (or
+  whose port is empty, not a number or above 65535) exits 2, and an admin
+  server error is printed at once, cancels the run and exits 1. A metrics
+  collector that cannot be built also exits 1 before the sink is opened. The
+  server bounds header reads (5s, about 8 KiB), whole-request reads (10s),
+  response writes (30s) and open connections (64; more wait in the accept
+  backlog), and keep-alives are off, so each connection serves one request.
+  The endpoints are unauthenticated: bind them to loopback or a private
   interface.
 
 - **`--metrics-per-target` (default `true`).** `false` drops the per-target
   `descry_check_*` series and keeps only the fleet-wide ones, for large fleets
-  or targets that carry a secret in their path.
+  or targets that carry a secret in their path. Setting it without `--listen`
+  logs a WARN, since it then has no effect.
 
 - **Shared metrics labels are refused.** With `--listen` and per-target series
   on, two targets whose URLs render to the same metrics label (exact
@@ -66,20 +76,13 @@ Pre-1.0, the minor version carries breaking changes.
   query (including through a relative redirect). An explicit `url` label on a
   target is still published verbatim as the subject. Targets that differ only
   in query now share a subject; `descry` warns once per shared subject at
-  startup, and a `url` label tells them apart. `source` and `data.extra.body`
-  are not rewritten.
-
-### Fixed
-
-- CI's check that the engine packages do not import prometheus now derives the
-  engine set from `go list` (every package except `metrics/` and `cmd/`), so a
-  new package is covered automatically. It fails on a `go list` error or an
-  empty set, and lists and checks the packages of the linux, darwin and windows
-  builds separately.
-- `metrics.Collector.SetRunner`'s doc describes the typed-nil behaviour
-  accurately: every Gather panics in the caller's goroutine, which net/http
-  recovers per request (the scrape fails with a dropped connection), while a
-  direct `Gather` call panics the caller.
+  startup, and a `url` label tells them apart. The rendering also normalises,
+  so subjects change even for URLs that carried no secret: a bare host gains
+  a trailing `/` (`https://example.com` becomes `https://example.com/`), the
+  path is re-escaped, the scheme is lower-cased and the fragment is dropped.
+  A target whose subject renders as `<unparseable>` (and has no `url` label)
+  gets a startup WARN that names its config position rather than its URL.
+  `source` and `data.extra.body` are not rewritten.
 
 ## [0.4.0] — 2026-10-11
 
