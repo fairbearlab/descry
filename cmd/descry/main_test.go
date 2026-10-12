@@ -141,7 +141,7 @@ func TestBuildTargets_WarnsOnceForDuplicateURL(t *testing.T) {
 
 // TestDrainResults_RateLimitsSkipsPerTarget: skips print once per target per
 // interval with a suppressed count on the next line; failures always print;
-// nil Results print nothing; the failure count is returned.
+// nil Results print nothing; the failure count lands in the caller's counter.
 func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 	ch := make(chan runner.Result, 16)
 	a := check.Target{URL: "https://a.example/"}
@@ -158,7 +158,9 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 	close(ch)
 
 	var out bytes.Buffer
-	if got := drainResults(ch, &out, 30*time.Second, now); got != 1 {
+	var failures atomic.Int64
+	drainResults(ch, &out, 30*time.Second, now, &failures)
+	if got := failures.Load(); got != 1 {
 		t.Fatalf("failures = %d, want 1", got)
 	}
 	s := out.String()
@@ -188,13 +190,51 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 		}
 		return clock
 	}
-	drainResults(ch2, &out, 30*time.Second, tick)
+	drainResults(ch2, &out, 30*time.Second, tick, new(atomic.Int64))
 	s = out.String()
 	if n := strings.Count(s, "check skipped:"); n != 2 {
 		t.Fatalf("skip lines across an interval boundary = %d, want 2:\n%s", n, s)
 	}
 	if !strings.Contains(s, "(1 more skips for this target since the last line)") {
 		t.Errorf("suppressed count not reported:\n%s", s)
+	}
+}
+
+// TestDrainResults_FailureCountVisibleLive: the failure counter is bumped as
+// each failure is drained, not stored when the drain returns, so a metrics
+// counter reading it sees the value while the results channel is still open.
+// Skips and successes do not count.
+func TestDrainResults_FailureCountVisibleLive(t *testing.T) {
+	ch := make(chan runner.Result)
+	var failures atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		drainResults(ch, io.Discard, 30*time.Second, time.Now, &failures)
+	}()
+
+	tgt := check.Target{URL: "https://a.example/"}
+	ch <- runner.Result{Target: tgt, Err: runner.ErrSkipped}
+	ch <- runner.Result{Target: tgt}
+	ch <- runner.Result{Target: tgt, Err: errors.New("publish failed")}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for failures.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("failures = %d before the channel closed, want 1", failures.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("drain returned before the channel closed")
+	default:
+	}
+
+	close(ch)
+	<-done
+	if got := failures.Load(); got != 1 {
+		t.Fatalf("failures after close = %d, want 1 (skips and successes must not count)", got)
 	}
 }
 
@@ -222,7 +262,7 @@ func TestDrainResults_SkipWindowUsesTargetInterval(t *testing.T) {
 	ch <- runner.Result{Target: dflt, Err: runner.ErrSkipped} // t=6s: suppressed (30s window)
 	close(ch)
 	var out bytes.Buffer
-	drainResults(ch, &out, 30*time.Second, now)
+	drainResults(ch, &out, 30*time.Second, now, new(atomic.Int64))
 
 	s := out.String()
 	if n := strings.Count(s, "check skipped: https://fast.example/"); n != 2 {

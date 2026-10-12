@@ -8,6 +8,29 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`metrics`: a Prometheus collector for programs that embed descry.**
+  `metrics.New(opts)` builds a `Collector` on its own registry (descry_* series
+  only, no Go or process collectors; serve it with
+  `promhttp.HandlerFor(c.Registry(), ...)`). `c.Check(inner)` decorates a
+  check so every run records per-target series (`descry_check_up`,
+  `status_code`, `latency_seconds`, `last_run_timestamp_seconds`,
+  `tls_expiry_timestamp_seconds`, `runs_total{status}`) and fleet series (a
+  `duration_seconds` histogram up to 30s and `errors_total{class}` over a
+  closed class set). Once the runner exists, `c.SetRunner(r)` backs the exact
+  `descry_runner_skipped_slots_total` and `dropped_results_total` counters;
+  `ObserveSkip`, `SetTargetCount` and `Options.ResultErrors` feed the
+  best-effort triage series. The `url` label comes from `metrics.TargetLabel`,
+  which keeps only scheme, host and path: userinfo, query and fragment are
+  always dropped, and a URL it cannot render safely (including one with a
+  stray literal `@`) becomes `<unparseable>`. Targets that differ only in
+  dropped parts share one series set. `Options.DisablePerTarget` drops the
+  per-target family (about seven series per target) for large fleets. The CLI
+  does not serve metrics yet. Adds `github.com/prometheus/client_golang`
+  v1.25.0 to the module; the engine packages do not import it, and CI now
+  fails if they ever do.
+
 ## [0.4.0] — 2026-10-11
 
 ### Added

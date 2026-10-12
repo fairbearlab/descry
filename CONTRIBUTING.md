@@ -54,8 +54,8 @@ comparison against the merge base that fails on a ≥ +10 % ns/op regression
 (`runner/scale_test.go`) with its structural criteria asserted, allocation-count
 guards (they skip under `-race`, so `go test -race` never exercises them), and
 count-budgeted coverage-guided fuzz runs. If your change touches the runner,
-sink, event encoder, or the SSRF guard, run the gated tests locally before
-pushing:
+sink, event encoder, metrics url label, or the SSRF guard, run the gated tests
+locally before pushing:
 
 ```
 go test -run 'TestScale' -v ./runner/
@@ -64,6 +64,7 @@ go test -run '^$' -fuzz 'FuzzScheduler' -fuzztime=400000x ./runner/
 go test -run '^$' -fuzz 'FuzzAssertSafeURL' -fuzztime=1200000x ./checks/http/
 go test -run '^$' -fuzz 'FuzzIsBlockedIP' -fuzztime=1000000x ./checks/http/
 go test -run '^$' -fuzz 'FuzzToCloudEvent' -fuzztime=1000000x ./event/
+go test -run '^$' -fuzz 'FuzzTargetLabel' -fuzztime=1000000x ./metrics/
 go test -run '^$' -bench . -count=10 ./runner/ ./sink/
 ```
 

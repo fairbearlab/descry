@@ -2,7 +2,7 @@
 
 Parked work, with enough context to pick up cold. Each entry says what, why, where to
 start, and what it depends on. Priorities: P1 next release, P2 when a consumer asks or
-the next time the area is touched, P3 nice-to-have.
+the next time the area is touched, P3 nice-to-have, P4 only if a trigger fires.
 
 ## Runner
 
@@ -29,6 +29,29 @@ is allowed to finish; added targets get their epoch-aligned first slot. Start at
 API generic — no consumer vocabulary.
 
 **Effort:** M · **Priority:** P2 · **Depends on:** v0.3.0 (landed)
+
+### Per-target metric series must be retired when `SetTargets` removes a target
+
+**What:** When the planned dynamic target set (`Runner.SetTargets`, above) removes a
+target, the `metrics/` decorator's per-target series for it must be deleted
+(`DeleteLabelValues`, or a removal hook the runner exposes). Otherwise the last values
+stay exported forever and `descry_check_up` keeps reporting a target that no longer
+exists.
+
+**Why:** Today's CLI loads a static config, so nothing is removed at runtime; a dynamic
+target set changes that, and the `SetTargets` design says nothing yet about downstream
+state keyed by target.
+
+**Context:** 2026-10-11 — the `metrics/` collector caches one set of per-target children
+per raw target URL and never drops them. A plain `DeleteLabelValues` is not enough: the
+`url` label is shared (targets that differ only in query or fragment, every
+`<unparseable>` URL, and duplicate entries of one URL all map to one label), so the
+delete must wait until no remaining target maps to the label, must evict or rebuild the
+affected cache entries in the same step, and must not race a removed target's in-flight
+run (whose `record` would recreate the series). Add this to the `SetTargets` design when
+it is written.
+
+**Effort:** M · **Priority:** P3 · **Depends on:** `Runner.SetTargets`; `metrics/` (landed)
 
 
 ## Event
@@ -94,6 +117,55 @@ consumer asks, not speculatively.
    returns; the batcher's `Close` flushes then closes `inner`).
 
 **Effort:** M · **Priority:** P3 · **Depends on:** a consumer that needs it; v0.3.0 (landed)
+
+## Metrics
+
+### `target_id` metrics label from a target identity key
+
+**What:** Add a stable `target_id` label to the per-target `descry_check_*` series in
+`metrics/`, derived from a target identity key (defined alongside the dynamic target
+set, `Runner.SetTargets`), so targets that differ only in query string or fragment stop
+sharing one series set.
+
+**Why:** The `url` label is built from scheme, host and path only (credential safety:
+the label is persistent and served on an unauthenticated port), so two targets
+differing only in dropped parts collide: counters sum and gauges are last-writer-wins.
+The identity label must be an opaque key: assigned in config, or random at registration.
+It must never be a plain hash of the URL or of its dropped parts, because, as
+`metrics.TargetLabel` notes, a fast hash of a URL whose userinfo or query carries a
+weak secret can be brute-forced offline. If the key has to be derived, use a keyed MAC
+with a per-process secret.
+
+**Context:** 2026-10-11 — documented in `metrics.TargetLabel`; deferred because the
+identity key does not exist until the dynamic target set is designed.
+
+**Effort:** M · **Priority:** P3 · **Depends on:** a target identity key (with `Runner.SetTargets`); `metrics/` (landed)
+
+## CLI
+
+### Move `cmd/descry` to its own module when a CLI-only dependency raises a shared floor
+
+**What:** Split `cmd/descry` into a nested module only when a CLI-only dependency forces
+a newer version of a library the embedding consumer also pins. `metrics/` is a public
+root package, so it cannot move under `cmd/descry` without breaking embedders' imports;
+if prometheus/client_golang is the trigger, `metrics/` needs its own nested module
+(`metrics/go.mod`, same import path, its own tags) to take it out of the root graph.
+
+**Why:** One root module was chosen: binary-only requires enter the consumer's module
+graph but are never imported, so the only cost is a raised floor on a shared
+dependency. If that happens, the known escape hatch is a nested module, about a
+day of work. Writing the trigger down avoids re-deriving it in a repin PR.
+
+**Context:** 2026-10-11 — trigger = the consumer's repin PR shows a go.mod/go.sum diff
+that raises a shared dependency (for example golang.org/x/sys or protobuf) because of a
+require such as prometheus/client_golang (which now arrives via the root `metrics/`
+package) or a future CLI-only OTel/grpc. Precedent: the root go.mod already carries
+`tool golang.org/x/vuln/cmd/govulncheck`. The move: `cmd/descry/go.mod` requiring the
+root at a tagged version, `cmd/descry/vX.Y.Z` tags, and a ci.yml step (or job) that
+builds and tests the nested module; no lockstep or go.sum precompute is needed because the CLI pins a published
+root tag.
+
+**Effort:** M · **Priority:** P4 · **Depends on:** a repin PR that exhibits the trigger
 
 ## Completed
 
