@@ -17,3 +17,7 @@ docs/internal/
 
 # Test coverage profile (written by the CI test command when run locally)
 coverage.out
+
+# Rule group extracted from contrib/prometheus/descry-rules.yaml for promtool
+# (written by the CI rules job and by the commands in its README)
+contrib/prometheus/descry-rules.extracted.yaml

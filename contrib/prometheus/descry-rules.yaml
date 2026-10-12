@@ -1,0 +1,184 @@
+# Alerting rules for descry, as a Prometheus Operator PrometheusRule.
+#
+# Plain Prometheus: extract the rule groups with `yq '.spec'` (see README.md).
+# The series are described in the metrics package doc and docs/OPERATIONS.md.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: descry
+  labels:
+    app.kubernetes.io/name: descry
+    app.kubernetes.io/component: alerting-rules
+spec:
+  groups:
+    - name: descry
+      rules:
+        # build_info is constant 1 and always registered, so its absence means
+        # no descry instance is being scraped at all. When descry exits, its
+        # per-target series go stale and the target alert below goes quiet
+        # with them, so this is what catches a prober that is gone. absent()
+        # sees every descry_build_info series in this Prometheus, though: if
+        # it scrapes more than one descry instance, one dead instance does not
+        # fire this while another still reports. For an instance that is
+        # discovered but cannot be scraped, also alert on the scrape job's up
+        # series, for example `up{job="<your descry job>"} == 0` for 5m; for
+        # one that leaves service discovery, see README.md.
+        - alert: DescryProberAbsent
+          expr: absent(descry_build_info) == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: no descry instance is reporting metrics
+            description: >-
+              No descry_build_info series has been scraped from any instance for
+              5 minutes. Every descry prober is down, or none of their --listen
+              endpoints is being scraped. Either nothing is being checked, or
+              its results are not reaching Prometheus: check the scrape config
+              (a missing PodMonitor, say) before restarting probers.
+
+        # Needs the per-target series, i.e. --metrics-per-target, which is on
+        # by default. With --metrics-per-target=false there is no
+        # descry_check_up and this rule never fires; alert on the fleet-wide
+        # descry_check_errors_total instead.
+        #
+        # descry_check_up holds its value until the target's next run, so the
+        # 5m wait is about 5m / interval consecutive failed runs: a target
+        # checked every 30s must fail about ten runs in a row, but a target
+        # with an interval of 5m or more fires after a single failed run.
+        # Raise `for` (or split the rule by url) if slow targets should get
+        # more than one chance.
+        - alert: DescryTargetDown
+          expr: descry_check_up == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: descry target {{ $labels.url }} is down
+            description: >-
+              The last run of {{ $labels.url }} was not up, and it has stayed
+              that way for 5 minutes.
+
+        # Catches a prober that is up and serving /metrics but no longer
+        # completing checks. descry_check_up keeps its last value, so a target
+        # that was up stays up, and build_info is still there. A wedged sink
+        # keeps its runs in flight, so their slots are skipped and
+        # DescrySkipsClimbing fires too, but that one points at the
+        # concurrency or the interval; this alert names the real symptom. A
+        # wedged scheduler starts no runs and skips no slots, so only this
+        # alert catches it.
+        #
+        # Needs the per-target series, i.e. --metrics-per-target, which is on
+        # by default. With --metrics-per-target=false it never fires; the
+        # fleet-wide fallback is
+        # `increase(descry_check_duration_seconds_count[15m]) == 0` with
+        # `for: 15m`, which fires only when no target at all completes a run
+        # (the README has the details and its limits).
+        #
+        # A url that a program embedding descry stops checking keeps its
+        # series, frozen, until the process restarts, so this fires for it.
+        # The CLI checks a fixed set of targets for its whole lifetime.
+        #
+        # The interval is not exported, so the budget is fixed: 15 minutes
+        # since the target's last completed run. Keep it above twice your
+        # longest per-target interval plus the timeout, or a slow target fires
+        # it between two healthy runs. The timestamp comes from descry's clock
+        # and time() from Prometheus's, so clock skew between the two counts
+        # against the budget. A target that has never completed a run has no
+        # series and is not covered.
+        #
+        # No wait: the condition only becomes true once the budget has passed,
+        # and the next completed run clears it at once, so it cannot flap and
+        # a `for` would only add to the 15 minutes.
+        - alert: DescryChecksStale
+          expr: time() - descry_check_last_run_timestamp_seconds > 15 * 60
+          labels:
+            severity: critical
+          annotations:
+            summary: descry has not completed a check of {{ $labels.url }} in 15 minutes
+            description: >-
+              The last completed run of {{ $labels.url }} is more than 15
+              minutes old, but descry is still being scraped. Its per-target
+              series, descry_check_up included, are frozen at their last
+              values. Check descry's stderr and the sink, and restart descry if
+              it is wedged.
+
+        # Reads the exact total, not descry_runner_skips_observed_total{kind}:
+        # that one is fed from the results channel, undercounts whenever
+        # results are dropped, and is for working out which kind of skip it
+        # was once this alert has fired.
+        #
+        # The condition is "at least one skip in the last 10 minutes", and it
+        # must hold at every evaluation for 15 minutes. It stays true for up to
+        # 10 minutes after the last skip, so skipping that lasts about 8 minutes
+        # or more fires it, and so do single skips that recur less than 10
+        # minutes apart. A shorter burst (a slow deploy, a few slow targets)
+        # does not.
+        - alert: DescrySkipsClimbing
+          expr: increase(descry_runner_skipped_slots_total[10m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: descry is skipping check slots
+            description: >-
+              descry has skipped slots at least once in every 10-minute window
+              for 15 minutes, because a target's previous run was still in
+              flight or the worker queue was full. Those targets are checked
+              less often than configured. Raise the concurrency or lengthen the
+              interval. descry_runner_skips_observed_total shows which kind of
+              skip it is.
+
+        # A dropped Result is the report of a run (or of a skipped slot), sent
+        # after the run is over: publication was attempted unless the slot was
+        # skipped or the check or its encoding failed. But a Result can carry a check, encode or
+        # publish failure, in which case no event went out, so a dropped
+        # Result can hide an event that was never sent. Its diagnostics, which
+        # the drain would have logged, are lost too (the runner logs every
+        # failed publish itself; other drops show only in its rate-limited
+        # drop warning), and
+        # descry_runner_result_errors_total and
+        # descry_runner_skips_observed_total undercount. No wait: the counter
+        # only moves under saturation, so a single increment is worth a look.
+        # The series is exact.
+        #
+        # increase() needs two samples of a series, so a counter that is
+        # already above 0 at its first scrape does not fire this. That is the
+        # case for drops before a new pod's first scrape (after a rollout or a
+        # reschedule its instance label is new), so check the pod log after a
+        # restart. A restart that keeps the same series is handled: increase()
+        # treats the drop to 0 as a counter reset.
+        - alert: DescryResultsDropped
+          expr: increase(descry_runner_dropped_results_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: descry is dropping results
+            description: >-
+              The runner discarded results in the last 10 minutes because the
+              results channel was full, so the drain is not keeping up. A
+              dropped Result can hide a failed check or publish (an event that
+              was never sent): its diagnostics are lost, and the best-effort
+              counters (skips seen, result errors) undercount while this
+              happens.
+
+        # The CLI counts a failed result here: a publish that failed after its
+        # retries (a full disk or a broken sink, which otherwise looks healthy
+        # from the outside), or an event mapping or check error. No wait: each
+        # increment is an event that was not delivered, and the retries are
+        # already spent by the time it counts. The series is best-effort and
+        # misses results the runner dropped, so this alert can understate the
+        # failures but does not invent them. As with the drop alert above,
+        # failures before a new instance's first scrape are not counted, so
+        # check the pod log after a restart.
+        - alert: DescryPublishErrors
+          expr: increase(descry_runner_result_errors_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: descry is failing to publish events
+            description: >-
+              Results failed in the last 10 minutes: events were not delivered
+              after retries, or could not be built. Check the sink (disk space,
+              permissions, the receiving end) and descry's stderr for the
+              "check failed" lines.
