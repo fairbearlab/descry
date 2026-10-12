@@ -109,7 +109,7 @@ type runnerRef struct{ RunnerStats }
 //
 // The runner is attached afterwards with SetRunner, because runner.New takes
 // the check that Collector.Check decorates: build the Collector, decorate the
-// check, build the runner, then call SetRunner.
+// check, build the runner, then call SetRunner and SetTargetCount.
 func New(opts Options) (*Collector, error) {
 	c := &Collector{
 		reg:             prometheus.NewRegistry(),
@@ -260,9 +260,8 @@ func (c *Collector) SetTargetCount(n int) { c.targetCount.Set(float64(n)) }
 // custom checks the two series can disagree.
 //
 // The per-target series are cached by the raw target URL and never evicted.
-// A static target set (as the CLI's will be once it serves metrics) keeps the
-// cache bounded; a caller that runs ever-new URLs through the decorator grows
-// it without bound.
+// A static target set (as the CLI's is) keeps the cache bounded; a caller
+// that runs ever-new URLs through the decorator grows it without bound.
 func (c *Collector) Check(inner check.Check) check.Check {
 	return &instrumented{inner: inner, c: c}
 }

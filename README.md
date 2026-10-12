@@ -40,7 +40,8 @@ engine's exported types. Read it before adding a typed field to `Observation`.
 
 [docs/OPERATIONS.md](docs/OPERATIONS.md) is the operator's half: what
 `ErrSkipped`, `ErrSkippedQueued`, `Skipped()` and `Dropped()` mean, how to size
-`concurrency`, and how the scheduler behaves across restarts and clock steps.
+`concurrency`, how the scheduler behaves across restarts and clock steps, what
+the metrics and the `/healthz` and `/readyz` probes report, and the exit codes.
 Read it before wiring up an alarm.
 
 [CHANGELOG.md](CHANGELOG.md) tracks notable changes release over release.
@@ -97,6 +98,62 @@ sleep 35
 cat events.jsonl   # one valid CloudEvent per line
 ```
 
+## Metrics and health endpoints
+
+`--listen` serves Prometheus metrics and two probes on one address. It is off by
+default; without it descry opens no port.
+
+```bash
+descry --config example.yaml --listen 127.0.0.1:9090
+curl -s 127.0.0.1:9090/metrics | grep '^descry_check_up'
+```
+
+| Endpoint | Answers |
+|---|---|
+| `GET /metrics` | the `descry_*` series in the Prometheus text format (no Go or process collectors). At most 2 scrapes run at once (a third gets 503) and a scrape times out after 10s |
+| `GET /healthz` | 200 `ok` whenever the server is serving |
+| `GET /readyz` | 503 `not ready` until the runner starts, 200 while it runs, 503 again from the first shutdown signal on. It does **not** wait for a first observation (see "First fire" above) |
+
+`HEAD` works wherever `GET` does; other methods get 405 and other paths 404.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--listen host:port` | empty (off) | serve the three endpoints there. `:9090` binds every interface. An address that is not `host:port` exits 2; a bind failure (port in use, permission) exits 1 before the sink is opened |
+| `--metrics-per-target` | `true` | export the per-target `descry_check_*` series, labelled `url="scheme://host[:port]/path"`. `false` keeps only the fleet-wide series. Only has an effect with `--listen` |
+
+The endpoints are **unauthenticated**. Bind them to loopback or a private
+interface, not a public one.
+
+With `--listen` and per-target series on, descry refuses to start (exit 2)
+when two targets share a metrics label: the label keeps only scheme, host and
+path, so targets that differ only in userinfo or query, exact duplicates, and
+URLs that have no safe rendering (`<unparseable>`) would merge into one series
+set. Give each a distinct scheme, host or path, or run with
+`--metrics-per-target=false`.
+
+A program that embeds the engine gets the same series from the
+[`metrics`](https://pkg.go.dev/github.com/fairbearlab/descry/metrics) package.
+The order is fixed, because `runner.New` takes the decorated check:
+
+```go
+var failures atomic.Int64 // your Results() drain adds one per non-skip error
+
+c, err := metrics.New(metrics.Options{ResultErrors: failures.Load})
+if err != nil {
+	return err
+}
+r := runner.New(c.Check(httpcheck.New(10*time.Second)), s, evCfg, targets, interval, concurrency)
+c.SetRunner(r)
+c.SetTargetCount(len(targets))
+mux.Handle("GET /metrics", promhttp.HandlerFor(c.Registry(), promhttp.HandlerOpts{}))
+// In the drain: errors.Is(err, runner.ErrSkippedQueued) first, then
+// runner.ErrSkipped, reported with c.ObserveSkip(metrics.SkipQueued) and
+// c.ObserveSkip(metrics.SkipInFlight).
+```
+
+Series, probe semantics, the shutdown order and the exit codes are in
+[docs/OPERATIONS.md](docs/OPERATIONS.md#metrics-and-health-endpoints).
+
 ## Version
 
 `descry --version` prints version, commit, and build date. Release builds stamp
@@ -149,6 +206,23 @@ Residual risks the guard does **not** cover:
 
 For production use, run `descry` inside a network namespace or egress firewall that
 enforces the isolation policy independently of this guard.
+
+What descry publishes about a target URL:
+
+- **The `--listen` port is unauthenticated.** Anyone who can reach it can read
+  the metrics. Bind it to loopback or a private interface.
+- **The per-target `url` metrics label** is `scheme://host[:port]/path`: userinfo,
+  query and fragment are dropped, the path is kept. A target that carries a
+  secret in its path (a tokenised webhook or capability URL) needs
+  `--metrics-per-target=false`.
+- **The event `subject` and `data.final_url`** use the same rendering, so they
+  drop userinfo, query and fragment too, and a URL with no safe rendering shows
+  as `<unparseable>`.
+- **A `url` label you set on a target (`targets[].labels.url`) is published
+  verbatim** as the event subject. It is yours to keep clean, and it is how to
+  give two targets that share a rendering distinct subjects (it does not change
+  the metrics label).
+- **`source` and the failure body (`data.extra.body`) are not rewritten.**
 
 ## License
 

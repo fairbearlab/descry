@@ -109,7 +109,7 @@ consumer vocabulary, and it is additive. It changes surface, not vocabulary. ✅
 | Tenancy / routing (`org_id`, RLS, `SET ROLE`) | Carried only as opaque `Labels`. The engine never reads them. |
 | Translating `ErrorClass` → a consumer's own error vocabulary | Lossy and consumer-specific. |
 | Deduplication | Keys on the authoritative `id`; a consumer's concern if it needs it. |
-| Job-health / liveness reporting | The runner exposes `EventSink` **only** — no health hooks. A consumer wraps the runner **externally**. |
+| Job-health / liveness reporting | The runner exposes `EventSink` **only** — no health hooks. A consumer wraps the runner **externally**. The CLI does exactly this: `/healthz` and `/readyz` live in `cmd/descry`. |
 | Keyword / content matching | The engine captures body into `Extra.body`; comparison logic is consumer scope. |
 | Cursor-based replay consumption | v1 demonstrates replay only via the append-only file sink. |
 
@@ -120,6 +120,12 @@ boundary**. A consumer lives in a *separate module* and `import`s descry; descry
 imports nothing back. If the engine ever needed to import a consumer, the seam
 would already be broken. This is the strongest guarantee available: the
 "consumer-agnostic" property is a compile-time fact, not a code-review aspiration.
+
+The same holds for dependencies inside the module. Prometheus is confined to
+`metrics/` and `cmd/`: the engine packages (everything else) never import it,
+so an embedder that does not import `metrics` never links it. CI enforces this
+on linux, darwin and windows, and derives the engine package list from
+`go list`, so a new package is covered without editing the check.
 
 ## Worked example — `WithUserAgent` (the seam done right)
 

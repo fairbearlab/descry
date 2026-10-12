@@ -137,7 +137,10 @@ weak secret can be brute-forced offline. If the key has to be derived, use a key
 with a per-process secret.
 
 **Context:** 2026-10-11 — documented in `metrics.TargetLabel`; deferred because the
-identity key does not exist until the dynamic target set is designed.
+identity key does not exist until the dynamic target set is designed. The CLI now
+refuses to start (exit 2) when two targets share a label while it serves per-target
+series, so the collision only remains for programs that embed `metrics/`; the entry
+stays for them.
 
 **Effort:** M · **Priority:** P3 · **Depends on:** a target identity key (with `Runner.SetTargets`); `metrics/` (landed)
 
@@ -159,7 +162,8 @@ day of work. Writing the trigger down avoids re-deriving it in a repin PR.
 **Context:** 2026-10-11 — trigger = the consumer's repin PR shows a go.mod/go.sum diff
 that raises a shared dependency (for example golang.org/x/sys or protobuf) because of a
 require such as prometheus/client_golang (which now arrives via the root `metrics/`
-package) or a future CLI-only OTel/grpc. Precedent: the root go.mod already carries
+package, and which `cmd/descry` also imports directly to serve `--listen`) or a future
+CLI-only OTel/grpc. Precedent: the root go.mod already carries
 `tool golang.org/x/vuln/cmd/govulncheck`. The move: `cmd/descry/go.mod` requiring the
 root at a tagged version, `cmd/descry/vX.Y.Z` tags, and a ci.yml step (or job) that
 builds and tests the nested module; no lockstep or go.sum precompute is needed because the CLI pins a published
@@ -167,7 +171,56 @@ root tag.
 
 **Effort:** M · **Priority:** P4 · **Depends on:** a repin PR that exhibits the trigger
 
+### No test proves `run()` wraps the production check in `sanitizedCheck`
+
+**What:** Add a run-level test that fails if `run()` stops wrapping `httpcheck.New`
+in `sanitizedCheck`, on both the plain and the `--listen` path (where the
+collector decorates the wrapped check).
+
+**Why:** The wrapper is what keeps userinfo and the query out of `data.final_url`.
+Its tests build the wrapper (and, for the redirect case, the runner) themselves,
+and the run-level tests only use loopback targets, which the SSRF guard refuses
+before any response, so `FinalURL` is never set. Dropping the wrapper in `run()`
+leaves the suite green and reopens the leak.
+
+**Context:** 2026-10-11 — proving it needs a way to get a real `FinalURL` through
+`run()`: a seam for the inner check (deliberately not added with `--listen`, to
+keep `run()` free of a check seam) or a probe the guard lets through.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 ## Completed
+
+### Prometheus deny-list fails open on new packages
+
+**What:** The CI step that keeps prometheus out of the engine listed the engine
+packages by hand, so a new package was unchecked until someone added it, and a
+`go list` failure or an empty list could pass silently.
+
+**Why:** The whole point of the step is that embedders who do not import `metrics/`
+never link prometheus; a hand-kept list decays.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** `metrics/` (landed)
+
+**Completed:** 2026-10-11 — the engine set is now `go list ./...` minus `metrics/`
+and `cmd/`, listed and checked separately for GOOS linux, darwin and windows (so a
+package that builds on one platform only is checked there); the step fails on a
+`go list` error or an empty set.
+
+### `SetRunner` typed-nil doc was wrong
+
+**What:** `metrics.Collector.SetRunner` said a typed nil "panics at scrape time",
+which read as a process crash.
+
+**Why:** Verified on client_golang v1.25.0: the counter funcs run on the Gather
+caller's goroutine, outside the registry's recover. Served through net/http each
+scrape's panic is recovered per request and the client sees a dropped connection;
+only a direct `Gather` call panics the caller.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** 2026-10-11 — the doc now describes that behaviour and says to pass
+the value `runner.New` returned; the CLI does exactly that.
 
 ### Fuzz shadow model does not mirror the overflow self-heal
 
