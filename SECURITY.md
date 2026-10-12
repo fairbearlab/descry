@@ -31,13 +31,16 @@ reporting lets us assess and fix before details are public.
 - GitHub Actions are pinned to commit SHAs and run with minimal token permissions.
 - Secret scanning and push protection are enabled on the repository.
 - The SSRF guard has Go fuzz targets on both layers (`assertSafeURL`,
-  `isBlockedIP`) and on `check.RedactURL`. They hunt for panics and for
-  disagreements between the two layers; they do **not** make the guard a
-  security boundary, and nothing in the threat model above changes because of them.
-  The two SSRF-layer targets (plus the scheduler's and the event encoder's) get
-  count-budgeted coverage-guided fuzzing on every pull request via the `perf`
-  workflow; all fuzz seed corpora also run as regular tests in CI's
-  `go test -race ./...` invocation.
+  `isBlockedIP`), and `check.RedactURL` and `metrics.TargetLabel` have their own.
+  The `metrics.TargetLabel` target checks that the metrics url label never
+  carries userinfo, a query or a fragment. The SSRF-layer targets hunt for panics
+  and for disagreements between the two layers; they do **not** make the guard a
+  security boundary, and nothing in the threat model above changes because of
+  them. The two SSRF-layer targets (plus the
+  scheduler's, the event encoder's and the metrics label's) get count-budgeted
+  coverage-guided fuzzing on every pull request via the `perf` workflow; all
+  fuzz seed corpora also run as regular tests in CI's `go test -race ./...`
+  invocation.
 - This repository is scored by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/fairbearlab/descry).
 
 ## Response window

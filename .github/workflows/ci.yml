@@ -15,6 +15,19 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go mod tidy -diff
+      # The engine packages stay dependency-light for embedders: prometheus may
+      # appear only in metrics/ (and cmd/, once the CLI serves metrics), never in
+      # anything the engine imports. A new engine package must be added to the
+      # list below.
+      - name: engine packages do not depend on prometheus
+        run: |
+          set -euo pipefail
+          deps="$(go list -deps ./check ./checks/http ./event ./runner ./sink ./config)"
+          if bad="$(printf '%s\n' "$deps" | grep '^github.com/prometheus/')"; then
+            echo "::error::engine packages must not import prometheus:"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
       - run: go test -race -coverprofile=coverage.out ./...
       # Coverage floor. Measured 85.7% of statements on main when last raised
       # (2026-10-05; identical across five -race runs and in CI). It was added at
