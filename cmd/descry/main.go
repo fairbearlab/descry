@@ -20,6 +20,7 @@ import (
 	httpcheck "github.com/fairbearlab/descry/checks/http"
 	"github.com/fairbearlab/descry/config"
 	"github.com/fairbearlab/descry/event"
+	"github.com/fairbearlab/descry/metrics"
 	"github.com/fairbearlab/descry/runner"
 	"github.com/fairbearlab/descry/sink"
 )
@@ -135,8 +136,10 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The check is wrapped so a redirect's final URL reaches the event in the
+	// same clean form as the subject.
 	r := runner.New(
-		httpcheck.New(cfg.Timeout),
+		sanitizedCheck{inner: httpcheck.New(cfg.Timeout)},
 		s,
 		evCfg,
 		targets,
@@ -257,9 +260,17 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 // warns once per URL that appears more than once: duplicates are independent
 // targets to the runner (probed and reported separately, sharing a slot when
 // their intervals match), which is rarely what a copy-pasted entry intended.
+//
+// A target without a "url" label gets eventURL(URL), which becomes the event
+// subject; a "url" label set in the config is kept and published as-is. Since
+// eventURL drops userinfo and query, different URLs can share a subject
+// (https://h/p?region=a and https://h/p?region=b); that is warned once per
+// subject, since consumers keyed on the subject can no longer tell them apart.
 func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
 	targets := make([]check.Target, len(cfg.Targets))
 	seen := make(map[string]int, len(cfg.Targets))
+	subjects := make(map[string]string, len(cfg.Targets)) // subject -> first raw URL with it
+	warnedSubject := map[string]bool{}
 	for i, t := range cfg.Targets {
 		if seen[t.URL]++; seen[t.URL] == 2 {
 			log.Warn("duplicate target URL; each entry is probed independently",
@@ -270,9 +281,20 @@ func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
 		for k, v := range t.Labels {
 			lbl[k] = v
 		}
-		// Ensure the "url" label is always present (used by the CloudEvent subject).
+		// Ensure the "url" label is always present (used by the CloudEvent
+		// subject). An operator-set label is published verbatim.
 		if _, ok := lbl["url"]; !ok {
-			lbl["url"] = t.URL
+			lbl["url"] = eventURL(t.URL)
+		}
+		subject := lbl["url"]
+		if first, ok := subjects[subject]; !ok {
+			subjects[subject] = t.URL
+		} else if first != t.URL && !warnedSubject[subject] {
+			warnedSubject[subject] = true
+			// RedactURL is the identity on a derived subject; it only matters
+			// for an operator-set label that still carries userinfo.
+			log.Warn("targets share an event subject; set a distinct url label to tell them apart",
+				"subject", check.RedactURL(subject))
 		}
 		targets[i] = check.Target{URL: t.URL, Labels: lbl, Interval: t.Interval}
 
@@ -286,4 +308,32 @@ func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
 		}
 	}
 	return targets
+}
+
+// eventURL is the URL form published in events (subject, final_url): the
+// metrics label rule, scheme://host[:port]/path with no userinfo, query or
+// fragment, and "<unparseable>" when the URL has no safe rendering (see
+// metrics.TargetLabel). Empty stays empty, so an Observation with no final
+// URL still omits the field.
+func eventURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	return metrics.TargetLabel(raw)
+}
+
+// sanitizedCheck rewrites Observation.FinalURL with eventURL before the runner
+// encodes it: after a redirect, or with none, the final URL is the request URL
+// net/http followed, which still carries the target's userinfo (a relative
+// redirect keeps it) and the query. Name and the error pass through; Labels
+// are not touched (buildTargets already set the url label, and obs.Labels
+// aliases the target's map).
+type sanitizedCheck struct{ inner check.Check }
+
+func (c sanitizedCheck) Name() string { return c.inner.Name() }
+
+func (c sanitizedCheck) Run(ctx context.Context, t check.Target) (check.Observation, error) {
+	obs, err := c.inner.Run(ctx, t)
+	obs.FinalURL = eventURL(obs.FinalURL)
+	return obs, err
 }
