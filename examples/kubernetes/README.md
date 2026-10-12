@@ -93,10 +93,12 @@ pod and does three things:
   `app.kubernetes.io/name: prometheus`). The kubelet's probes come from the
   node, and most CNIs let node traffic through regardless of policy; check
   that yours does, or the pod goes unready once the policy is applied.
-- **Egress: TCP 80 and 443 outside the special-purpose ranges.** The private,
-  shared (`100.64.0.0/10`), loopback, link-local, reserved and other
-  special-purpose IPv4 ranges are excepted, and for IPv6 loopback, NAT64
-  (`64:ff9b::/96`), unique-local and link-local. This is defense in depth
+- **Egress: TCP 80 and 443 outside the special-purpose ranges.** Every range
+  descry's dial guard blocks is excepted: for IPv4 the private, shared
+  (`100.64.0.0/10`), loopback, link-local, documentation, multicast, reserved
+  and other special-purpose ranges, and for IPv6 unspecified, loopback,
+  unique-local, link-local and multicast. NAT64 (`64:ff9b::/96`) is excepted
+  as well, though the dial guard allows it. This is defense in depth
   beside descry's own dial guard, not a replacement for it. The lists do not
   know your cluster's own ranges: where the Service or pod CIDR is public
   (GKE's default Service range `34.118.224.0/20`, say), append both to the
