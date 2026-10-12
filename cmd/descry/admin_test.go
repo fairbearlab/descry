@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -445,8 +446,8 @@ func (l *failingListener) Close() error {
 }
 func (*failingListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9} }
 
-// Value: protects=an admin server failure is not silent: it cancels the run, prints the cause and exits 1, even though the cancellation itself would map to 0
-// Value: fails_when=serveAdmin drops the Serve error, does not cancel the run (run would never return here), or the code stays 0
+// Value: protects=an admin server failure is not silent: it cancels the run, prints the cause exactly once and exits 1, even though the cancellation itself would map to 0
+// Value: fails_when=serveAdmin drops the Serve error, does not cancel the run (run would never return here), the code stays 0, or the cause is printed both when it happens and again at exit
 // Value: why_new=--listen is new; seam=listen returns a listener whose Accept fails; the test never cancels the signal context
 func TestRun_AdminServeErrorExitsOne(t *testing.T) {
 	origListen := listen
@@ -457,14 +458,72 @@ func TestRun_AdminServeErrorExitsOne(t *testing.T) {
 	ar := startAdminRun(t, adminYAML)
 	ar.waitExit(t, 1)
 	out := ar.stderr.String()
-	if !strings.Contains(out, "error: admin server:") || !strings.Contains(out, "accept boom") {
-		t.Errorf("stderr does not report the server failure: %q", out)
+	if n := strings.Count(out, "error: admin server:"); n != 1 || !strings.Contains(out, "accept boom") {
+		t.Errorf("stderr reports the server failure %d times, want once with its cause: %q", n, out)
 	}
 	if strings.Contains(out, "context canceled") {
 		t.Errorf("the run's own cancellation was reported as an error: %q", out)
 	}
 	if !fl.closed.Load() {
 		t.Error("listener was never closed")
+	}
+}
+
+// gatedFailListener's Accept blocks until fail is closed and then fails with
+// a non-temporary error, so the test picks when Serve returns. Close unblocks
+// a pending Accept.
+type gatedFailListener struct {
+	fail      chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newGatedFailListener() *gatedFailListener {
+	return &gatedFailListener{fail: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (l *gatedFailListener) Accept() (net.Conn, error) {
+	select {
+	case <-l.fail:
+		return nil, errors.New("accept boom")
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *gatedFailListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+func (*gatedFailListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+}
+
+// Value: protects=an admin server failure is on stderr while the run is still shutting down, not only once it exits, so a second signal that kills a slow shutdown does not lose the cause
+// Value: fails_when=the cause is printed only after Run returns (as the exit-path summary), or is not printed until the drain finishes
+// Value: why_new=the early report is new; seam=listen returns a listener whose Accept fails when the test says, newFileSink returns a sink whose Publish blocks until released, so Run waits on its worker after the cancel
+func TestRun_AdminServeErrorPrintedBeforeExit(t *testing.T) {
+	origListen := listen
+	t.Cleanup(func() { listen = origListen })
+	gl := newGatedFailListener()
+	listen = func(string, string) (net.Listener, error) { return gl, nil }
+	bs := newBlockingSink()
+	swapFileSink(t, bs)
+
+	ar := startAdminRun(t, adminYAML, "--sink", "file", "--file", filepath.Join(t.TempDir(), "events.jsonl"))
+	t.Cleanup(bs.unblock) // runs before startAdminRun's cleanup waits for the run
+	select {
+	case <-bs.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no Publish within 10s")
+	}
+	// Run cannot return while the publish is held, so the line seen here was
+	// printed before the run finished.
+	close(gl.fail)
+	waitFor(t, func() bool { return strings.Contains(ar.stderr.String(), "error: admin server: accept boom") })
+	bs.unblock()
+	ar.waitExit(t, 1)
+	if n := strings.Count(ar.stderr.String(), "error: admin server:"); n != 1 {
+		t.Errorf("the server failure was printed %d times, want once: %q", n, ar.stderr.String())
 	}
 }
 
@@ -673,6 +732,65 @@ func TestDrainResults_ObservesSkipsBeforeRateLimit(t *testing.T) {
 	}
 }
 
+// stalledWriter is a ResponseWriter whose Write blocks until release is
+// closed, after signalling writing: a client that sent GET /metrics and then
+// stopped reading.
+type stalledWriter struct {
+	header  http.Header
+	writing chan struct{}
+	release chan struct{}
+}
+
+func (w *stalledWriter) Header() http.Header { return w.header }
+func (*stalledWriter) WriteHeader(int)       {}
+func (w *stalledWriter) Write(p []byte) (int, error) {
+	w.writing <- struct{}{}
+	<-w.release
+	return len(p), nil
+}
+
+// Value: protects=a /metrics response stuck in its write keeps its in-flight slot, so at most metricsMaxInFlight buffered bodies are held at once and a further scrape gets 503 even though every gather has finished
+// Value: fails_when=the outer limiter is dropped or moved inside promhttp's timeout handler (whose own in-flight slot is freed before the buffered body is written), or answers with something other than 503
+// Value: why_new=the outer limiter is new; seam=mux.ServeHTTP with a ResponseWriter whose Write blocks
+func TestAdminMux_MetricsSlotHeldThroughWrite(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGauge(prometheus.GaugeOpts{Name: "descry_test_gauge", Help: "x"}))
+	mux := newAdminMux(reg, &readyState{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	var wg sync.WaitGroup
+	// One cleanup so the release always runs before the wait (cleanups are
+	// LIFO); a failure with scrapes still stuck then fails instead of hanging.
+	t.Cleanup(func() { releaseAll(); wg.Wait() })
+	for i := range metricsMaxInFlight {
+		w := &stalledWriter{header: http.Header{}, writing: make(chan struct{}, 1), release: release}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		}()
+		select {
+		case <-w.writing: // gathered; the body write is stuck
+		case <-time.After(5 * time.Second):
+			t.Fatalf("scrape %d never reached its write", i+1)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("scrape while %d writes are stuck = %d, want 503", metricsMaxInFlight, rec.Code)
+	}
+	releaseAll()
+	wg.Wait()
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("scrape after the stuck writes finished = %d, want 200", rec.Code)
+	}
+}
+
 // Value: protects=a stuck admin request cannot hold shutdown past its timeout: the server is closed, the stuck client is cut off, and shutdown reports no error (the exit code is not changed by it)
 // Value: fails_when=the Close fallback is dropped (the stuck connection stays open after shutdown returns), or a Shutdown timeout is returned as a Serve error
 // Value: why_new=the admin server is new; seam=a handler that blocks until the test releases it
@@ -688,7 +806,7 @@ func TestAdminServer_ShutdownTimeoutForcesClose(t *testing.T) {
 	a := serveAdmin(ln, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		close(entered)
 		<-release
-	}), func() { cancelled.Store(true) })
+	}), func(error) { cancelled.Store(true) })
 
 	clientErr := make(chan error, 1)
 	go func() {
@@ -721,5 +839,325 @@ func TestAdminServer_ShutdownTimeoutForcesClose(t *testing.T) {
 	}
 	if cancelled.Load() {
 		t.Error("a clean shutdown cancelled the run")
+	}
+}
+
+// Value: protects=the admin server's documented hardening: header read 5s, whole-request read 10s, response write 30s (well above the 10s scrape timeout), idle backstop 60s, about 8 KiB of headers, and keep-alives off (every response closes its connection, so an idle client cannot hold a connection slot)
+// Value: fails_when=a timeout or the header cap is dropped or changed from the documented value, or keep-alives are left on
+// Value: why_new=no test asserted the server's limits; seam=none (the returned adminServer's srv fields, and one real request)
+func TestServeAdmin_ServerLimits(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := serveAdmin(ln, http.NotFoundHandler(), func(error) {})
+	t.Cleanup(func() { _ = a.shutdown(time.Second) })
+	for _, c := range []struct {
+		name      string
+		got, want time.Duration
+	}{
+		{"ReadHeaderTimeout", a.srv.ReadHeaderTimeout, 5 * time.Second},
+		{"ReadTimeout", a.srv.ReadTimeout, 10 * time.Second},
+		{"IdleTimeout", a.srv.IdleTimeout, 60 * time.Second},
+		{"WriteTimeout", a.srv.WriteTimeout, 30 * time.Second},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	if a.srv.MaxHeaderBytes != 8<<10 {
+		t.Errorf("MaxHeaderBytes = %d, want %d", a.srv.MaxHeaderBytes, 8<<10)
+	}
+
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://" + ln.Addr().String() + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if !resp.Close {
+		t.Error("the response kept the connection open; want Connection: close (keep-alives off)")
+	}
+}
+
+// acceptLoop accepts from l until it fails, sending each conn on the returned
+// channel.
+func acceptLoop(l net.Listener) <-chan net.Conn {
+	conns := make(chan net.Conn)
+	go func() {
+		defer close(conns)
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			conns <- c
+		}
+	}()
+	return conns
+}
+
+// countingListener counts calls to Accept, made or in progress.
+type countingListener struct {
+	net.Listener
+	calls atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	l.calls.Add(1)
+	return l.Listener.Accept()
+}
+
+// Value: protects=the admin connection cap: a connection over the limit is not accepted from the kernel (it waits in the backlog, holding no descriptor here) until an accepted one closes, and an Accept error gives its slot back
+// Value: fails_when=Accept takes no slot or takes it after the inner Accept returns (the inner Accept is then called while the only slot is taken), a closed conn does not give its slot back, or a failed Accept keeps its slot (the server would stall after a few transient errors)
+// Value: why_new=the cap is new; seam=newLimitListener with a cap of 1 (production uses adminMaxConns) over a listener that counts inner Accept calls; the not-yet-accepted check waits 200ms
+func TestLimitListener_CapsOpenConns(t *testing.T) {
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &countingListener{Listener: tcp}
+	l := newLimitListener(inner, 1)
+	t.Cleanup(func() { _ = l.Close() })
+	conns := acceptLoop(l)
+
+	dial := func() {
+		c, err := net.DialTimeout("tcp", inner.Addr().String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+	}
+	dial()
+	var first net.Conn
+	select {
+	case first = <-conns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first connection was not accepted")
+	}
+	dial() // completes the TCP handshake in the kernel backlog
+	select {
+	case c := <-conns:
+		_ = c.Close()
+		t.Fatal("a second connection was accepted while the only slot was taken")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// The accept loop is waiting for a slot; it must not have taken the
+	// pending connection from the kernel meanwhile.
+	if n := inner.calls.Load(); n != 1 {
+		t.Errorf("inner Accept calls while the only slot was taken = %d, want 1", n)
+	}
+	_ = first.Close()
+	select {
+	case c := <-conns:
+		_ = c.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second connection was not accepted after the first closed")
+	}
+
+	// A failed Accept gives its slot back: with a cap of 1, a second Accept
+	// would otherwise wait forever.
+	fl := newLimitListener(&failingListener{}, 1)
+	for i := range 2 {
+		errc := make(chan error, 1)
+		go func() {
+			_, err := fl.Accept()
+			errc <- err
+		}()
+		select {
+		case err := <-errc:
+			if err == nil {
+				t.Fatalf("Accept %d on a failing listener returned no error", i+1)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Accept %d blocked: an earlier failed Accept kept its slot", i+1)
+		}
+	}
+}
+
+// Value: protects=a connection gives its slot back once, however often it is closed (net/http may close a conn more than once)
+// Value: fails_when=Close releases on every call, so a double Close frees another live connection's slot and the cap is exceeded
+// Value: why_new=the cap is new; seam=newLimitListener with a cap of 2, reading the semaphore's fill
+func TestLimitListener_DoubleCloseReleasesOnce(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := newLimitListener(inner, 2)
+	t.Cleanup(func() { _ = l.Close() })
+	// Accepted one at a time here, with no Accept left waiting to take a
+	// freed slot.
+	var accepted []net.Conn
+	for range 2 {
+		c, err := net.DialTimeout("tcp", inner.Addr().String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		sc, err := l.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted = append(accepted, sc)
+	}
+	// Closed underneath its wrapper: if the double Close below freed this
+	// conn's slot too, a wrapper Close here would wait on an empty semaphore.
+	t.Cleanup(func() { _ = accepted[1].(*limitConn).Conn.Close() })
+	_ = accepted[0].Close()
+	_ = accepted[0].Close()
+	if n := len(l.sem); n != 1 {
+		t.Errorf("slots held after closing one of two conns twice = %d, want 1", n)
+	}
+}
+
+// Value: protects=Shutdown is not held up by a full server: closing the listener wakes an Accept waiting for a slot
+// Value: fails_when=Accept waits only on the semaphore, so with every slot taken Serve never returns and shutdown hangs
+// Value: why_new=the cap is new; seam=newLimitListener with a cap of 1 and its only slot held
+func TestLimitListener_CloseUnblocksAccept(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := newLimitListener(inner, 1)
+	c, err := net.DialTimeout("tcp", inner.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	held, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := l.Accept() // waits for the held slot
+		errc <- err
+	}()
+	_ = l.Close()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("Accept after Close = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not unblock an Accept waiting for a slot")
+	}
+}
+
+// Value: protects=the admin server serves at most adminMaxConns connections at once: one more is not served until a served one closes
+// Value: fails_when=serveAdmin stops wrapping ln in newLimitListener(ln, adminMaxConns), or wraps it with another cap
+// Value: why_new=the limit listener was only tested on its own; seam=none (the handler passed to serveAdmin holds each request until released); the not-yet-served check waits 200ms
+func TestServeAdmin_CapsOpenConns(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, adminMaxConns+1) // never blocks a handler
+	release := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-release
+		// Close after responding, so a released request frees its slot
+		// (keep-alives are off anyway; this keeps the test about the cap).
+		w.Header().Set("Connection", "close")
+	})
+	a := serveAdmin(ln, h, func(error) {})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseAll()
+		_ = a.shutdown(time.Second)
+	})
+
+	// Each connection holds one request in the handler, so its slot stays
+	// taken.
+	send := func() {
+		c, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: admin\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitEntered := func(what string) {
+		t.Helper()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s was not served within 5s", what)
+		}
+	}
+	for range adminMaxConns {
+		send()
+	}
+	for i := range adminMaxConns {
+		waitEntered(fmt.Sprintf("connection %d", i+1))
+	}
+
+	send() // one over the cap: waits in the kernel backlog
+	select {
+	case <-entered:
+		t.Fatalf("connection %d was served while %d were open", adminMaxConns+1, adminMaxConns)
+	case <-time.After(200 * time.Millisecond):
+	}
+	release <- struct{}{} // finishes one held request; its connection closes
+	waitEntered(fmt.Sprintf("connection %d, after one closed,", adminMaxConns+1))
+	releaseAll()
+}
+
+// noCloseWriteConn is a net.Conn with no CloseWrite method.
+type noCloseWriteConn struct{ net.Conn }
+
+// Value: protects=limitConn forwards net/http's TCP half-close, so a client sent an error response (an oversized header, say) reads it and a clean EOF rather than a reset, while the connection stays open for reading; over a conn with no half-close it returns without panicking
+// Value: fails_when=CloseWrite is dropped from limitConn (net/http's type check then misses it and skips the half-close) or stops forwarding, or it panics on a conn without CloseWrite
+// Value: why_new=CloseWrite on the wrapper is new; seam=a limitConn built over a real TCP conn and over one with the method hidden
+func TestLimitConn_CloseWriteForwardsHalfClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	client, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	var c net.Conn = &limitConn{Conn: server, release: func() {}}
+	cw, ok := c.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("limitConn has no CloseWrite method; net/http would skip the half-close")
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite = %v", err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := client.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Errorf("client read after CloseWrite = %d, %v; want 0, EOF", n, err)
+	}
+	// Only the write side is closed: the server still reads.
+	if _, err := client.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := c.Read(make([]byte, 1)); n != 1 || err != nil {
+		t.Errorf("server read after CloseWrite = %d, %v; want 1, nil", n, err)
+	}
+
+	// Over a conn without CloseWrite there is nothing to forward.
+	p1, p2 := net.Pipe()
+	t.Cleanup(func() { _ = p1.Close(); _ = p2.Close() })
+	nc := &limitConn{Conn: noCloseWriteConn{p1}, release: func() {}}
+	if err := nc.CloseWrite(); err != nil {
+		t.Errorf("CloseWrite over a conn without it = %v, want nil", err)
 	}
 }

@@ -66,20 +66,22 @@ func main() {
 //   - 0: -h, --version, a clean SIGINT/SIGTERM shutdown (with or without
 //     --listen), or Run returning nil.
 //   - 1: a runtime failure: --listen cannot bind (before the sink opens, so no
-//     events file is created), the admin server fails (the run is cancelled
-//     first), Run fails other than by cancellation, the file sink's Close
-//     fails on an otherwise clean exit, or the metrics collector cannot be
-//     built.
+//     events file is created), the admin server fails (the error is printed
+//     when it happens and the run is cancelled), Run fails other than by
+//     cancellation, the file sink's Close fails on an otherwise clean exit,
+//     or the metrics collector cannot be built (also before the sink opens).
 //   - 2: a usage or config error: a bad flag, no --config, a --listen that is
-//     not host:port, a config that does not load, two targets that share a
+//     not host:port or whose port is empty, not a number or out of range (0
+//     is allowed), a config that does not load, two targets that share a
 //     metrics label (only with --listen and per-target series), a bad sink
 //     setting or event source, or a file sink that cannot be opened.
 //
 // With --listen, shutdown runs in this order: /readyz turns 503 and the run
-// context is cancelled, Run returns, the results drain finishes (so a last
-// scrape still sees every counter), the admin server shuts down (5s for
-// in-flight requests, then closed, which is logged but does not change the
-// exit code), and the file sink closes last.
+// context is cancelled, Run returns, the results drain finishes (so a scrape
+// still in flight then sees every counter; there is no linger for a later
+// one), the admin server shuts down (5s for in-flight requests, then closed,
+// which is logged but does not change the exit code), and the file sink
+// closes last.
 func run(args []string, stdout, stderr io.Writer) (code int) {
 	fs := flag.NewFlagSet("descry", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -87,7 +89,7 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	sinkOverride := fs.String("sink", "", `override config sink ("stdout" | "file")`)
 	fileOverride := fs.String("file", "", "override config file_path (sink=file)")
 	showVersion := fs.Bool("version", false, "print version and exit")
-	listenAddr := fs.String("listen", "", "serve /metrics, /healthz and /readyz on this address (host:port, e.g. :9090); empty disables the server")
+	listenAddr := fs.String("listen", "", "serve /metrics, /healthz and /readyz on this address (host:port, e.g. 127.0.0.1:9090; unauthenticated, and :9090 binds every interface); empty disables the server")
 	perTarget := fs.Bool("metrics-per-target", true, "export per-target series labelled by the target URL (scheme, host and path); false keeps only fleet-wide series; only with --listen")
 	if err := fs.Parse(args); err != nil {
 		// -h/--help printed usage; exit 0 as flag.Parse's ExitOnError did.
@@ -102,16 +104,37 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 		return 0
 	}
 
+	// An explicit --metrics-per-target without --listen is likely a mistake
+	// (no collector is built), but harmless, so it is a warning.
+	if *listenAddr == "" {
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "metrics-per-target" {
+				slog.Default().Warn("--metrics-per-target has no effect without --listen")
+			}
+		})
+	}
+
 	if *cfgPath == "" {
 		_, _ = fmt.Fprintln(stderr, "error: --config is required")
 		return 2
 	}
 
 	// A malformed address is a usage error, caught before anything is loaded;
-	// whether it can be bound is only known later.
+	// whether it can be bound is only known later. An empty port ("127.0.0.1:")
+	// splits cleanly but would bind a random one, and a service name or an
+	// out-of-range number would only fail (or resolve) at bind time, so the
+	// port must be a number from 0 to 65535 (0 picks a free one).
 	listening := *listenAddr != ""
 	if listening {
-		if _, _, err := net.SplitHostPort(*listenAddr); err != nil {
+		_, port, err := net.SplitHostPort(*listenAddr)
+		if err == nil {
+			if port == "" {
+				err = errors.New("missing port")
+			} else if _, perr := strconv.ParseUint(port, 10, 16); perr != nil {
+				err = fmt.Errorf("port %q is not a number from 0 to 65535", port)
+			}
+		}
+		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "error: --listen %q: %v\n", *listenAddr, err)
 			return 2
 		}
@@ -166,6 +189,28 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 		defer func() { _ = ln.Close() }()
 	}
 
+	// failures is bumped by the drain as it goes, so it can be read while the
+	// drain is live (the metrics collector reads it at scrape time), not only
+	// after it returns.
+	var failures atomic.Int64
+
+	// The collector exists only with --listen: without it nobody can scrape,
+	// and the decorator's per-run bookkeeping would be waste. It is built
+	// before the sink opens, so a failure here leaves no events file behind.
+	var col *metrics.Collector
+	if listening {
+		col, err = metrics.New(metrics.Options{
+			Version:          version,
+			Commit:           commit,
+			DisablePerTarget: !*perTarget,
+			ResultErrors:     failures.Load,
+		})
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: metrics: %v\n", err)
+			return 1
+		}
+	}
+
 	// Build the event sink.
 	var s sink.EventSink = sink.NewStdoutSink(stdout)
 	if cfg.Sink == "file" {
@@ -185,10 +230,6 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 		s = fsink
 	}
 
-	// failures is bumped by the drain as it goes, so it can be read while the
-	// drain is live (the metrics collector reads it at scrape time), not only
-	// after it returns.
-	var failures atomic.Int64
 	targets := buildTargets(cfg, slog.Default())
 
 	sigCtx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -198,24 +239,11 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	defer cancel()
 
 	// The check is wrapped so a redirect's final URL reaches the event in the
-	// same clean form as the subject.
+	// same clean form as the subject. Order: the collector decorates the
+	// check, the runner takes the decorated check, then the collector is
+	// pointed at the runner.
 	chk := check.Check(sanitizedCheck{inner: httpcheck.New(cfg.Timeout)})
-	// The collector exists only with --listen: without it nobody can scrape,
-	// and the decorator's per-run bookkeeping would be waste. Order: the
-	// collector decorates the check, the runner takes the decorated check,
-	// then the collector is pointed at the runner.
-	var col *metrics.Collector
-	if listening {
-		col, err = metrics.New(metrics.Options{
-			Version:          version,
-			Commit:           commit,
-			DisablePerTarget: !*perTarget,
-			ResultErrors:     failures.Load,
-		})
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "error: metrics: %v\n", err)
-			return 1
-		}
+	if col != nil {
 		chk = col.Check(chk)
 	}
 
@@ -246,7 +274,12 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	ready := &readyState{}
 	var adm *adminServer
 	if listening {
-		adm = serveAdmin(ln, newAdminMux(col.Registry(), ready), cancel)
+		// The cause is printed before the run is cancelled, so it is on
+		// stderr even if a second signal kills the process during shutdown.
+		adm = serveAdmin(ln, newAdminMux(col.Registry(), ready), func(err error) {
+			_, _ = fmt.Fprintf(stderr, "error: admin server: %v\n", err)
+			cancel()
+		})
 	}
 
 	// Once the first signal (or an admin server failure) has cancelled ctx,
@@ -263,9 +296,9 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	// other error is. Without WithShutdownGrace (never set here: this wait
 	// relies on it) Run closes Results() before returning on every path; wait
 	// for the drain so the last buffered diagnostics reach stderr, and the
-	// last counts reach a scrape, before the process exits. The ctx re-check
-	// after set(true) closes the race with the goroutine above clearing the
-	// flag first.
+	// last counts reach a scrape still in flight, before the process exits.
+	// The ctx re-check after set(true) closes the race with the goroutine
+	// above clearing the flag first.
 	ready.set(true)
 	if ctx.Err() != nil {
 		ready.set(false)
@@ -274,8 +307,8 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	ready.set(false) // Run can also return on a non-cancel error
 	<-drained
 	// Shut the admin server down here, not in a defer: its error feeds the
-	// exit code, and the server must stop before the file sink's deferred
-	// Close.
+	// exit code (it was printed when it happened), and the server must stop
+	// before the file sink's deferred Close.
 	var serveErr error
 	if adm != nil {
 		serveErr = adm.shutdown(adminShutdownTimeout)
@@ -285,7 +318,6 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", runErr)
 	}
 	if serveErr != nil {
-		_, _ = fmt.Fprintf(stderr, "error: admin server: %v\n", serveErr)
 		code = 1
 	}
 	return code
@@ -404,6 +436,12 @@ func buildTargets(cfg config.Config, log *slog.Logger) []check.Target {
 		// subject). An operator-set label is published verbatim.
 		if _, ok := lbl["url"]; !ok {
 			lbl["url"] = eventURL(t.URL)
+			// Name the target by its config position: a URL with no safe
+			// rendering may carry a secret, so this warning does not log it.
+			if lbl["url"] == unparseableLabel {
+				log.Warn("target URL cannot be shown safely; its event subject is "+unparseableLabel,
+					"target", i+1)
+			}
 		}
 		subject := lbl["url"]
 		if first, ok := subjects[subject]; !ok {

@@ -376,6 +376,42 @@ func TestBuildTargets_SanitizesURLLabelAndWarnsOnSharedSubject(t *testing.T) {
 	}
 }
 
+// Value: protects=a target whose URL has no safe rendering is pointed out at startup by its config position, since its events all carry the <unparseable> subject, without the URL (which may carry a secret) reaching the log
+// Value: fails_when=the warning is missing, names the URL instead of the position, fires for an operator-set url label or for a URL that renders, or fires more than once per target
+// Value: why_new=the warning is new; seam=buildTargets' logger
+func TestBuildTargets_WarnsOnUnparseableSubject(t *testing.T) {
+	// A literal "/" in the password makes the stray "@" land in the path,
+	// which TargetLabel refuses to render.
+	bad := "https://us" + "er:" + secretPW + "/x@h/"
+	if got := eventURL(bad); got != unparseableLabel {
+		t.Fatalf("precondition: eventURL(bad) = %q, want %q", got, unparseableLabel)
+	}
+	cfg := config.Config{
+		Interval: 30 * time.Second,
+		Timeout:  10 * time.Second,
+		Targets: []config.Target{
+			{URL: "https://fine.example/"},
+			{URL: bad},
+			{URL: bad + "y", Labels: map[string]string{"url": "billing-api"}}, // labelled: the subject is the label
+		},
+	}
+	var buf bytes.Buffer
+	targets := buildTargets(cfg, slog.New(slog.NewTextHandler(&buf, nil)))
+	if got := targets[1].Labels["url"]; got != unparseableLabel {
+		t.Errorf("target 2 url label = %q, want %q", got, unparseableLabel)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "cannot be shown safely"); n != 1 {
+		t.Fatalf("want exactly 1 unparseable-subject warning, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "target=2") {
+		t.Errorf("warning does not name the target's config position:\n%s", out)
+	}
+	if strings.Contains(out, secretPW) {
+		t.Errorf("log leaks the target URL's password:\n%s", out)
+	}
+}
+
 // waitFor polls cond every 20ms until it holds, failing the test after 10s.
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
