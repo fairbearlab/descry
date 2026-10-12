@@ -16,18 +16,32 @@ jobs:
       - run: go vet ./...
       - run: go mod tidy -diff
       # The engine packages stay dependency-light for embedders: prometheus may
-      # appear only in metrics/ (and cmd/, once the CLI serves metrics), never in
-      # anything the engine imports. A new engine package must be added to the
-      # list below.
+      # appear only in metrics/ and cmd/. Every other package in the module is
+      # engine, so a new package is checked without editing this step, and the
+      # step fails closed: a go list error or an empty engine set turns it red.
+      # The set is listed per GOOS: go list ./... leaves out a package whose
+      # files are all for another platform, and go list -deps fails on one.
+      # Test-only imports are not checked (they never reach embedders).
       - name: engine packages do not depend on prometheus
         run: |
           set -euo pipefail
-          deps="$(go list -deps ./check ./checks/http ./event ./runner ./sink ./config)"
-          if bad="$(printf '%s\n' "$deps" | grep '^github.com/prometheus/')"; then
-            echo "::error::engine packages must not import prometheus:"
-            printf '%s\n' "$bad"
-            exit 1
-          fi
+          mod="$(go list -m)" || exit 1
+          for goos in linux darwin windows; do
+            pkgs="$(GOOS="$goos" go list ./...)" || exit 1
+            list="$(printf '%s\n' "$pkgs" | grep -Ev "^${mod}/(metrics|cmd)(/|\$)")" || {
+              echo "::error::no engine packages found (GOOS=$goos)"
+              exit 1
+            }
+            mapfile -t engine <<<"$list"
+            echo "engine packages (GOOS=$goos):"
+            printf '  %s\n' "${engine[@]}"
+            deps="$(GOOS="$goos" go list -deps "${engine[@]}")" || exit 1
+            if bad="$(printf '%s\n' "$deps" | grep '^github.com/prometheus/')"; then
+              echo "::error::engine packages must not import prometheus (GOOS=$goos):"
+              printf '%s\n' "$bad"
+              exit 1
+            fi
+          done
       - run: go test -race -coverprofile=coverage.out ./...
       # Coverage floor. Measured 85.7% of statements on main when last raised
       # (2026-10-05; identical across five -race runs and in CI). It was added at

@@ -1,5 +1,5 @@
 // Package metrics is a Prometheus collector for programs that embed the
-// descry engine (and for the descry CLI, once it is wired in). It instruments
+// descry engine; the descry CLI serves it with --listen. It instruments
 // a check.Check with a decorator (Collector.Check), reads the runner's exact
 // skip and drop counters through the small RunnerStats interface (attached
 // with Collector.SetRunner once the runner exists), and serves everything
@@ -11,7 +11,8 @@
 // # Series
 //
 // Per-target family (label url = TargetLabel(target.URL); dropped entirely
-// with Options.DisablePerTarget):
+// with Options.DisablePerTarget, which the CLI's --metrics-per-target=false
+// sets):
 //
 //	descry_check_up                           gauge    {url}         1 when the last run was check.StatusUp, else 0
 //	descry_check_status_code                  gauge    {url}         last HTTP status code; 0 with no response or a Run error
@@ -49,6 +50,8 @@
 // how a password with an unescaped "/", "?" or "#" shows up once url.Parse has
 // misread it; a literal "@" in a legitimate path, query or fragment (an email
 // in a query parameter, say) gets the placeholder too unless written as "%40".
+// The CLI refuses to start (exit 2) when two targets share a label and
+// per-target series are served; the library itself does not check.
 //
 // # Skips
 //
@@ -63,6 +66,17 @@
 // Results the drain receives.
 //
 // # Wiring
+//
+// The order is fixed by runner.New taking the decorated check:
+//
+//	c, err := metrics.New(metrics.Options{ResultErrors: failures.Load})
+//	r := runner.New(c.Check(inner), sink, evCfg, targets, interval, concurrency)
+//	c.SetRunner(r)
+//	c.SetTargetCount(len(targets))
+//
+// and the single Results() drain reports skips with ObserveSkip, testing
+// runner.ErrSkippedQueued before runner.ErrSkipped, and counts the other
+// error Results in whatever Options.ResultErrors reads.
 //
 // The runner series read 0 until they are wired: skipped_slots_total and
 // dropped_results_total until SetRunner, result_errors_total without

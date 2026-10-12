@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -159,7 +160,7 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 
 	var out bytes.Buffer
 	var failures atomic.Int64
-	drainResults(ch, &out, 30*time.Second, now, &failures)
+	drainResults(ch, &out, 30*time.Second, now, &failures, nil)
 	if got := failures.Load(); got != 1 {
 		t.Fatalf("failures = %d, want 1", got)
 	}
@@ -190,7 +191,7 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 		}
 		return clock
 	}
-	drainResults(ch2, &out, 30*time.Second, tick, new(atomic.Int64))
+	drainResults(ch2, &out, 30*time.Second, tick, new(atomic.Int64), nil)
 	s = out.String()
 	if n := strings.Count(s, "check skipped:"); n != 2 {
 		t.Fatalf("skip lines across an interval boundary = %d, want 2:\n%s", n, s)
@@ -210,7 +211,7 @@ func TestDrainResults_FailureCountVisibleLive(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		drainResults(ch, io.Discard, 30*time.Second, time.Now, &failures)
+		drainResults(ch, io.Discard, 30*time.Second, time.Now, &failures, nil)
 	}()
 
 	tgt := check.Target{URL: "https://a.example/"}
@@ -262,7 +263,7 @@ func TestDrainResults_SkipWindowUsesTargetInterval(t *testing.T) {
 	ch <- runner.Result{Target: dflt, Err: runner.ErrSkipped} // t=6s: suppressed (30s window)
 	close(ch)
 	var out bytes.Buffer
-	drainResults(ch, &out, 30*time.Second, now, new(atomic.Int64))
+	drainResults(ch, &out, 30*time.Second, now, new(atomic.Int64), nil)
 
 	s := out.String()
 	if n := strings.Count(s, "check skipped: https://fast.example/"); n != 2 {
@@ -409,10 +410,20 @@ func TestRun_FlagParseExitCodes(t *testing.T) {
 	}
 }
 
-// Value: protects=run's exit-code contract: -version 0 and prints; missing/unreadable config, bad sink override, unopenable file sink exit 2
+// Value: protects=run's exit-code contract: -version 0 and prints; missing/unreadable config, bad sink override, unopenable file sink, malformed --listen or one whose port is empty, not a number or out of range (before the sink opens), shared metrics label exit 2
 // Value: fails_when=a refactor returns the wrong code, drops a message, or -version stops printing the build info line
-// Value: why_new=existing run tests cover only -h, unknown flag and an invalid source; these pre-run branches were untested; seam=none
+// Value: why_new=existing run tests cover only -h, unknown flag and an invalid source; these pre-run branches were untested; seam=none (notifyContext, an existing hook, returns an already-cancelled context so a regressed check exits fast)
 func TestRun_UsageAndConfigErrors(t *testing.T) {
+	// Already "signalled": no row reaches notifyContext, so a check that
+	// regresses and lets run start exits 0 at once (a wrong code) instead of
+	// probing until the test times out.
+	origNotify := notifyContext
+	t.Cleanup(func() { notifyContext = origNotify })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	}
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "descry.yaml")
 	yaml := "source: https://example.com/descry\ninterval: 30s\ntimeout: 5s\ntargets:\n  - url: https://example.com/\n"
@@ -420,6 +431,11 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	unopenable := filepath.Join(dir, "no-such-dir", "events.jsonl")
+	listenBad := filepath.Join(dir, "listen-bad.jsonl") // a bad --listen must fail before the sink opens
+	collidePath := filepath.Join(dir, "collide.yaml")   // two targets on one metrics label
+	if err := os.WriteFile(collidePath, []byte(targetsYAML("https://h/p?a=1", "https://h/p?b=2")), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, tc := range []struct {
 		name       string
@@ -434,6 +450,13 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 		{"sink override invalid", []string{"--config", cfgPath, "--sink", "bogus"}, 2, "", "must be"},
 		{"file override without path", []string{"--config", cfgPath, "--sink", "file"}, 2, "", "file_path is required"},
 		{"file sink unopenable", []string{"--config", cfgPath, "--sink", "file", "--file", unopenable}, 2, "", "error:"},
+		{"listen not host:port", []string{"--config", cfgPath, "--listen", "not-an-addr", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"listen port only", []string{"--config", cfgPath, "--listen", "9090", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"listen empty port", []string{"--config", cfgPath, "--listen", "127.0.0.1:", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"listen colon only", []string{"--config", cfgPath, "--listen", ":", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"listen port out of range", []string{"--config", cfgPath, "--listen", "127.0.0.1:99999", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"listen port not a number", []string{"--config", cfgPath, "--listen", "127.0.0.1:metricz", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"shared metrics label", []string{"--config", collidePath, "--listen", "127.0.0.1:0", "--sink", "file", "--file", listenBad}, 2, "", "share the metrics label"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -450,6 +473,9 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 				t.Errorf("stderr = %q, want substring %q", stderr.String(), tc.wantStderr)
 			}
 		})
+	}
+	if _, err := os.Stat(listenBad); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a malformed --listen opened the file sink (stat err = %v)", err)
 	}
 }
 
@@ -564,5 +590,62 @@ func TestRun_EmitsEventsAndExitsZeroOnSignal(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "error:") {
 		t.Errorf("clean shutdown printed an error: %q", stderr.String())
+	}
+}
+
+// captureDefaultLog points slog.Default at a buffer for the rest of the test.
+// Cleanup restores the logger and the log package's output and flags, which
+// slog.SetDefault redirects.
+func captureDefaultLog(t *testing.T) *lockedBuffer {
+	t.Helper()
+	buf := &lockedBuffer{}
+	origLogger, origOut, origFlags := slog.Default(), stdlog.Writer(), stdlog.Flags()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(origLogger)
+		stdlog.SetOutput(origOut)
+		stdlog.SetFlags(origFlags)
+	})
+	return buf
+}
+
+// Value: protects=an explicit --metrics-per-target without --listen is called out once, since it has no effect there, and nothing is said when the flag is left alone or --listen is set
+// Value: fails_when=the warning is missing, fires on the flag's default, fires alongside --listen, or fires more than once
+// Value: why_new=the warning is new; seam=slog.Default is swapped for a buffer, notifyContext is already cancelled so each run exits at once
+func TestRun_WarnsMetricsPerTargetWithoutListen(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "descry.yaml")
+	if err := os.WriteFile(cfgPath, []byte(adminYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origNotify := notifyContext
+	t.Cleanup(func() { notifyContext = origNotify })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	}
+
+	const msg = "--metrics-per-target has no effect without --listen"
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  int
+	}{
+		{"explicit false", []string{"--metrics-per-target=false"}, 1},
+		{"explicit true", []string{"--metrics-per-target"}, 1},
+		{"not set", nil, 0},
+		{"with listen", []string{"--metrics-per-target=false", "--listen", "127.0.0.1:0"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureDefaultLog(t)
+			var stderr lockedBuffer
+			args := append([]string{"--config", cfgPath}, tc.extra...)
+			if code := run(args, io.Discard, &stderr); code != 0 {
+				t.Fatalf("exit code = %d, want 0; stderr:\n%s", code, stderr.String())
+			}
+			if n := strings.Count(logs.String(), msg); n != tc.want {
+				t.Errorf("warnings = %d, want %d:\n%s", n, tc.want, logs.String())
+			}
+		})
 	}
 }

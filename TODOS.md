@@ -53,6 +53,32 @@ it is written.
 
 **Effort:** M · **Priority:** P3 · **Depends on:** `Runner.SetTargets`; `metrics/` (landed)
 
+### `TestScale_Saturated` flakes under parallel package load
+
+**What:** Make the accounting-identity assert in `TestScale_Saturated`
+(`runner/scale_test.go`) robust when the machine is busy, or keep the test out
+of the plain `go test ./...` run.
+
+**Why:** The harness runs on a real clock and allows each target to differ by
+one slot from the wall-clock expectation (the boundary slot at each end). On a
+loaded machine it has failed with a worst difference of 2 ("|results −
+expected slots| = 2, want ≤ 1") while the runner code was untouched, and a
+retry passed. CI's test job uses `-race`, which skips the harness, but a local
+`go test ./...` without `-race` or `-short` runs it and can then fail for
+reasons unrelated to the change under test.
+
+**Context:** 2026-10-12 — seen during a local pre-push run with other test
+processes loading the machine; `go test ./...` runs packages in parallel, so
+the 2s saturated regime competes for CPU with the other packages. Options:
+derive the expected slot window from the run's actual start and cancel
+timestamps rather than `t0` and `tEnd`, widen the tolerance only for slots
+whose boundary fell inside the measured scheduling delay, or gate the scale
+tests behind an explicit opt-in (env var or build tag) so they run only in the
+perf workflow's `scale` job and through the `-run 'TestScale'` command in
+CONTRIBUTING.md.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 
 ## Event
 
@@ -137,7 +163,10 @@ weak secret can be brute-forced offline. If the key has to be derived, use a key
 with a per-process secret.
 
 **Context:** 2026-10-11 — documented in `metrics.TargetLabel`; deferred because the
-identity key does not exist until the dynamic target set is designed.
+identity key does not exist until the dynamic target set is designed. The CLI now
+refuses to start (exit 2) when two targets share a label while it serves per-target
+series, so the collision only remains for programs that embed `metrics/`; the entry
+stays for them.
 
 **Effort:** M · **Priority:** P3 · **Depends on:** a target identity key (with `Runner.SetTargets`); `metrics/` (landed)
 
@@ -159,7 +188,8 @@ day of work. Writing the trigger down avoids re-deriving it in a repin PR.
 **Context:** 2026-10-11 — trigger = the consumer's repin PR shows a go.mod/go.sum diff
 that raises a shared dependency (for example golang.org/x/sys or protobuf) because of a
 require such as prometheus/client_golang (which now arrives via the root `metrics/`
-package) or a future CLI-only OTel/grpc. Precedent: the root go.mod already carries
+package, and which `cmd/descry` also imports directly to serve `--listen`) or a future
+CLI-only OTel/grpc. Precedent: the root go.mod already carries
 `tool golang.org/x/vuln/cmd/govulncheck`. The move: `cmd/descry/go.mod` requiring the
 root at a tagged version, `cmd/descry/vX.Y.Z` tags, and a ci.yml step (or job) that
 builds and tests the nested module; no lockstep or go.sum precompute is needed because the CLI pins a published
@@ -167,7 +197,182 @@ root tag.
 
 **Effort:** M · **Priority:** P4 · **Depends on:** a repin PR that exhibits the trigger
 
+### No test proves `run()` wraps the production check in `sanitizedCheck`
+
+**What:** Add a run-level test that fails if `run()` stops wrapping `httpcheck.New`
+in `sanitizedCheck`, on both the plain and the `--listen` path (where the
+collector decorates the wrapped check).
+
+**Why:** The wrapper is what keeps userinfo and the query out of `data.final_url`.
+Its tests build the wrapper (and, for the redirect case, the runner) themselves,
+and the run-level tests only use loopback targets, which the SSRF guard refuses
+before any response, so `FinalURL` is never set. Dropping the wrapper in `run()`
+leaves the suite green and reopens the leak.
+
+**Context:** 2026-10-11 — proving it needs a way to get a real `FinalURL` through
+`run()`: a seam for the inner check (deliberately not added with `--listen`, to
+keep `run()` free of a check seam) or a probe the guard lets through.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
+## Check
+
+### `check.RedactURL` leaves passwords in misparsed URLs
+
+**What:** Make `check.RedactURL` mask credentials in URLs that `url.Parse`
+misreads: an opaque URL such as `https:user:pass@host` (no `//` after the
+scheme), and a password with a literal `/`, `?` or `#` that moves the `@` out of
+the authority (`https://user:12/34@host/p` parses as host `user:12`, path
+`/34@host/p`). Then have the CLI rely on it.
+
+**Why:** `url.Parse` accepts both without error and finds no `User`, so
+`RedactURL` returns them unchanged and the password is printed. The CLI passes
+target URLs through `RedactURL` in its startup warnings (duplicate URL, interval
+shorter than timeout, and the shared-subject warning, but only for an
+operator-set `url` label of that shape; a derived subject is already safe) and
+in the per-run `check failed` / `check skipped` lines on stderr, so a config
+typo of either shape puts the password in the logs. The metrics label and the
+derived event subject are not affected: `metrics.TargetLabel` renders both
+shapes as `<unparseable>`.
+
+**Context:** 2026-10-12 — found while reviewing the `--listen` work; the
+unparseable-subject warning already names the target by config position only,
+but the older lines still print the URL. Fix it in the engine (`check/check.go`)
+by adopting `metrics.TargetLabel`'s rule: an opaque URL, or any literal `@`
+beyond the single userinfo delimiter `url.Parse` consumed, yields the
+`<unparseable>` placeholder. Keep the function idempotent and add table rows to
+its tests. OPERATIONS.md ("Log lines and their levels") documents the gap until
+then; drop that caveat with the fix.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+## Admin server
+
+### Reserved capacity for health probes
+
+**What:** Keep `/healthz` and `/readyz` answerable while the 64 admin
+connection slots are taken: a separate probe listener, or a few slots reserved
+for the probe paths.
+
+**Why:** A connection holds a slot from accept until it closes, and one that
+never sends its headers holds it for up to the 5s header timeout. 64 such
+sockets from any peer that can reach the port make HTTP liveness probes time
+out, and an orchestrator may then restart a healthy process. OPERATIONS.md
+advises loopback binding, a firewall, and exec or TCP probes meanwhile.
+
+**Context:** 2026-10-12 — the cap is enforced by the listener before any
+request is read, so reserving slots by path needs a second listener (simplest:
+a `--probe-listen` address) or a post-accept handoff. Start at
+`cmd/descry/admin.go`.
+
+**Effort:** M · **Priority:** P3 · **Depends on:** nothing
+
+### Admin shutdown waits out its timeout for idle never-requested connections
+
+**What:** At shutdown, close admin connections that are open but have not sent
+a request, instead of waiting the full 5s for them and then logging the
+`admin server shutdown` WARN.
+
+**Why:** `http.Server.Shutdown` closes only idle connections; a connection
+that is accepted but has not sent its headers counts as active for its first
+5s, so a single half-open client (or a probe that connects and waits) delays
+every shutdown by the full grace and turns a clean stop into a WARN.
+
+**Context:** 2026-10-12 — the server has keep-alives off, so no connection is
+legitimately idle after a response. Options: track accepted connections in the
+limit listener and close those still in `http.StateNew` when shutdown starts,
+or use `ConnState` to do the same. Start at `cmd/descry/admin.go`
+(`adminServer.shutdown`).
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
+### No warning when `--listen` binds a wildcard or non-loopback address
+
+**What:** Log a WARN at startup when `--listen` resolves to a wildcard (`:9090`,
+`0.0.0.0`, `[::]`) or other non-loopback address, naming the bound address.
+
+**Why:** The endpoints are unauthenticated and the docs say to bind loopback or
+a private interface, but `:9090` (the shortest form) binds every interface
+silently.
+
+**Context:** 2026-10-12 — the bound address is known after `bindAdmin`; check
+it with `net.IP.IsLoopback` and `IsUnspecified`. Keep it a warning, not an
+error: a private interface or a container network is a legitimate target.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
+### `/healthz` does not reflect scheduler progress
+
+**What:** Let `/healthz` (or a new probe) fail when the scheduler has stopped
+making progress, not only when the server stops answering.
+
+**Why:** `/healthz` is 200 whenever the HTTP server answers, so a wedged
+scheduler or a run stuck on a sink that ignores its context still looks alive
+to an orchestrator.
+
+**Context:** 2026-10-12 — a progress signal needs a heartbeat the runner exposes
+(for example the last dispatch time) without coupling the engine to the CLI;
+the threshold must allow for long intervals and the first fire, which is up to
+one interval after start. Start at `cmd/descry/admin.go` and the runner's
+public surface.
+
+**Effort:** M · **Priority:** P3 · **Depends on:** nothing
+
+### Admin slot-release paths that no test pins
+
+**What:** Add tests for two slot-release rules in `cmd/descry/admin.go`:
+`limitConn.CloseWrite` must not give back the listener slot (only the first
+`Close` does), and `limitInFlight` must free its `/metrics` slot when the
+handler panics or the client disconnects mid-response.
+
+**Why:** Both behave correctly today (checked by probe during review), but
+nothing fails if they regress. A `CloseWrite` that also released the slot would
+let a half-closed connection free its slot early and push the open-connection
+count past the cap; a `limitInFlight` that leaked its slot on a panic or a
+dropped client would leave `/metrics` answering 503 after two such scrapes.
+
+**Context:** 2026-10-12 — for `CloseWrite`, build a `limitConn` over a real
+TCP conn with a counting `release` and assert 0 releases after `CloseWrite`
+and 1 after a double `Close`. For `limitInFlight`, wrap a handler that panics
+(recovered by the test or by net/http) and one whose client goes away during
+the write, then assert a third request still gets 200, not 503.
+`TestLimitConn_CloseWriteForwardsHalfClose` and
+`TestAdminMux_MetricsSlotHeldThroughWrite` are the nearest existing tests.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 ## Completed
+
+### Prometheus deny-list fails open on new packages
+
+**What:** The CI step that keeps prometheus out of the engine listed the engine
+packages by hand, so a new package was unchecked until someone added it, and a
+`go list` failure or an empty list could pass silently.
+
+**Why:** The whole point of the step is that embedders who do not import `metrics/`
+never link prometheus; a hand-kept list decays.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** `metrics/` (landed)
+
+**Completed:** 2026-10-11 — the engine set is now `go list ./...` minus `metrics/`
+and `cmd/`, listed and checked separately for GOOS linux, darwin and windows (so a
+package that builds on one platform only is checked there); the step fails on a
+`go list` error or an empty set.
+
+### `SetRunner` typed-nil doc was wrong
+
+**What:** `metrics.Collector.SetRunner` said a typed nil "panics at scrape time",
+which read as a process crash.
+
+**Why:** Verified on client_golang v1.25.0: the counter funcs run on the Gather
+caller's goroutine, outside the registry's recover. Served through net/http each
+scrape's panic is recovered per request and the client sees a dropped connection;
+only a direct `Gather` call panics the caller.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** none
+
+**Completed:** 2026-10-11 — the doc now describes that behaviour and says to pass
+the value `runner.New` returned; the CLI does exactly that.
 
 ### Fuzz shadow model does not mirror the overflow self-heal
 

@@ -26,8 +26,15 @@ only while it is not already in flight. A target is never run concurrently with
 itself: if it comes due while its previous run is still in flight, that slot is
 **skipped** and reported. "Itself" means the configured entry: the same URL
 listed twice is two independent targets, probed and reported separately (with
-equal intervals they share a slot); `descry` warns once per duplicated URL at
-startup.
+equal intervals they share a slot). When `descry` is not serving per-target
+metrics it warns once per duplicated URL at startup; with `--listen` and
+`--metrics-per-target` on, two targets that share a metrics label (exact
+duplicates, URLs that differ only in userinfo or query, or more than one URL
+that renders as `<unparseable>`) are refused with exit 2 instead (see
+[Metrics and health endpoints](#metrics-and-health-endpoints)). Targets that
+differ only in query or userinfo also share an event subject; where they are
+not refused, `descry` warns once per shared subject, and a `url` label on each
+target (`targets[].labels.url`) tells their events apart.
 
 ### First fire is up to one interval after start
 
@@ -85,8 +92,8 @@ channel and two counters. Nothing is silent.
 | `Run` returns `runner: event config: ...` | error | The event config (`Source`, `Type`) is invalid. The runner validates it once in `New` and `Run` refuses to start: `Results()` is closed with no `Result` and no check runs. The `descry` CLI checks the same config before opening the sink and exits 2 (config error) with `error: invalid event config`; the `source` in that message is printed through `check.RedactURL`, so one that does not parse shows as `<unparseable>` | fix `source` / the event config; this is a startup error, never a per-event one |
 | `Result{Err: runner.ErrSkipped}` | channel | Slot skipped: the prior run **had started** and was still running. The check is slower than the target's interval | lengthen that target's interval, or shorten `timeout` |
 | `Result{Err: runner.ErrSkippedQueued}` | channel | Slot skipped: the prior run was still **queued** behind a saturated worker pool and had not started. The pool is too small | raise `concurrency` (see sizing below) |
-| `Runner.Skipped() int64` | counter | Total skipped slots, both kinds | trend it; a nonzero rate in steady state means undersized |
-| `Runner.Dropped() int64` | counter | Results discarded because `Results()` was full — i.e. the consumer stopped draining | fix the consumer; you are losing observations |
+| `Runner.Skipped() int64` | counter | Total skipped slots, both kinds. Exported as `descry_runner_skipped_slots_total` | trend it; a nonzero rate in steady state means undersized |
+| `Runner.Dropped() int64` | counter | Results discarded because `Results()` was full — i.e. the consumer stopped draining. Exported as `descry_runner_dropped_results_total` | fix the consumer; you are losing observations |
 
 ### "Down" is not an error
 
@@ -146,6 +153,119 @@ is counted — so `completed + ErrSkipped + ErrSkippedQueued` equals the slots t
 scheduler processed, per target, while `Dropped() == 0`; a dropped `Result` takes
 its target with it, so with drops only the fleet-wide sum `+ dropped` is
 checkable. If you are exporting one number, make it that identity.
+
+## Metrics and health endpoints
+
+`descry --listen host:port` serves `/metrics`, `/healthz` and `/readyz` on one
+address. Without `--listen` no port is opened and no collector is built.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--listen host:port` | empty (off) | serve the endpoints there (`:9090` binds every interface). Checked with `net.SplitHostPort` before the config is loaded: anything that is not `host:port` (`9090`, say), or whose port is empty (`127.0.0.1:`, `:`), not a number (`:metricz`) or above 65535, exits 2 (`:0` picks a free port). A bind failure (port in use, permission) exits 1, before the sink is opened, so no events file is created |
+| `--metrics-per-target` | `true` | export the per-target series below. `false` keeps only the fleet-wide series. Only has an effect with `--listen`; set without it, descry logs a WARN |
+
+The endpoints are unauthenticated: bind them to loopback or a private interface.
+
+| Endpoint | Status | Notes |
+|---|---|---|
+| `GET /metrics` | 200 | Prometheus text format, `descry_*` series only (no Go or process collectors). At most 2 scrapes in flight; a further scrape gets 503, sometimes with fewer than 2 visibly in flight (see below). A scrape that takes longer than 10s gets 503 |
+| `GET /healthz` | 200 `ok` | whenever the server is serving. It says the process is up, nothing about targets |
+| `GET /readyz` | 503 `not ready` / 200 `ok` | 503 until the runner starts, 200 while it runs, 503 from the first shutdown signal on (and if `Run` returns for any other reason). It does **not** wait for a first observation: a target's first check is up to one interval after start (see [First fire](#first-fire-is-up-to-one-interval-after-start)) |
+
+`HEAD` is answered wherever `GET` is; any other method gets 405 and any other
+path 404. The server reads request headers for at most 5s and accepts at most
+about 8 KiB of them, and reads a whole request for at most 10s. Keep-alives
+are off: the server closes every connection after one response (an HTTP/1.1
+response says so with `Connection: close`; an HTTP/1.0 one carries no
+`Connection` header), so an idle connection cannot hold one of the connection
+slots below. A response must be written within 30s, well above the 10s scrape
+timeout, so a client that requests `/metrics` and then stops reading cannot
+hold its connection open; it does hold one of the 2 `/metrics` slots until
+then, so two such clients make every other scrape get 503 for up to 30s. At
+most 64 connections are open at once; a further one waits in the kernel's
+accept backlog, unanswered, until one closes.
+
+The 2-scrape limit applies twice: to the whole request, and inside the
+Prometheus handler to the gather. A scrape that times out, or whose client
+disconnects, gets its request slot back at once, but its gather keeps running
+and keeps a gather slot until it finishes. Until then, a new scrape can get
+503 with fewer than 2 scrapes visibly in flight.
+
+A connection holds its slot from accept until it closes. A socket that never
+sends its headers holds one for up to the 5s header timeout, so 64 such
+sockets can make `/healthz` and `/readyz` probes time out. Bind `--listen` to
+loopback; where the port is reachable from untrusted peers, firewall it, and
+prefer exec or TCP probes over HTTP liveness probes.
+
+### Series
+
+Per-target (labelled `url`; about seven series per target; dropped with
+`--metrics-per-target=false`):
+
+| Series | Type | Meaning |
+|---|---|---|
+| `descry_check_up{url}` | gauge | 1 when the last run was up, else 0 |
+| `descry_check_status_code{url}` | gauge | last HTTP status code; 0 with no response |
+| `descry_check_latency_seconds{url}` | gauge | last run's latency |
+| `descry_check_last_run_timestamp_seconds{url}` | gauge | when the last run was observed, unix seconds |
+| `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the final response's certificate, unix seconds; only for targets that report one (https) |
+| `descry_check_runs_total{url,status}` | counter | runs, `status` `up` or `down` |
+
+Fleet-wide (always served):
+
+| Series | Type | Meaning |
+|---|---|---|
+| `descry_check_duration_seconds` | histogram | latency of every completed check |
+| `descry_check_errors_total{class}` | counter | failed checks by error class (`timeout`, `ssrf_blocked`, …) |
+| `descry_runner_skipped_slots_total` | counter | `Runner.Skipped()`, both skip kinds, exact. Alert on this one |
+| `descry_runner_dropped_results_total` | counter | `Runner.Dropped()`, exact |
+| `descry_runner_result_errors_total` | counter | non-skip error `Result`s seen by the drain (publish and mapping failures); best-effort |
+| `descry_runner_skips_observed_total{kind}` | counter | skips seen by the drain, `kind` `queued` or `in_flight`; best-effort, triage only |
+| `descry_runner_targets` | gauge | number of configured targets |
+| `descry_build_info{version,commit}` | gauge | constant 1 |
+
+The best-effort series undercount when the runner drops `Result`s; the exact
+counters are the ones to alert on. The `metrics` package doc has the details.
+
+### The `url` label and shared labels
+
+The label is `scheme://host[:port]/path`: userinfo, query and fragment are
+dropped, an empty path renders as `/`, and a URL with no safe rendering
+(including one with a literal `@` other than the userinfo delimiter; write it
+as `%40`) becomes `<unparseable>`. The path is exported as-is, so a fleet whose
+URLs carry a secret in the path should run with `--metrics-per-target=false`.
+
+Two targets with the same label would share one series set (counters summed,
+gauges last-writer-wins), so with `--listen` and per-target series on, descry
+refuses to start, naming config positions rather than URLs:
+
+```
+error: targets 1 and 2 share the metrics label "https://h/p" (labels drop userinfo, query and fragment); give each a distinct scheme, host or path, or run with --metrics-per-target=false
+error: targets 2 and 5 have no safe metrics label (each renders as "<unparseable>"); fix the URL (escape a literal "@" as %40) or run with --metrics-per-target=false
+```
+
+The label comes from the target URL, not from a `url` label set in the
+config, so setting one does not resolve this. A single `<unparseable>` target
+is allowed. Without `--listen`, or with
+`--metrics-per-target=false`, nothing is refused: exact duplicates get the
+startup warning and query variants run as distinct targets.
+
+### Which event fields are clean
+
+The same rendering is applied to the events, whether or not `--listen` is set.
+It normalises as well as strips, so a consumer keyed on `subject` sees changed
+values even for URLs that carried no secret: a bare host gains a trailing `/`
+(`https://example.com` becomes `https://example.com/`), the path is
+re-escaped (a literal space becomes `%20`), the scheme is lower-cased, and the
+fragment is dropped along with userinfo and query.
+
+| Field | Published as |
+|---|---|
+| `subject` | `scheme://host[:port]/path` of the target URL, or `<unparseable>`. Equal to the metrics `url` label, so events and series join on it |
+| `data.final_url` | the same rendering of the URL after redirects |
+| `subject` from a `url` label you set (`targets[].labels.url`) | verbatim |
+| `source` | verbatim |
+| `data.extra.body` | verbatim |
 
 ## Sizing `concurrency`
 
@@ -213,10 +333,26 @@ Fix it by raising that target's `interval` above `timeout`, or by lowering
 |---|---|---|
 | DEBUG | `skipping slot; prior run in flight` | one per skipped slot. Debug on purpose — `Results()` is the signal; the log would be a flood under saturation |
 | INFO | `clock stepped back; re-anchored schedule` | once per backward wall-clock step |
+| INFO | `admin server listening` | `--listen` only: the server is up; `addr` is the bound address |
 | WARN | `check timeout exceeds interval; …` | startup, once per offending target |
+| WARN | `duplicate target URL; each entry is probed independently` | startup, once per URL listed more than once; only when not serving per-target metrics (otherwise it is an exit 2) |
+| WARN | `targets share an event subject; set a distinct url label to tell them apart` | startup, once per subject shared by targets with different URLs: URLs differing only in query or userinfo, or two targets given the same `url` label. `subject` is printed through `check.RedactURL` |
+| WARN | `target URL cannot be shown safely; its event subject is <unparseable>` | startup, once per target whose URL has no safe rendering and that has no `url` label. `target` is its 1-based position in `targets`; this line does not include the URL |
+| WARN | `--metrics-per-target has no effect without --listen` | startup, when `--metrics-per-target` is set explicitly and `--listen` is not |
+| WARN | `admin server shutdown` | `--listen` only: in-flight requests did not finish within 5s at shutdown, so their connections were closed. The exit code is unchanged |
 | WARN | `dropping results; results channel full …` | consumer not draining; rate-limited to once per default interval |
 | WARN | `shutdown grace expired; …` | `WithShutdownGrace` only: `Run` returned with `workers` runs still in flight; see [Shutdown](#bounding-the-wait-withshutdowngrace) |
 | ERROR | `publish failed after retries` | the sink rejected an event 3 times (linear back-off, 100ms × attempt). The observation is lost; the scheduler continues |
+
+Lines that print a target URL (`url` above, `subject` when it comes from a
+`url` label you set, and the per-run diagnostics `descry` writes to stderr)
+pass it through `check.RedactURL`. It masks userinfo, but leaves the query
+string as it is, so a `?token=` is printed even in a well-formed URL. It masks
+nothing in a URL with no `//` after the scheme (`https:user:pass@host` is
+printed as written), nor in a password with a literal `/` that moves the `@`
+into the path (`https://user:12/34@host/p`); a URL that fails to parse prints
+as `<unparseable>`. Keep credentials and tokens out of target URLs, or out of
+URLs of those shapes at least.
 
 Publishing is best-effort by design: bounded retry, then log and continue. The
 scheduler goroutine is never blocked by a sink — a slow `Publish` holds one
@@ -239,12 +375,27 @@ a file whose last byte is not `\n` is treated as torn on open.
 
 ## Shutdown
 
-Cancel the context passed to `Run`. The runner stops dispatching, waits for
-in-flight runs to finish, then closes `Results()` so a draining consumer's loop
-exits. Targets that were queued but not yet started are acked without running, so
-shutdown produces no burst of `context.Canceled` results. No `Publish` happens
-after `Run` returns — which is what makes a deferred sink `Close()` safe. If
-that `Close` fails (the file sink's final flush or the file close itself), the
+For the `descry` binary the order is:
+
+1. SIGINT or SIGTERM arrives (or the admin server fails, which cancels the run
+   the same way).
+2. `/readyz` turns 503 and the run's context is cancelled.
+3. `Run` returns once in-flight runs finish.
+4. The `Results()` drain completes, so a scrape still in flight then sees
+   every counter. There is no linger: once step 5 begins, a new scrape is
+   refused.
+5. With `--listen`, the admin server shuts down: it stops accepting and waits
+   up to 5s for in-flight requests; any still running then are closed, with a
+   WARN, and the exit code is unchanged.
+6. The file sink, if any, is closed.
+
+The runner's side is the same for any program: cancel the context passed to
+`Run`. The runner stops dispatching, waits for in-flight runs to finish, then
+closes `Results()` so a draining consumer's loop exits. Targets that were
+queued but not yet started are acked without running, so shutdown produces
+no burst of `context.Canceled` results. No `Publish` happens after `Run`
+returns — which is what makes a deferred sink `Close()` safe. If that `Close`
+fails (the file sink's final flush or the file close itself), the
 `descry` binary prints `error: closing file sink: …` and exits 1 even though
 `Run` itself returned cleanly, so a supervisor sees the sink failure. By
 default the wait for in-flight runs is unbounded (see above); `cmd/descry`
@@ -285,6 +436,17 @@ they exit when their `Check` or `Publish` returns. Size the grace above the
 check `timeout` plus the sink's worst honest `Publish` latency, so it only
 fires on a run that is genuinely wedged. The `descry` binary does not set it.
 
+## Exit codes
+
+| Code | When |
+|---|---|
+| 0 | `-h`; `--version`; a clean SIGINT/SIGTERM shutdown, with or without `--listen`; `Run` returning without error |
+| 1 | `--listen` bind failure (port in use, permission; before the sink opens, so no events file); an admin server error, which prints `error: admin server: …` at once and cancels the run; any `Run` error other than cancellation; a file-sink `Close` failure when the code would otherwise be 0; `metrics.New` failing (also before the sink opens) |
+| 2 | flag parse error; missing `--config`; `--listen` not `host:port`, or with a port that is empty, not a number or above 65535; `config.Load` error; two targets sharing a metrics label (only with `--listen` and per-target series on); invalid sink settings; invalid event `source`; the file sink cannot be opened |
+
+An admin server that does not finish shutting down within 5s is closed
+forcibly with a WARN; that does not change the exit code.
+
 ## Triage quick reference
 
 | Symptom | Likely cause | Check |
@@ -297,3 +459,8 @@ fires on a run that is genuinely wedged. The `descry` binary does not set it.
 | All targets late by exactly one interval, once | wall-clock step | look for the INFO re-anchor line |
 | Goroutines growing with target count | not this runner | it is O(concurrency); look at `net/http` connections |
 | `descry` exits 1 after a clean shutdown with `error: closing file sink: …` | the file sink's final flush or file close failed (e.g. ENOSPC) | check disk space and the file's tail; a torn last line is terminated on the next open |
+| `/readyz` 503 right after start, or during shutdown | the runner has not started yet, or a shutdown signal has arrived | expected; readiness is not "every target observed", so gate freshness on the metrics, not on `/readyz` |
+| `descry` exits 1 at startup with `error: --listen …` | the address could not be bound (port in use, permission) | free the port or pick another; no events file was created |
+| `descry` exits 2 with `error: targets … share the metrics label …` or `error: targets … have no safe metrics label …` | two targets render to the same `url` metrics label (or both to `<unparseable>`) while per-target series are served | give them distinct scheme, host or path (escape a literal `@` as `%40`), or run with `--metrics-per-target=false` |
+| scrapes of `/metrics` get 503 | more than 2 scrapes in flight, a scrape over 10s, or the gather of a recent timed-out or abandoned scrape still running | fewer or slower-cadence scrapers; one Prometheus job per instance |
+| every scrape of `/metrics` gets 503 for up to 30s, though your scrapers are within the limit | two clients requested `/metrics` and stopped reading; each holds a `/metrics` slot until the 30s write timeout | clears within 30s; bind `--listen` to loopback or a private interface, or firewall the port from untrusted peers |
