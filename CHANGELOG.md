@@ -33,6 +33,11 @@ Pre-1.0, the minor version carries breaking changes.
 
 ### Fixed
 
+- CI's check that the engine packages do not import prometheus now derives the
+  engine set from `go list` (every package except `metrics/` and `cmd/`), so a
+  new package is covered automatically. It fails on a `go list` error or an
+  empty set, and lists and checks the packages of the linux, darwin and windows
+  builds separately.
 - `metrics.Collector.SetRunner`'s doc describes the typed-nil behaviour
   accurately: every Gather panics in the caller's goroutine, which net/http
   recovers per request (the scrape fails with a dropped connection), while a
