@@ -145,12 +145,14 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	)
 
 	// Drain results to stderr + count failures. The goroutine exits when the
-	// runner closes the results channel during shutdown.
+	// runner closes the results channel during shutdown. failures is bumped as
+	// the drain goes, so it can be read while the drain is live, not only after
+	// it returns.
 	var failures atomic.Int64
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		failures.Store(drainResults(r.Results(), stderr, cfg.Interval, time.Now))
+		drainResults(r.Results(), stderr, cfg.Interval, time.Now, &failures)
 	}()
 
 	// Once the first signal has cancelled ctx, restore default signal handling
@@ -188,20 +190,21 @@ func exitCodeFor(runErr error) int {
 }
 
 // drainResults prints each Result's diagnostic to w until results is closed
-// and returns the number of check/mapping/publish failures seen. Skipped slots
-// are not check failures (the scheduler chose not to run, not a bad probe) and
-// are printed distinctly; ErrSkippedQueued is tested before ErrSkipped since it
-// wraps it. Under saturation every slot of every target skips, so skip lines
-// are rate-limited to one per target per interval (with a suppressed count on
-// the next line printed) — otherwise a slow stderr would stall this drain, fill
-// Results(), and turn skips into drops. The window is the target's own
-// effective interval (its override, else interval), so a fast target under a
-// slow default is not silenced for several of its own slots. Failures are
-// always printed.
-func drainResults(results <-chan runner.Result, w io.Writer, interval time.Duration, now func() time.Time) int64 {
+// and adds one to failures for each check/mapping/publish failure seen, as it
+// is seen, so a caller can read the running count while the drain is live.
+// failures must be non-nil. Skipped slots are not check failures (the
+// scheduler chose not to run, not a bad probe) and are printed distinctly;
+// ErrSkippedQueued is tested before ErrSkipped since it wraps it. Under
+// saturation every slot of every target skips, so skip lines are rate-limited
+// to one per target per interval (with a suppressed count on the next line
+// printed) — otherwise a slow stderr would stall this drain, fill Results(),
+// and turn skips into drops. The window is the target's own effective
+// interval (its override, else interval), so a fast target under a slow
+// default is not silenced for several of its own slots. Failures are always
+// printed.
+func drainResults(results <-chan runner.Result, w io.Writer, interval time.Duration, now func() time.Time, failures *atomic.Int64) {
 	// Diagnostics are best-effort: a failed stderr write is not something this
 	// loop can act on, so write errors are deliberately ignored.
-	var failures int64
 	type skipState struct {
 		last       time.Time
 		suppressed int
@@ -215,7 +218,7 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 		case errors.Is(res.Err, runner.ErrSkipped):
 			reason = "prior run still running (slow check)"
 		case res.Err != nil:
-			failures++
+			failures.Add(1)
 			_, _ = fmt.Fprintf(w, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
 			continue
 		default:
@@ -244,7 +247,6 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 			_, _ = fmt.Fprintf(w, "check skipped: %s: %s\n", check.RedactURL(res.Target.URL), reason)
 		}
 	}
-	return failures
 }
 
 // buildTargets maps config targets to engine targets. It warns once, at
