@@ -13,6 +13,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -69,8 +71,9 @@ func main() {
 //     fails on an otherwise clean exit, or the metrics collector cannot be
 //     built.
 //   - 2: a usage or config error: a bad flag, no --config, a --listen that is
-//     not host:port, a config that does not load, a bad sink setting or event
-//     source, or a file sink that cannot be opened.
+//     not host:port, a config that does not load, two targets that share a
+//     metrics label (only with --listen and per-target series), a bad sink
+//     setting or event source, or a file sink that cannot be opened.
 //
 // With --listen, shutdown runs in this order: /readyz turns 503 and the run
 // context is cancelled, Run returns, the results drain finishes (so a last
@@ -127,6 +130,13 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	}
 	if *fileOverride != "" {
 		cfg.FilePath = *fileOverride
+	}
+	// Per-target series are keyed by the metrics label, so two targets that
+	// share one would sum their counters and overwrite each other's gauges.
+	// Refuse that only when those series are served: without them a shared
+	// label costs nothing, and query variants are legitimate distinct targets.
+	if listening && *perTarget && !checkLabelCollisions(cfg.Targets, stderr) {
+		return 2
 	}
 	if err := config.ValidateSink(cfg.Sink, cfg.FilePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
@@ -367,6 +377,8 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 // warns once per URL that appears more than once: duplicates are independent
 // targets to the runner (probed and reported separately, sharing a slot when
 // their intervals match), which is rarely what a copy-pasted entry intended.
+// With --listen and per-target series, run refuses duplicates earlier
+// (checkLabelCollisions), so these warnings only fire without them.
 //
 // A target without a "url" label gets eventURL(URL), which becomes the event
 // subject; a "url" label set in the config is kept and published as-is. Since
@@ -443,4 +455,51 @@ func (c sanitizedCheck) Run(ctx context.Context, t check.Target) (check.Observat
 	obs, err := c.inner.Run(ctx, t)
 	obs.FinalURL = eventURL(obs.FinalURL)
 	return obs, err
+}
+
+// unparseableLabel is the placeholder metrics.TargetLabel returns for a URL
+// with no safe rendering (an empty URL is one).
+var unparseableLabel = metrics.TargetLabel("")
+
+// checkLabelCollisions reports the first metrics label, in config order, that
+// two or more targets share, printing one "error:" line to w, and returns
+// false; it returns true when every label is distinct. Exact duplicates share
+// a label too. The line names targets by their 1-based position and prints
+// the label (which carries no userinfo, query or fragment), never the URL.
+func checkLabelCollisions(targets []config.Target, w io.Writer) bool {
+	positions := make(map[string][]int, len(targets))
+	var order []string
+	for i, t := range targets {
+		label := metrics.TargetLabel(t.URL)
+		if _, ok := positions[label]; !ok {
+			order = append(order, label)
+		}
+		positions[label] = append(positions[label], i+1)
+	}
+	for _, label := range order {
+		pos := positions[label]
+		if len(pos) < 2 {
+			continue
+		}
+		if label == unparseableLabel {
+			_, _ = fmt.Fprintf(w, "error: targets %s have no safe metrics label (each renders as %q); "+
+				"fix the URL (escape a literal \"@\" as %%40) or run with --metrics-per-target=false\n",
+				joinPositions(pos), label)
+		} else {
+			_, _ = fmt.Fprintf(w, "error: targets %s share the metrics label %q (labels drop userinfo, query and fragment); "+
+				"give each a distinct scheme, host or path, or run with --metrics-per-target=false\n",
+				joinPositions(pos), label)
+		}
+		return false
+	}
+	return true
+}
+
+// joinPositions renders positions as "1 and 2" or "1, 4 and 6".
+func joinPositions(pos []int) string {
+	parts := make([]string, len(pos))
+	for i, p := range pos {
+		parts[i] = strconv.Itoa(p)
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
 }

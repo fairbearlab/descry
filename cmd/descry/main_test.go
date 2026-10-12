@@ -409,7 +409,7 @@ func TestRun_FlagParseExitCodes(t *testing.T) {
 	}
 }
 
-// Value: protects=run's exit-code contract: -version 0 and prints; missing/unreadable config, bad sink override, unopenable file sink, malformed --listen exit 2
+// Value: protects=run's exit-code contract: -version 0 and prints; missing/unreadable config, bad sink override, unopenable file sink, malformed --listen, shared metrics label exit 2
 // Value: fails_when=a refactor returns the wrong code, drops a message, or -version stops printing the build info line
 // Value: why_new=existing run tests cover only -h, unknown flag and an invalid source; these pre-run branches were untested; seam=none
 func TestRun_UsageAndConfigErrors(t *testing.T) {
@@ -421,6 +421,10 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 	}
 	unopenable := filepath.Join(dir, "no-such-dir", "events.jsonl")
 	listenBad := filepath.Join(dir, "listen-bad.jsonl") // a bad --listen must fail before the sink opens
+	collidePath := filepath.Join(dir, "collide.yaml")   // two targets on one metrics label
+	if err := os.WriteFile(collidePath, []byte(targetsYAML("https://h/p?a=1", "https://h/p?b=2")), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, tc := range []struct {
 		name       string
@@ -437,6 +441,7 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 		{"file sink unopenable", []string{"--config", cfgPath, "--sink", "file", "--file", unopenable}, 2, "", "error:"},
 		{"listen not host:port", []string{"--config", cfgPath, "--listen", "not-an-addr", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
 		{"listen port only", []string{"--config", cfgPath, "--listen", "9090", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"shared metrics label", []string{"--config", collidePath, "--listen", "127.0.0.1:0", "--sink", "file", "--file", listenBad}, 2, "", "share the metrics label"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
