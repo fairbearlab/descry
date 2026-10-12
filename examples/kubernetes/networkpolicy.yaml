@@ -1,0 +1,116 @@
+# Opt-in NetworkPolicy for the descry pod. Not listed in kustomization.yaml:
+# it needs adapting to your cluster first (see README.md), then apply it with
+# `kubectl apply -f` after `kubectl apply -k`, or add it to your own
+# kustomization. It does nothing on a cluster whose CNI does not enforce
+# NetworkPolicy.
+#
+# Ingress: the admin server on :9090 is unauthenticated, serves the target
+# URLs in its url labels, and has a fixed number of connection slots that a
+# client can hold to stall the readiness probe, so only the scraper may reach
+# it. The kubelet's probes come from the node, which most CNIs let through
+# regardless of policy; check that yours does, or the pod goes unready.
+#
+# Egress: defense in depth beside descry's own dial guard. Targets may only be
+# reached on ports 80 and 443 at addresses outside the excepted special-purpose
+# ranges, plus DNS to kube-dns. A cluster whose Service or pod range is public
+# is not covered until those ranges are added (see ADAPT below). Whether an
+# ipBlock rule applies to traffic for a ClusterIP (before or after the Service
+# address is translated to a pod IP) is CNI-specific.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: descry
+  labels:
+    app.kubernetes.io/name: descry
+    app.kubernetes.io/part-of: descry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: descry
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        # ADAPT: the namespace and pod labels of your Prometheus. Both
+        # selectors are in one entry, so a pod must match both.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    # DNS, to the cluster DNS pods only. ADAPT the labels if your cluster DNS
+    # does not carry the usual k8s-app: kube-dns.
+    #
+    # ADAPT: with NodeLocal DNSCache, DNS is answered on the node, not by the
+    # kube-dns pods, so the rule below no longer matches it and DNS fails.
+    # Pods send it to the address in their resolv.conf: usually the kube-dns
+    # Service's ClusterIP (kubectl -n kube-system get svc kube-dns), which
+    # the node cache also listens on with kube-proxy in iptables mode, or
+    # 169.254.20.10 where kubelet's clusterDNS points there (required with
+    # IPVS mode). Allow whichever your pods use (rules add up, so it is
+    # reachable even though the target rule excepts its range):
+    #
+    # - to:
+    #     - ipBlock:
+    #         cidr: <kube-dns ClusterIP>/32   # or 169.254.20.10/32
+    #   ports:
+    #     - protocol: UDP
+    #       port: 53
+    #     - protocol: TCP
+    #       port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The targets: HTTP and HTTPS. The excepted ranges are "this network"
+    # (0.0.0.0/8), private (RFC 1918), shared/CGNAT (100.64.0.0/10),
+    # loopback, link-local (169.254.0.0/16, cloud metadata included), IETF
+    # protocol assignments (192.0.0.0/24), benchmarking (198.18.0.0/15),
+    # reserved (240.0.0.0/4, broadcast included), and for IPv6 loopback,
+    # NAT64 (64:ff9b::/96, which embeds IPv4 addresses), unique-local and
+    # link-local.
+    #
+    # ADAPT: these lists do not know your cluster's own ranges. Where the
+    # Service or pod CIDR is public (GKE's default Service range
+    # 34.118.224.0/20, for example), append both to the except lists, or
+    # descry may reach in-cluster Services and pods on ports 80 and 443.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 240.0.0.0/4
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - ::1/128
+              - 64:ff9b::/96
+              - fc00::/7
+              - fe80::/10
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
