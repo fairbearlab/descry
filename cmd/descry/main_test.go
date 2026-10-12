@@ -159,7 +159,7 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 
 	var out bytes.Buffer
 	var failures atomic.Int64
-	drainResults(ch, &out, 30*time.Second, now, &failures)
+	drainResults(ch, &out, 30*time.Second, now, &failures, nil)
 	if got := failures.Load(); got != 1 {
 		t.Fatalf("failures = %d, want 1", got)
 	}
@@ -190,7 +190,7 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 		}
 		return clock
 	}
-	drainResults(ch2, &out, 30*time.Second, tick, new(atomic.Int64))
+	drainResults(ch2, &out, 30*time.Second, tick, new(atomic.Int64), nil)
 	s = out.String()
 	if n := strings.Count(s, "check skipped:"); n != 2 {
 		t.Fatalf("skip lines across an interval boundary = %d, want 2:\n%s", n, s)
@@ -210,7 +210,7 @@ func TestDrainResults_FailureCountVisibleLive(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		drainResults(ch, io.Discard, 30*time.Second, time.Now, &failures)
+		drainResults(ch, io.Discard, 30*time.Second, time.Now, &failures, nil)
 	}()
 
 	tgt := check.Target{URL: "https://a.example/"}
@@ -262,7 +262,7 @@ func TestDrainResults_SkipWindowUsesTargetInterval(t *testing.T) {
 	ch <- runner.Result{Target: dflt, Err: runner.ErrSkipped} // t=6s: suppressed (30s window)
 	close(ch)
 	var out bytes.Buffer
-	drainResults(ch, &out, 30*time.Second, now, new(atomic.Int64))
+	drainResults(ch, &out, 30*time.Second, now, new(atomic.Int64), nil)
 
 	s := out.String()
 	if n := strings.Count(s, "check skipped: https://fast.example/"); n != 2 {
@@ -409,7 +409,7 @@ func TestRun_FlagParseExitCodes(t *testing.T) {
 	}
 }
 
-// Value: protects=run's exit-code contract: -version 0 and prints; missing/unreadable config, bad sink override, unopenable file sink exit 2
+// Value: protects=run's exit-code contract: -version 0 and prints; missing/unreadable config, bad sink override, unopenable file sink, malformed --listen exit 2
 // Value: fails_when=a refactor returns the wrong code, drops a message, or -version stops printing the build info line
 // Value: why_new=existing run tests cover only -h, unknown flag and an invalid source; these pre-run branches were untested; seam=none
 func TestRun_UsageAndConfigErrors(t *testing.T) {
@@ -420,6 +420,7 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	unopenable := filepath.Join(dir, "no-such-dir", "events.jsonl")
+	listenBad := filepath.Join(dir, "listen-bad.jsonl") // a bad --listen must fail before the sink opens
 
 	for _, tc := range []struct {
 		name       string
@@ -434,6 +435,8 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 		{"sink override invalid", []string{"--config", cfgPath, "--sink", "bogus"}, 2, "", "must be"},
 		{"file override without path", []string{"--config", cfgPath, "--sink", "file"}, 2, "", "file_path is required"},
 		{"file sink unopenable", []string{"--config", cfgPath, "--sink", "file", "--file", unopenable}, 2, "", "error:"},
+		{"listen not host:port", []string{"--config", cfgPath, "--listen", "not-an-addr", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
+		{"listen port only", []string{"--config", cfgPath, "--listen", "9090", "--sink", "file", "--file", listenBad}, 2, "", "error: --listen"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -450,6 +453,9 @@ func TestRun_UsageAndConfigErrors(t *testing.T) {
 				t.Errorf("stderr = %q, want substring %q", stderr.String(), tc.wantStderr)
 			}
 		})
+	}
+	if _, err := os.Stat(listenBad); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a malformed --listen opened the file sink (stat err = %v)", err)
 	}
 }
 
