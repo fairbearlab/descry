@@ -48,6 +48,15 @@ goreleaser check
 goreleaser release --snapshot --clean --skip=publish,sign
 ```
 
+CI also runs a `rules` job, which checks and unit-tests the alerting rules in
+`contrib/prometheus/` with `promtool`, and a `manifests` job, which renders
+`examples/kubernetes/` with `kubectl kustomize` and validates it with
+`kubeconform`. If you change either directory, run the commands in its README
+([Tests](contrib/prometheus/README.md#tests),
+[Validate the manifests](examples/kubernetes/README.md#validate-the-manifests)).
+`go test ./metrics/` fails if a series or label the rules read is renamed, and
+`go test ./cmd/descry/` fails if the example ConfigMap no longer loads.
+
 PRs also run a perf gate (`.github/workflows/perf.yml`): a same-job `benchstat`
 comparison against the merge base that fails on a ≥ +10 % ns/op regression
 (p < 0.05) in the runner and sink benchmarks, the scale harness

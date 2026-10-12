@@ -93,7 +93,7 @@ channel and two counters. Nothing is silent.
 | `Result{Err: runner.ErrSkipped}` | channel | Slot skipped: the prior run **had started** and was still running. The check is slower than the target's interval | lengthen that target's interval, or shorten `timeout` |
 | `Result{Err: runner.ErrSkippedQueued}` | channel | Slot skipped: the prior run was still **queued** behind a saturated worker pool and had not started. The pool is too small | raise `concurrency` (see sizing below) |
 | `Runner.Skipped() int64` | counter | Total skipped slots, both kinds. Exported as `descry_runner_skipped_slots_total` | trend it; a nonzero rate in steady state means undersized |
-| `Runner.Dropped() int64` | counter | Results discarded because `Results()` was full — i.e. the consumer stopped draining. Exported as `descry_runner_dropped_results_total` | fix the consumer; you are losing observations |
+| `Runner.Dropped() int64` | counter | Results discarded because `Results()` was full — i.e. the consumer stopped draining. Exported as `descry_runner_dropped_results_total` | fix the consumer; you are losing `Result`s: a dropped `Result` can be a successful check, a skipped slot, a check that returned an error, an event that could not be encoded, or a failed publish, and you lose its diagnostics and the counts fed from `Results()` |
 
 ### "Down" is not an error
 
@@ -225,7 +225,10 @@ Fleet-wide (always served):
 | `descry_build_info{version,commit}` | gauge | constant 1 |
 
 The best-effort series undercount when the runner drops `Result`s; the exact
-counters are the ones to alert on. The `metrics` package doc has the details.
+counters are the ones to alert on. The `metrics` package doc has the details,
+and [contrib/prometheus](../contrib/prometheus/README.md) has ready-made
+alerting rules. [examples/kubernetes](../examples/kubernetes/README.md) has
+manifests that run descry with `--listen` in a cluster.
 
 ### The `url` label and shared labels
 

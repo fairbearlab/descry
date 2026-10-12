@@ -65,6 +65,47 @@ Pre-1.0, the minor version carries breaking changes.
   `--listen`, or with `--metrics-per-target=false`, nothing changes: exact
   duplicates still get the startup warning.
 
+- **`contrib/prometheus/`: alerting rules for the exported series.**
+  `descry-rules.yaml` is a Prometheus Operator `PrometheusRule` with six
+  alerts: `DescryProberAbsent`, `DescryTargetDown`, `DescryChecksStale` (a
+  target whose last completed run is more than 15 minutes old, which catches a
+  prober that is still scraped but no longer completing checks),
+  `DescrySkipsClimbing` (the exact skipped-slots total, not the best-effort
+  per-kind series), `DescryResultsDropped` (a dropped `Result` can hide a
+  failed check or publish, and its diagnostics are lost) and
+  `DescryPublishErrors`. A README covers applying them with the Operator (with
+  a `PodMonitor` for the scrape) or extracting them with `yq '.spec'` for
+  plain Prometheus, sizing the stale budget against your longest interval, a
+  fleet-wide stale rule for `--metrics-per-target=false`, a scrape interval of
+  1m or less, and what they do not catch: `DescryProberAbsent` fires only when
+  no descry instance reports, so the README suggests `up` and `absent(up)`
+  rules for per-instance coverage. They are covered by promtool unit tests in
+  a new CI `rules` job (pinned `yq` and `promtool`, checked by sha256, with
+  `--lint-fatal`), and Go tests in `metrics/` fail if a series named in the
+  rules, or a label they read from it, is renamed or removed.
+
+- **`examples/kubernetes/`: plain manifests that run descry in a cluster.** A
+  Deployment (one replica with the `Recreate` strategy, so a rollout never
+  runs two probers at once, `--listen=:9090`, a TCP liveness probe and an HTTP
+  readiness probe on `/readyz`, Prometheus scrape annotations, a read-only
+  root filesystem, a non-root, capability-free security context, no service
+  account token, `GOMEMLIMIT` under the memory limit and no CPU limit, since
+  throttling would inflate the measured latency), a ConfigMap with two example
+  targets, and a kustomization that sets the image tag, so apply it with
+  `kubectl apply -k`. An opt-in `networkpolicy.yaml`, outside the
+  kustomization, limits the metrics port to the scraper and egress to DNS and
+  ports 80 and 443 outside the special-purpose ranges (adapt it with the
+  cluster's own Service and pod ranges where those are public, and for
+  NodeLocal DNSCache). No image is published yet: the README builds one
+  locally with ko and walks through trying it on a kind cluster. It also notes
+  the limits that matter in a cluster: the dial guard refuses in-cluster
+  Services only where the Service range is private (kind, kubeadm, EKS; not
+  GKE's default public range), it refuses ports other than 80 and 443, and the
+  metrics port is unauthenticated. The new CI `manifests` job renders it with
+  `kubectl kustomize` and validates it, and the NetworkPolicy, with
+  `kubeconform -strict` (pinned binaries, checked by sha256, and schemas
+  pinned to one commit).
+
 ### Changed
 
 - **Breaking (behaviour), for consumers keyed on the event subject: the

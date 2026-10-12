@@ -153,6 +153,10 @@ mux.Handle("GET /metrics", promhttp.HandlerFor(c.Registry(), promhttp.HandlerOpt
 
 Series, probe semantics, the shutdown order and the exit codes are in
 [docs/OPERATIONS.md](docs/OPERATIONS.md#metrics-and-health-endpoints).
+Ready-made alerting rules for these series are in
+[contrib/prometheus](contrib/prometheus/README.md), and manifests that run
+descry with `--listen` in a Kubernetes cluster are in
+[examples/kubernetes](examples/kubernetes/README.md).
 
 ## Version
 
