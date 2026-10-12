@@ -99,3 +99,103 @@ jobs:
         with:
           version: "~> v2"
           args: release --snapshot --clean --skip=publish,sign
+  # The alerting rules ship as a PrometheusRule CR, which promtool cannot read,
+  # so the job extracts the plain rule groups with yq and runs promtool on
+  # those, with --lint-fatal so a lint finding (a duplicate rule) fails the
+  # job instead of only printing a warning. Both tools are fixed release
+  # binaries checked against a hard-coded sha256 (taken from each project's
+  # published checksums file), so a changed or tampered download fails the
+  # job. Bump a version and its digest together.
+  # The Go tests in metrics/rules_test.go cover the other half: every series
+  # name in the rules must exist in the collector, with every label the rules
+  # read from it.
+  rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install yq and promtool
+        env:
+          YQ_VERSION: v4.54.1
+          YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+          PROM_VERSION: 3.15.0
+          PROM_SHA256: 2a542df32eac02ee17b9d844fb2aa1de00dafa5476579ba8a3ba862e9d572ea0
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/yq" \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  $tools/yq" | sha256sum -c -
+          chmod +x "$tools/yq"
+          tarball="prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${tarball}"
+          echo "${PROM_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$tools" --strip-components=1 \
+            "prometheus-${PROM_VERSION}.linux-amd64/promtool"
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: extract, check and test the rules
+        working-directory: contrib/prometheus
+        run: |
+          set -euo pipefail
+          yq '.spec' descry-rules.yaml > descry-rules.extracted.yaml
+          promtool check rules --lint-fatal descry-rules.extracted.yaml
+          promtool test rules descry-rules.test.yaml
+  # The example manifests are kustomize-only (the image tag is set in the
+  # kustomization), so the job renders them with kubectl and validates the
+  # result with kubeconform. networkpolicy.yaml is opt-in and not in the
+  # kustomization, so it is validated on its own. No cluster is involved.
+  # Both tools are fixed release binaries checked against a hard-coded
+  # sha256: kubectl's from the .sha256 file published next to the binary,
+  # kubeconform's from the CHECKSUMS file of its release. Bump a version and
+  # its digest together.
+  #
+  # kubeconform fetches its JSON schemas at run time, by default from the
+  # moving master branch of yannh/kubernetes-json-schema. -schema-location
+  # points it at one commit of that repository instead (KUBE_SCHEMAS_REF), so
+  # what the job accepts cannot change under it. K8S_VERSION picks the schema
+  # directory within that commit: bump the two together, to a commit that has
+  # a v<K8S_VERSION>-standalone-strict directory, and update the copy of both
+  # in the "Validate the manifests" command in examples/kubernetes/README.md.
+  manifests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install kubectl and kubeconform
+        env:
+          KUBECTL_VERSION: v1.37.1
+          KUBECTL_SHA256: 65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
+          KUBECONFORM_VERSION: v0.8.0
+          KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  $tools/kubectl" | sha256sum -c -
+          chmod +x "$tools/kubectl"
+          tarball="kubeconform-linux-amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/${tarball}"
+          echo "${KUBECONFORM_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$tools" kubeconform
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: render and validate examples/kubernetes
+        env:
+          K8S_VERSION: 1.37.1
+          KUBE_SCHEMAS_REF: 817113f21a2643311cbc3e992bb44ffe1c416c54
+        run: |
+          set -euo pipefail
+          schemas="https://raw.githubusercontent.com/yannh/kubernetes-json-schema/${KUBE_SCHEMAS_REF}/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json"
+          kubectl kustomize examples/kubernetes \
+            | kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" \
+              -schema-location "$schemas"
+          kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" \
+            -schema-location "$schemas" examples/kubernetes/networkpolicy.yaml
