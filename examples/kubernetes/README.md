@@ -120,10 +120,11 @@ NetworkPolicy. kind's default CNI does enforce it.
 
 ## Try it on a kind cluster
 
-The release workflow publishes `ghcr.io/fairbearlab/descry` starting with
-v0.5.0, the tag `kustomization.yaml` pins. Until that release exists, and
-whenever you want to run your own changes, these steps build an image from this
-checkout and load it straight into kind. You need Docker,
+The release workflow publishes `ghcr.io/fairbearlab/descry` from v0.5.0 on,
+and `kustomization.yaml` pins v0.5.0, so running that release takes only
+`kubectl apply -k examples/kubernetes` (see the note after step 3). The steps
+below build an image from this checkout instead and load it straight into
+kind, so they run your own changes. You need Docker,
 [kind](https://kind.sigs.k8s.io/), `kubectl` and Go. Run everything from the
 root of the repository.
 

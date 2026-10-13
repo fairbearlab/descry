@@ -277,7 +277,9 @@ What descry publishes about a target URL:
   `--metrics-per-target=false`.
 - **The event `subject` and `data.final_url`** use the same rendering, so they
   drop userinfo, query and fragment too, and a URL with no safe rendering shows
-  as `<unparseable>`.
+  as `<unparseable>`. The `descry` binary does this; a program that embeds the
+  library publishes the check's raw values unless it does the same (see
+  [Which event fields are clean](docs/OPERATIONS.md#which-event-fields-are-clean)).
 - **A `url` label you set on a target (`targets[].labels.url`) is published
   verbatim** as the event subject. It is yours to keep clean, and it is how to
   give two targets that share a rendering distinct subjects (it does not change

@@ -374,7 +374,25 @@ the write, then assert a third request still gets 200, not 503.
 fairbearlab/descry, then run the `cosign verify` and `cosign verify-blob`
 commands from README.md's "Verify a release" against v0.5.0, and
 `kubectl apply -k examples/kubernetes` on a kind cluster without the local
-overlay.
+overlay. Then run `go version -m` on one release archive binary (linux/amd64)
+and on the image's `/ko-app/descry` (linux/amd64), in a fresh empty
+directory:
+
+```bash
+TAG=v0.5.0; VER=${TAG#v}
+gh release download "$TAG" -R fairbearlab/descry -p "descry_${VER}_Linux_x86_64.tar.gz"
+mkdir archive && tar -xzf "descry_${VER}_Linux_x86_64.tar.gz" -C archive descry
+go version -m archive/descry
+digest="$(crane digest ghcr.io/fairbearlab/descry:${TAG})"
+mkdir image && crane export --platform linux/amd64 "ghcr.io/fairbearlab/descry@${digest}" - | tar -xf - -C image ko-app/descry
+go version -m image/ko-app/descry
+```
+
+Both must show `mod github.com/fairbearlab/descry v0.5.0` (no `+dirty`),
+`build vcs.modified=false`, and `vcs.revision` equal to
+`git rev-parse v0.5.0^{commit}`. If `crane export` finds no `ko-app/descry`
+member, list the stream with `tar -tf -` first, or copy the file out with
+`docker create --platform linux/amd64` and `docker cp`.
 
 **Why:** The push, the image signature and the checksums signature first run
 on the v0.5.0 tag: the CI snapshot builds the image but skips publishing and
@@ -382,7 +400,9 @@ signing. A first push with the workflow's `GITHUB_TOKEN` from this public
 repository creates the package public and linked to it (seen in a
 2026-10-13 rehearsal), but a private package would make anonymous pulls,
 `cosign verify` and the Kubernetes example fail with an authorization error,
-so check it rather than assume it.
+so check it rather than assume it. The build stamp needs the same check: CI
+checks only the linux/amd64 snapshot binary, never a tag run's archive binary
+or the binary inside the image.
 
 **Context:** 2026-10-12 — if the release fails after the image push (the
 image is signed before the GitHub release is created), patch forward with
@@ -391,8 +411,7 @@ every place that names it: `newTag` in `examples/kubernetes/kustomization.yaml`,
 README.md (the install line, the `cosign verify` and `verify-blob` identities,
 the checksum file names and "Releases before v0.5.0"), the
 `examples/kubernetes/README.md` kind walkthrough, the comments in
-`kustomization.yaml` and `deployment.yaml`, and the changelog. Once the image
-is published, also reword the walkthrough's "Until that release exists".
+`kustomization.yaml` and `deployment.yaml`, and the changelog.
 
 **Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so even
 a run that succeeds leaves `:latest` pointing at an unsigned digest for the
@@ -481,20 +500,6 @@ config pass every guard:
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
-### Protect release tags with a ruleset
-
-**What:** Add a repository tag ruleset on `v*` that blocks updates and
-deletions and restricts creation to the maintainers who cut releases. This is
-a repository setting the owner applies; nothing in the tree enforces it.
-
-**Why:** Any pushed `v*` tag runs `release.yml`, and that run gets a valid
-keyless signature for `release.yml@refs/tags/<tag>`, the identity README.md's
-"Verify a release" pins. Tags are mutable: without the ruleset, anyone who can
-push a tag can create one or move an existing one to another commit, and the
-release it publishes still verifies.
-
-**Effort:** S · **Priority:** P1 · **Depends on:** nothing
-
 ### Verify Scorecard credits the signed releases
 
 **What:** After v0.5.0, check the OpenSSF Scorecard result for this
@@ -525,6 +530,25 @@ someone bumps it by hand, including after distroless publishes a fix.
 **Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
 ## Completed
+
+### Protect release tags with a ruleset
+
+**What:** Add a repository tag ruleset on `v*` that blocks updates and
+deletions and restricts creation to the maintainers who cut releases. This is
+a repository setting the owner applies; nothing in the tree enforces it.
+
+**Why:** Any pushed `v*` tag runs `release.yml`, and that run gets a valid
+keyless signature for `release.yml@refs/tags/<tag>`, the identity README.md's
+"Verify a release" pins. Tags are mutable: without the ruleset, anyone who can
+push a tag can create one or move an existing one to another commit, and the
+release it publishes still verifies.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+**Completed:** 2026-10-13 — done in repository settings: a ruleset on
+`refs/tags/v*` blocks updates, deletions and non-fast-forward pushes with no
+bypass, and a second ruleset restricts creating `v*` tags to repository
+admins. Nothing in the tree enforces either.
 
 ### Publish the container image before v0.5.0 is tagged
 
