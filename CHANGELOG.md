@@ -145,6 +145,15 @@ Pre-1.0, the minor version carries breaking changes.
   builds stamp the tagged commit's date, so a re-run of the release for the
   same tag builds identical binaries and image digests.
 
+### Fixed
+
+- **Release binaries no longer report a dirty build.** goreleaser's `dist/`
+  output directory was not ignored by git, so Go stamped every release binary
+  (v0.4.0's included) as built from a modified tree: `go version -m` showed
+  the version with `+dirty` and `vcs.modified=true`. `dist/` is now ignored,
+  and the CI `release-check` snapshot fails if its binary is stamped dirty.
+  `descry --version` was never affected.
+
 ## [0.4.0] — 2026-10-11
 
 ### Added

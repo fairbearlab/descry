@@ -15,6 +15,12 @@ docs/internal/
 # Compiled binary
 /descry
 
+# goreleaser output. goreleaser creates it before it builds, and Go stamps
+# a build whose tree has an untracked file as dirty (+dirty,
+# vcs.modified=true), so it must stay ignored for release binaries to read
+# clean in `go version -m`.
+/dist/
+
 # Test coverage profile (written by the CI test command when run locally)
 coverage.out
 

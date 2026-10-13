@@ -367,19 +367,22 @@ the write, then assert a third request still gets 200, not 503.
 
 ## Release
 
-### Make the first published image public and verify its signatures
+### Confirm the first published image is public and verify its signatures
 
-**What:** After the v0.5.0 release workflow runs, set the
-`ghcr.io/fairbearlab/descry` package's visibility to public (GHCR creates a
-new package private), confirm it is linked to this repository, then run the
-`cosign verify` and `cosign verify-blob` commands from README.md's "Verify a
-release" against v0.5.0, and `kubectl apply -k examples/kubernetes` on a kind
-cluster without the local overlay.
+**What:** After the v0.5.0 release workflow runs, confirm the
+`ghcr.io/fairbearlab/descry` package is public and linked to
+fairbearlab/descry, then run the `cosign verify` and `cosign verify-blob`
+commands from README.md's "Verify a release" against v0.5.0, and
+`kubectl apply -k examples/kubernetes` on a kind cluster without the local
+overlay.
 
 **Why:** The push, the image signature and the checksums signature first run
 on the v0.5.0 tag: the CI snapshot builds the image but skips publishing and
-signing. A private package makes anonymous pulls, `cosign verify` and the
-Kubernetes example fail with an authorization error.
+signing. A first push with the workflow's `GITHUB_TOKEN` from this public
+repository creates the package public and linked to it (seen in a
+2026-10-13 rehearsal), but a private package would make anonymous pulls,
+`cosign verify` and the Kubernetes example fail with an authorization error,
+so check it rather than assume it.
 
 **Context:** 2026-10-12 — if the release fails after the image push (the
 image is signed before the GitHub release is created), patch forward with
@@ -391,20 +394,69 @@ the checksum file names and "Releases before v0.5.0"), the
 `kustomization.yaml` and `deployment.yaml`, and the changelog. Once the image
 is published, also reword the walkthrough's "Until that release exists".
 
-**Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so if
-signing fails the tags are live and unsigned with no GitHub release. A patch
-release moves only `:latest`, so an unsigned `:vX` stays live. Either delete
-the failed `:vX` in GHCR (and roll `:latest` back if it moved), or, once the
-cause is fixed, re-run the failed workflow run: no GitHub release exists yet
-and the build is reproducible (commit-time dates), so a re-run pushes the
-same digest and signs it. Do not announce the release until `cosign verify`
-passes.
+**Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so even
+a run that succeeds leaves `:latest` pointing at an unsigned digest for the
+few seconds until the signature is pushed; if signing fails, the tags stay
+live and unsigned with no GitHub release. A patch release moves only
+`:latest`, so an unsigned `:vX` stays live. Either delete the failed `:vX` in
+GHCR (and roll `:latest` back if it moved), or, once the cause is fixed,
+re-run the failed workflow run: no GitHub release exists yet and the build is
+reproducible (commit-time dates), so a re-run pushes the same digest and
+signs it. That holds only while the tag is the only one on its commit: Go
+stamps the highest tag at HEAD into the binary, whatever
+`GORELEASER_CURRENT_TAG` says (see "Deterministic build info" below). Never
+re-run a tag once its GitHub release exists: the run re-pushes and re-signs
+the image and moves `:latest` before it fails with 422s at asset upload.
+Do not announce the release until `cosign verify` passes.
 
 **Effort:** S · **Priority:** P1 · **Depends on:** the v0.5.0 release
 
+### Check the build stamp on tag runs and every target
+
+**What:** Add a goreleaser `builds` post hook on the `descry` build that runs
+`go version -m` on each built binary and fails unless it carries
+`vcs.modified=false`, so the check runs for all four targets on both the CI
+snapshot and the tag run, before anything is archived, pushed or signed.
+Decide whether ko's own build of the image binary needs the same check (for
+example by extracting `/ko-app/descry` from the snapshot image in
+`release-check`).
+
+**Why:** The release-check step "snapshot binary is not stamped dirty" checks
+only the CI snapshot's linux/amd64 binary. A tag run, the other three targets
+and the image binary that ko builds are never checked, so a change that dirties
+the tree only in `release.yml` (a step that writes a file before goreleaser)
+would publish and sign dirty binaries with nothing going red. Today
+`release.yml` writes nothing into the tree.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
+### Deterministic build info (`-buildvcs=false`)
+
+**What:** Decide whether to add `flags: [-buildvcs=false]` to the `descry`
+build in `.goreleaser.yaml` (ko reuses the build's flags when its `kos` entry
+sets none), with a guard test that the flag stays and no `kos` entry drops it.
+
+**Why:** Go stamps the module version from the highest semver tag at HEAD and
+ignores `GORELEASER_CURRENT_TAG`. If v0.5.1 is tagged on the commit v0.5.0
+points at, a re-run of v0.5.0 builds a binary stamped v0.5.1, so it pushes a
+new `:v0.5.0` digest and moves `:latest`. Today only practice prevents it:
+`release.yml` says to patch forward rather than re-run once a newer tag
+exists. `-buildvcs=false` makes the build info the same whatever the git
+state.
+
+**Cost:** The main module then reads `(devel)` and the `vcs.revision`,
+`vcs.time` and `vcs.modified` lines disappear from `go version -m` and from
+the image's SPDX SBOM. `descry --version` and `descry_build_info` keep the
+version and commit, since they come from ldflags. It also replaces today's
+dirty-build guard: with no stamp left, the release-check step "snapshot binary
+is not stamped dirty" fails every run, and `TestReleaseBinariesNotDirty` and
+`TestReleaseDirtyCheckScript` (its "no vcs stamp" case) must change with it.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 ### Harden the release guard tests
 
-**What:** Three gaps in `cmd/descry/release_test.go` let a broken release
+**What:** Five gaps in `cmd/descry/release_test.go` let a broken release
 config pass every guard:
 
 - Require a fixed concurrency group, a literal with no `${{`. A per-ref group
@@ -417,6 +469,15 @@ config pass every guard:
 - Tie the README identity guard to the full
   `https://github.com/fairbearlab/descry/.github/workflows/release.yml@refs/tags/`
   prefix.
+- Fail if the release-check step "snapshot binary is not stamped dirty", or
+  its job, sets `if:` or `continue-on-error`. Either switches the dirty-build
+  check off while `TestReleaseBinariesNotDirty` and
+  `TestReleaseDirtyCheckScript` stay green, since they read only the step's
+  `run:` text.
+- Ask git whether `dist/` is ignored (`git check-ignore` on a `dist/` path in a
+  temp repo with the repository's `.gitignore`) instead of parsing it.
+  `TestReleaseBinariesNotDirty` only reads lines that are exactly `dist`, so a
+  later broad negation such as `!*` passes it, and a valid `/dist/**` fails it.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
