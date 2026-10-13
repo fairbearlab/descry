@@ -44,7 +44,8 @@ state keyed by target.
 
 **Context:** 2026-10-11 — the `metrics/` collector caches one set of per-target children
 per raw target URL and never drops them. A plain `DeleteLabelValues` is not enough: the
-`url` label is shared (targets that differ only in query or fragment, every
+`url` label is shared (targets that differ only in userinfo, query, fragment or
+normalisation such as `https://h` and `https://h/`, every
 `<unparseable>` URL, and duplicate entries of one URL all map to one label), so the
 delete must wait until no remaining target maps to the label, must evict or rebuild the
 affected cache entries in the same step, and must not race a removed target's in-flight
