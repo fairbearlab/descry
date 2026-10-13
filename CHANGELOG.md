@@ -96,8 +96,9 @@ Pre-1.0, the minor version carries breaking changes.
   kustomization, limits the metrics port to the scraper and egress to DNS and
   ports 80 and 443 outside the special-purpose ranges (adapt it with the
   cluster's own Service and pod ranges where those are public, and for
-  NodeLocal DNSCache). No image is published yet: the README builds one
-  locally with ko and walks through trying it on a kind cluster. It also notes
+  NodeLocal DNSCache). The kustomization pins the image tag `v0.5.0`, the
+  first release that publishes it; the README also builds one locally with ko
+  and walks through trying it on a kind cluster. It also notes
   the limits that matter in a cluster: the dial guard refuses in-cluster
   Services only where the Service range is private (kind, kubeadm, EKS; not
   GKE's default public range), it refuses ports other than 80 and 443, and the
@@ -105,6 +106,21 @@ Pre-1.0, the minor version carries breaking changes.
   `kubectl kustomize` and validates it, and the NetworkPolicy, with
   `kubeconform -strict` (pinned binaries, checked by sha256, and schemas
   pinned to one commit).
+
+- **Container image: `ghcr.io/fairbearlab/descry`, starting with this
+  release.** The release workflow builds it with ko on a distroless static
+  nonroot base (pinned by digest) for linux/amd64 and linux/arm64, with an
+  SPDX SBOM and OCI labels. It is tagged with the release tag, `v` included,
+  so it matches `newTag` in `examples/kubernetes/kustomization.yaml`; final
+  releases also move `latest`. The CI `release-check` snapshot builds the
+  image locally on every pull request without pushing it.
+
+- **Signed releases.** The image (in the registry: its index and each
+  per-platform manifest) and the checksums file (a `.sigstore.json` bundle on
+  the release) are signed with cosign keyless signing from the release
+  workflow's GitHub OIDC identity. README.md has the `cosign verify` and
+  `cosign verify-blob` commands, pinned to `.github/workflows/release.yml` at
+  the tag, and says to deploy the image by its verified digest.
 
 ### Changed
 
@@ -124,6 +140,10 @@ Pre-1.0, the minor version carries breaking changes.
   A target whose subject renders as `<unparseable>` (and has no `url` label)
   gets a startup WARN that names its config position rather than its URL.
   `source` and `data.extra.body` are not rewritten.
+
+- **`descry --version` prints the commit date, not the build time.** Release
+  builds stamp the tagged commit's date, so a re-run of the release for the
+  same tag builds identical binaries and image digests.
 
 ## [0.4.0] — 2026-10-11
 

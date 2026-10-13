@@ -9,11 +9,13 @@ builds:
     env: [CGO_ENABLED=0]
     goos: [linux, darwin]
     goarch: [amd64, arm64]
+    # main.date is the commit date, not the build time, so a re-run of the
+    # same tag builds identical binaries and image digests.
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
       - -X main.commit={{.Commit}}
-      - -X main.date={{.Date}}
+      - -X main.date={{.CommitDate}}
 archives:
   - name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ title .Os }}_
@@ -26,3 +28,46 @@ snapshot:
 release:
   prerelease: auto
   mode: replace
+# The container image. ko reuses the descry build above (main, env, ldflags)
+# and builds its own platforms. bare keeps the image name exactly the
+# repository, and the version tag is {{ .Tag }}, with the v, to match newTag
+# in examples/kubernetes/kustomization.yaml ({{ .Version }} drops the v).
+# latest renders empty on prereleases, and ko drops empty tags. To bump the
+# base, take the index digest from
+# `docker buildx imagetools inspect gcr.io/distroless/static-debian13:nonroot`.
+kos:
+  - id: descry
+    build: descry
+    repositories: [ghcr.io/fairbearlab/descry]
+    base_image: gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+    platforms: [linux/amd64, linux/arm64]
+    bare: true
+    sbom: spdx
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    creation_time: "{{ .CommitTimestamp }}"
+    ko_data_creation_time: "{{ .CommitTimestamp }}"
+    labels:
+      org.opencontainers.image.source: https://github.com/fairbearlab/descry
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.licenses: Apache-2.0
+# Keyless cosign signing from the release workflow's OIDC identity: the
+# checksums file gets a .sigstore.json bundle uploaded to the release, and
+# the image is signed in the registry by digest. --recursive signs the index
+# and each per-platform manifest in it, so a platform image pulled by its own
+# digest verifies too.
+signs:
+  - id: checksums
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+    output: true
+docker_signs:
+  - id: images
+    cmd: cosign
+    artifacts: manifests
+    args: ["sign", "--recursive", "${artifact}@${digest}", "--yes"]
+    output: true

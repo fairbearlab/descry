@@ -31,6 +31,61 @@ As a library:
 go get github.com/fairbearlab/descry
 ```
 
+As a container image, from v0.5.0: `ghcr.io/fairbearlab/descry:<tag>`, where
+`<tag>` is the release tag with its `v` (`v0.5.0`). It is a distroless static
+image for linux/amd64 and linux/arm64 that runs as a non-root user, with an
+SPDX SBOM attached (the SBOM is not signed; the signature below covers the
+image); final releases also move `latest`.
+[`examples/kubernetes/`](examples/kubernetes/) runs it in a cluster.
+
+### Verify a release
+
+From v0.5.0, the release workflow signs the image and the checksums file
+with [cosign](https://docs.sigstore.dev/) keyless signing, so a signature
+proves the file was produced by `.github/workflows/release.yml` running for
+that tag in this repository. With cosign v3, for a release `v0.5.0`:
+
+```bash
+cosign verify ghcr.io/fairbearlab/descry:v0.5.0 \
+  --certificate-identity 'https://github.com/fairbearlab/descry/.github/workflows/release.yml@refs/tags/v0.5.0' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+```
+
+A tag can be moved, so deploy by the digest you verified, not by the tag.
+Resolve the tag once:
+
+```bash
+docker buildx imagetools inspect ghcr.io/fairbearlab/descry:v0.5.0 --format '{{.Manifest.Digest}}'
+```
+
+then run the `cosign verify` above on `ghcr.io/fairbearlab/descry@sha256:<digest>`
+and deploy that reference (in a kustomization, `digest:` in place of
+`newTag`). `cosign verify` also prints the digest it checked, as
+`critical.image.docker-manifest-digest`. The index and each per-platform
+manifest are signed, so a single platform's digest verifies too.
+
+For the release archives, download `descry_0.5.0_checksums.txt` and
+`descry_0.5.0_checksums.txt.sigstore.json` from the release next to the
+archives (the file names carry the version without the `v`), verify the
+checksums file, then the archives against it:
+
+```bash
+cosign verify-blob \
+  --certificate-identity 'https://github.com/fairbearlab/descry/.github/workflows/release.yml@refs/tags/v0.5.0' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  --bundle descry_0.5.0_checksums.txt.sigstore.json descry_0.5.0_checksums.txt &&
+  shasum -a 256 --check --ignore-missing descry_0.5.0_checksums.txt
+```
+
+Look for the `<archive>: OK` line for the archive you downloaded. `shasum`
+fails with "no file was verified" if the archive is missing or renamed, where
+macOS's `sha256sum` exits 0 and prints nothing.
+
+These are cosign v3 signatures: the image's are stored as OCI referrers and
+the checksums file's as a Sigstore bundle, which cosign v2 and older
+verifiers may report as missing, so use cosign v3.x. Releases before v0.5.0
+are not signed.
+
 ## Design
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the producer/consumer seam
@@ -160,9 +215,10 @@ descry with `--listen` in a Kubernetes cluster are in
 
 ## Version
 
-`descry --version` prints version, commit, and build date. Release builds stamp
-them via `-ldflags -X main.version=…` (see `.goreleaser.yaml`); a plain
-`go build` reports the `dev` defaults.
+`descry --version` prints version, commit, and commit date (not the build
+time, so a rebuild of a tag is identical). Release builds stamp them via
+`-ldflags -X main.version=…` (see `.goreleaser.yaml`); a plain `go build`
+reports the `dev` defaults.
 
 ## HTTP check options
 
