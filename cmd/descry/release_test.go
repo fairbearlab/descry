@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"slices"
@@ -174,8 +175,8 @@ func readYAML(t *testing.T, path string, v any) {
 	}
 }
 
-// Value: protects=keyless signing can run on a tag: OIDC and packages write only on the release job, cache off, signs by digest with --bundle and --yes, no --skip or --snapshot
-// fails_when=id-token or packages dropped, workflow-wide write added, cache re-enabled, the trigger is not tags v*, the run is not a plain release (skip, snapshot, other config), a cosign flag dropped, or image signed by tag
+// Value: protects=keyless signing can run on a tag: OIDC and packages write only on the release job, cache off, signs by digest with --bundle and --yes, the image index and each platform manifest, no --skip or --snapshot
+// fails_when=id-token or packages dropped, workflow-wide write added, cache re-enabled, the trigger is not tags v*, the run is not a plain release (skip, snapshot, other config), a cosign flag dropped (--recursive included), or image signed by tag
 // why_new=signing and the GHCR push run only on a tag, so a missing permission shows up at release time, not in CI
 // seam=none; no_claim=does not run cosign or push; a real tag is the end-to-end check
 func TestReleaseSigningContract(t *testing.T) {
@@ -200,9 +201,11 @@ func TestReleaseSigningContract(t *testing.T) {
 		!containsAll(gr.Signs[0].Args, "sign-blob", "--bundle=${signature}", "${artifact}", "--yes") {
 		t.Errorf("signs %+v: want one cosign sign-blob of the checksum file into a .sigstore.json bundle, as README.md verifies", gr.Signs)
 	}
+	// --recursive also signs each per-platform manifest, so an image pulled by
+	// its platform digest verifies as well as one pulled by the index digest.
 	if len(gr.DockerSigns) != 1 || gr.DockerSigns[0].Cmd != "cosign" || gr.DockerSigns[0].Artifacts != "manifests" ||
-		!containsAll(gr.DockerSigns[0].Args, "sign", "${artifact}@${digest}", "--yes") {
-		t.Errorf("docker_signs %+v: want one cosign signature of the manifest list by digest, so the tag README.md verifies resolves to it", gr.DockerSigns)
+		!containsAll(gr.DockerSigns[0].Args, "sign", "--recursive", "${artifact}@${digest}", "--yes") {
+		t.Errorf("docker_signs %+v: want one recursive cosign signature of the manifest list by digest, so the tag README.md verifies resolves to it and each platform manifest is signed", gr.DockerSigns)
 	}
 
 	var wf struct {
@@ -286,5 +289,102 @@ func TestReleaseCheckBuildsImage(t *testing.T) {
 	}
 	if !snapshot {
 		t.Error("release-check has no goreleaser --snapshot step")
+	}
+}
+
+// Value: protects=CI's release-check runs the exact goreleaser a tag releases with
+// fails_when=a goreleaser-action step in release.yml or ci.yml has no version, a range (~>, ^, latest), or a version the other steps do not, or either file has no such step
+// why_new=with a range, a tag can release with a goreleaser that CI never checked the config against
+// seam=none; no_claim=does not check that the version exists or is current
+func TestGoreleaserVersionPinned(t *testing.T) {
+	exact := regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+	versions := map[string][]string{} // version -> the steps that use it
+	for _, path := range []string{"../../.github/workflows/release.yml", "../../.github/workflows/ci.yml"} {
+		var wf struct {
+			Jobs map[string]struct {
+				Steps []struct {
+					Uses string         `yaml:"uses"`
+					With map[string]any `yaml:"with"`
+				} `yaml:"steps"`
+			} `yaml:"jobs"`
+		}
+		readYAML(t, path, &wf)
+		n := 0
+		for job, j := range wf.Jobs {
+			for i, st := range j.Steps {
+				if name, _, _ := strings.Cut(st.Uses, "@"); name != "goreleaser/goreleaser-action" {
+					continue
+				}
+				n++
+				v, _ := st.With["version"].(string)
+				if !exact.MatchString(v) {
+					t.Errorf("%s job %s step %d: goreleaser version %q, want an exact vX.Y.Z", path, job, i, st.With["version"])
+					continue
+				}
+				versions[v] = append(versions[v], fmt.Sprintf("%s job %s step %d", path, job, i))
+			}
+		}
+		if n == 0 {
+			t.Errorf("%s has no goreleaser-action step", path)
+		}
+	}
+	if len(versions) > 1 {
+		t.Errorf("goreleaser versions differ across steps %v: CI must check the version a tag releases with; bump them together", versions)
+	}
+}
+
+// Value: protects=README.md's verify commands name the release the Kubernetes example deploys
+// fails_when=the Verify a release section's certificate identity ref, image tag, or checksum file names name a release other than newTag, or one of them is missing
+// why_new=the commands are prose that no build reads; a stale ref verifies against an identity no current release has
+// seam=none; no_claim=does not run cosign or check that the release exists
+func TestReadmeVerifyMatchesKustomization(t *testing.T) {
+	var kz struct {
+		Images []struct {
+			Name   string `yaml:"name"`
+			NewTag string `yaml:"newTag"`
+		} `yaml:"images"`
+	}
+	readYAML(t, "../../examples/kubernetes/kustomization.yaml", &kz)
+	if len(kz.Images) != 1 {
+		t.Fatalf("kustomization.yaml: want 1 images entry, got %d", len(kz.Images))
+	}
+	img := kz.Images[0]
+	ver := strings.TrimPrefix(img.NewTag, "v")
+
+	raw, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	const heading = "### Verify a release\n"
+	_, sec, ok := strings.Cut(string(raw), heading)
+	if !ok {
+		t.Fatalf("README.md has no %q section", strings.TrimSpace(heading))
+	}
+	if end := regexp.MustCompile(`(?m)^#{2,3} `).FindStringIndex(sec); end != nil {
+		sec = sec[:end[0]]
+	}
+
+	// Each literal must appear, and every release it names in the section must
+	// be newTag, so a half-bumped section fails too.
+	checks := []struct {
+		what string
+		re   *regexp.Regexp
+		want string
+	}{
+		{"--certificate-identity ref", regexp.MustCompile(`release\.yml@refs/tags/([^'"\s]+)`), img.NewTag},
+		{"image reference tag", regexp.MustCompile(regexp.QuoteMeta(img.Name) + `:([^\s'"]+)`), img.NewTag},
+		{"checksums file name", regexp.MustCompile(`descry_([^_\s]+)_checksums\.txt`), ver},
+		{"checksums bundle name", regexp.MustCompile(`descry_([^_\s]+)_checksums\.txt\.sigstore\.json`), ver},
+	}
+	for _, c := range checks {
+		m := c.re.FindAllStringSubmatch(sec, -1)
+		if len(m) == 0 {
+			t.Errorf("README.md Verify a release: no %s matching %s; update README.md when bumping newTag (%s)", c.what, c.re, img.NewTag)
+		}
+		for _, got := range m {
+			if got[1] != c.want {
+				t.Errorf("README.md Verify a release: %s %q names %q, want %q from kustomization newTag %s; update README.md when bumping newTag", c.what, got[0], got[1], c.want, img.NewTag)
+			}
+		}
 	}
 }

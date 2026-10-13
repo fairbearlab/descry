@@ -51,6 +51,19 @@ cosign verify ghcr.io/fairbearlab/descry:v0.5.0 \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
 
+A tag can be moved, so deploy by the digest you verified, not by the tag.
+Resolve the tag once:
+
+```bash
+docker buildx imagetools inspect ghcr.io/fairbearlab/descry:v0.5.0 --format '{{.Manifest.Digest}}'
+```
+
+then run the `cosign verify` above on `ghcr.io/fairbearlab/descry@sha256:<digest>`
+and deploy that reference (in a kustomization, `digest:` in place of
+`newTag`). `cosign verify` also prints the digest it checked, as
+`critical.image.docker-manifest-digest`. The index and each per-platform
+manifest are signed, so a single platform's digest verifies too.
+
 For the release archives, download `descry_0.5.0_checksums.txt` and
 `descry_0.5.0_checksums.txt.sigstore.json` from the release next to the
 archives (the file names carry the version without the `v`), verify the
@@ -195,9 +208,10 @@ descry with `--listen` in a Kubernetes cluster are in
 
 ## Version
 
-`descry --version` prints version, commit, and build date. Release builds stamp
-them via `-ldflags -X main.version=…` (see `.goreleaser.yaml`); a plain
-`go build` reports the `dev` defaults.
+`descry --version` prints version, commit, and commit date (not the build
+time, so a rebuild of a tag is identical). Release builds stamp them via
+`-ldflags -X main.version=…` (see `.goreleaser.yaml`); a plain `go build`
+reports the `dev` defaults.
 
 ## HTTP check options
 

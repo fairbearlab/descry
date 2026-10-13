@@ -393,6 +393,20 @@ is published, also reword the walkthrough's "Until that release exists".
 
 **Effort:** S · **Priority:** P1 · **Depends on:** the v0.5.0 release
 
+### Protect release tags with a ruleset
+
+**What:** Add a repository tag ruleset on `v*` that blocks updates and
+deletions and restricts creation to the maintainers who cut releases. This is
+a repository setting the owner applies; nothing in the tree enforces it.
+
+**Why:** Any pushed `v*` tag runs `release.yml`, and that run gets a valid
+keyless signature for `release.yml@refs/tags/<tag>`, the identity README.md's
+"Verify a release" pins. Tags are mutable: without the ruleset, anyone who can
+push a tag can create one or move an existing one to another commit, and the
+release it publishes still verifies.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
 ### Verify Scorecard credits the signed releases
 
 **What:** After v0.5.0, check the OpenSSF Scorecard result for this

@@ -86,7 +86,9 @@ jobs:
   # and linux/arm64 images and loads the linux/amd64 one into the runner's
   # Docker daemon under goreleaser.ko.local (the daemon publisher loads a
   # single platform). That is the only check of the image config before a
-  # tag. The push and the cosign signatures first run on a tag.
+  # tag. The push and the cosign signatures first run on a tag. Both steps
+  # pin the exact goreleaser release.yml runs, so CI checks the same one a
+  # tag releases with; bump all three together.
   release-check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -100,11 +102,11 @@ jobs:
           cache: true
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          version: v2.18.3
           args: check
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          version: v2.18.3
           args: release --snapshot --clean --skip=publish,sign
   # The alerting rules ship as a PrometheusRule CR, which promtool cannot read,
   # so the job extracts the plain rule groups with yq and runs promtool on

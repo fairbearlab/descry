@@ -115,11 +115,12 @@ Pre-1.0, the minor version carries breaking changes.
   releases also move `latest`. The CI `release-check` snapshot builds the
   image locally on every pull request without pushing it.
 
-- **Signed releases.** The image (in the registry) and the checksums file (a
-  `.sigstore.json` bundle on the release) are signed with cosign keyless
-  signing from the release workflow's GitHub OIDC identity. README.md has the
-  `cosign verify` and `cosign verify-blob` commands, pinned to
-  `.github/workflows/release.yml` at the tag.
+- **Signed releases.** The image (in the registry: its index and each
+  per-platform manifest) and the checksums file (a `.sigstore.json` bundle on
+  the release) are signed with cosign keyless signing from the release
+  workflow's GitHub OIDC identity. README.md has the `cosign verify` and
+  `cosign verify-blob` commands, pinned to `.github/workflows/release.yml` at
+  the tag, and says to deploy the image by its verified digest.
 
 ### Changed
 
@@ -139,6 +140,10 @@ Pre-1.0, the minor version carries breaking changes.
   A target whose subject renders as `<unparseable>` (and has no `url` label)
   gets a startup WARN that names its config position rather than its URL.
   `source` and `data.extra.body` are not rewritten.
+
+- **`descry --version` prints the commit date, not the build time.** Release
+  builds stamp the tagged commit's date, so a re-run of the release for the
+  same tag builds identical binaries and image digests.
 
 ## [0.4.0] — 2026-10-11
 
