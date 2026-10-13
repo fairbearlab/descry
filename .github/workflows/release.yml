@@ -44,3 +44,8 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Release the tag that was pushed. Otherwise goreleaser takes the
+          # highest tag pointing at HEAD, so a re-run of an older tag on a
+          # commit carrying two tags would publish under the newer one while
+          # signing as the older ref.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}

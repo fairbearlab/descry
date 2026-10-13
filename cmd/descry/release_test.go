@@ -175,8 +175,8 @@ func readYAML(t *testing.T, path string, v any) {
 	}
 }
 
-// Value: protects=keyless signing can run on a tag: OIDC and packages write only on the release job, cache off, signs by digest with --bundle and --yes, the image index and each platform manifest, no --skip or --snapshot
-// fails_when=id-token or packages dropped, workflow-wide write added, cache re-enabled, the trigger is not tags v*, the run is not a plain release (skip, snapshot, other config), a cosign flag dropped (--recursive included), or image signed by tag
+// Value: protects=keyless signing can run on a tag: OIDC and packages write only on the release job, cache off, signs by digest with --bundle and --yes, the image index and each platform manifest, no --skip or --snapshot, the pushed tag is the one released, runs serialized, setup steps before goreleaser
+// fails_when=id-token or packages dropped, workflow-wide write added, another job gets id-token write, cache re-enabled, the trigger is not tags v*, the run is not a plain release (skip, snapshot, other config), GORELEASER_CURRENT_TAG is not the pushed ref, concurrency group dropped or cancel-in-progress not false, a setup step runs after goreleaser, a cosign flag dropped (--recursive included), or image signed by tag
 // why_new=signing and the GHCR push run only on a tag, so a missing permission shows up at release time, not in CI
 // seam=none; no_claim=does not run cosign or push; a real tag is the end-to-end check
 func TestReleaseSigningContract(t *testing.T) {
@@ -211,17 +211,18 @@ func TestReleaseSigningContract(t *testing.T) {
 	var wf struct {
 		On          map[string]map[string][]string `yaml:"on"`
 		Permissions map[string]string              `yaml:"permissions"`
-		Jobs        struct {
-			Release struct {
-				Permissions map[string]string `yaml:"permissions"`
-				Steps       []struct {
-					Uses string         `yaml:"uses"`
-					With map[string]any `yaml:"with"`
-				} `yaml:"steps"`
-			} `yaml:"release"`
+		Concurrency any                            `yaml:"concurrency"`
+		Jobs        map[string]struct {
+			Permissions map[string]string `yaml:"permissions"`
+			Steps       []struct {
+				Uses string            `yaml:"uses"`
+				With map[string]any    `yaml:"with"`
+				Env  map[string]string `yaml:"env"`
+			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
 	readYAML(t, "../../.github/workflows/release.yml", &wf)
+	release := wf.Jobs["release"]
 	// The signing identity README.md verifies is release.yml@refs/tags/<tag>;
 	// any other trigger would sign under a different ref.
 	if len(wf.On) != 1 || len(wf.On["push"]) != 1 || !slices.Equal(wf.On["push"]["tags"], []string{"v*"}) {
@@ -231,14 +232,31 @@ func TestReleaseSigningContract(t *testing.T) {
 		t.Errorf("workflow permissions %v: want only contents: read, with writes granted on the release job", wf.Permissions)
 	}
 	for _, p := range []string{"contents", "packages", "id-token"} {
-		if wf.Jobs.Release.Permissions[p] != "write" {
-			t.Errorf("release job permission %s = %q, want write (release, GHCR push, keyless OIDC)", p, wf.Jobs.Release.Permissions[p])
+		if release.Permissions[p] != "write" {
+			t.Errorf("release job permission %s = %q, want write (release, GHCR push, keyless OIDC)", p, release.Permissions[p])
 		}
 	}
-	seen := map[string]bool{}
-	for _, st := range wf.Jobs.Release.Steps {
+	// Any job with id-token: write can mint a token for the identity README.md
+	// verifies, so only the release job may hold it.
+	var oidc []string
+	for name, j := range wf.Jobs {
+		if j.Permissions["id-token"] == "write" {
+			oidc = append(oidc, name)
+		}
+	}
+	slices.Sort(oidc)
+	if !slices.Equal(oidc, []string{"release"}) {
+		t.Errorf("jobs with id-token: write %q, want exactly the release job", oidc)
+	}
+	// Two tag runs at once could each push latest, and the older one can land
+	// last. A run cancelled mid-publish leaves a half-pushed release.
+	if c, _ := wf.Concurrency.(map[string]any); c == nil || c["group"] == nil || c["group"] == "" || c["cancel-in-progress"] != false {
+		t.Errorf("release.yml concurrency %v: want a group with cancel-in-progress: false, so tag runs never overlap or cancel one mid-publish", wf.Concurrency)
+	}
+	seen := map[string]int{} // step name -> its index in the release job
+	for i, st := range release.Steps {
 		name, _, _ := strings.Cut(st.Uses, "@")
-		seen[name] = true
+		seen[name] = i
 		switch name {
 		case "actions/setup-go":
 			if st.With["cache"] != false {
@@ -251,11 +269,24 @@ func TestReleaseSigningContract(t *testing.T) {
 			if r := parseGoreleaserArgs(args); r.sub != "release" || len(r.skips) > 0 || r.snapshot || r.config {
 				t.Errorf("goreleaser args %q: want release with no --skip, --snapshot or --config; a tag must publish and sign", args)
 			}
+			// Without it goreleaser releases the highest tag at HEAD, which
+			// need not be the ref the signing identity names.
+			if got := st.Env["GORELEASER_CURRENT_TAG"]; got != "${{ github.ref_name }}" {
+				t.Errorf("goreleaser env GORELEASER_CURRENT_TAG = %q, want ${{ github.ref_name }}, the tag that was pushed", got)
+			}
 		}
 	}
-	for _, name := range []string{"sigstore/cosign-installer", "docker/login-action", "actions/setup-go", "goreleaser/goreleaser-action"} {
-		if !seen[name] {
+	gi, ok := seen["goreleaser/goreleaser-action"]
+	if !ok {
+		t.Error("release job has no goreleaser/goreleaser-action step")
+	}
+	for _, name := range []string{"actions/checkout", "actions/setup-go", "sigstore/cosign-installer", "docker/login-action"} {
+		i, found := seen[name]
+		switch {
+		case !found:
 			t.Errorf("release job has no %s step", name)
+		case ok && i > gi:
+			t.Errorf("release job step %s (step %d) runs after goreleaser (step %d); goreleaser needs it set up first", name, i, gi)
 		}
 	}
 }
@@ -333,8 +364,8 @@ func TestGoreleaserVersionPinned(t *testing.T) {
 	}
 }
 
-// Value: protects=README.md's verify commands name the release the Kubernetes example deploys
-// fails_when=the Verify a release section's certificate identity ref, image tag, or checksum file names name a release other than newTag, or one of them is missing
+// Value: protects=README.md's verify commands name the release the Kubernetes example deploys, and the checksum files the release uploads
+// fails_when=the Verify a release section's certificate identity ref, image tag, or checksum file names name a release other than newTag, or one of them is missing; .goreleaser.yaml renames the checksums file or its bundle without README.md; the checksum name_template or signature changes shape
 // why_new=the commands are prose that no build reads; a stale ref verifies against an identity no current release has
 // seam=none; no_claim=does not run cosign or check that the release exists
 func TestReadmeVerifyMatchesKustomization(t *testing.T) {
@@ -350,6 +381,37 @@ func TestReadmeVerifyMatchesKustomization(t *testing.T) {
 	}
 	img := kz.Images[0]
 	ver := strings.TrimPrefix(img.NewTag, "v")
+
+	// The checksum file names come from .goreleaser.yaml, so README.md must
+	// name the files a release uploads, not just a consistent version.
+	var gr struct {
+		ProjectName string `yaml:"project_name"`
+		Checksum    struct {
+			NameTemplate string `yaml:"name_template"`
+		} `yaml:"checksum"`
+		Signs []struct {
+			Signature string `yaml:"signature"`
+		} `yaml:"signs"`
+	}
+	readYAML(t, "../../.goreleaser.yaml", &gr)
+	// Render {{ .ProjectName }} and split at {{ .Version }}; the version is
+	// what each match below captures. Any other template action is a shape
+	// this test does not render.
+	tmpl := strings.NewReplacer(" ", "", "\t", "").Replace(gr.Checksum.NameTemplate)
+	pre, post, ok := strings.Cut(strings.ReplaceAll(tmpl, "{{.ProjectName}}", gr.ProjectName), "{{.Version}}")
+	if gr.ProjectName == "" || !ok || strings.Contains(pre+post, "{{") {
+		t.Fatalf(".goreleaser.yaml checksum.name_template %q (project_name %q): want only {{ .ProjectName }} and one {{ .Version }}; update this test for the new shape", gr.Checksum.NameTemplate, gr.ProjectName)
+	}
+	if len(gr.Signs) != 1 {
+		t.Fatalf(".goreleaser.yaml: want 1 signs entry, got %d", len(gr.Signs))
+	}
+	bundle, ok := strings.CutPrefix(gr.Signs[0].Signature, "${artifact}")
+	if !ok || bundle == "" || strings.ContainsAny(bundle, "${}") {
+		t.Fatalf(".goreleaser.yaml signs signature %q: want ${artifact} plus a fixed suffix; update this test for the new shape", gr.Signs[0].Signature)
+	}
+	checksums := func(suffix string) *regexp.Regexp {
+		return regexp.MustCompile(regexp.QuoteMeta(pre) + `([^_\s]+)` + regexp.QuoteMeta(post+suffix))
+	}
 
 	raw, err := os.ReadFile("../../README.md")
 	if err != nil {
@@ -373,8 +435,8 @@ func TestReadmeVerifyMatchesKustomization(t *testing.T) {
 	}{
 		{"--certificate-identity ref", regexp.MustCompile(`release\.yml@refs/tags/([^'"\s]+)`), img.NewTag},
 		{"image reference tag", regexp.MustCompile(regexp.QuoteMeta(img.Name) + `:([^\s'"]+)`), img.NewTag},
-		{"checksums file name", regexp.MustCompile(`descry_([^_\s]+)_checksums\.txt`), ver},
-		{"checksums bundle name", regexp.MustCompile(`descry_([^_\s]+)_checksums\.txt\.sigstore\.json`), ver},
+		{"checksums file name", checksums(""), ver},
+		{"checksums bundle name", checksums(bundle), ver},
 	}
 	for _, c := range checks {
 		m := c.re.FindAllStringSubmatch(sec, -1)
