@@ -417,33 +417,34 @@ func TestReleaseDirtyCheckScript(t *testing.T) {
 			t.Skipf("%s not found, which the step needs: %v", tool, err)
 		}
 	}
-	// go test puts its own GOROOT/bin first on PATH, so this is the toolchain
-	// running the test.
-	goBin, err := exec.LookPath("go")
+	// go test puts its own GOROOT/bin first on PATH. The builds below use that
+	// toolchain's binary directly, not a version-manager shim, which would
+	// need the HOME the children do not get.
+	goEnv, err := exec.Command("go", "env", "GOROOT", "GOCACHE").Output()
 	if err != nil {
-		t.Fatalf("go not found on PATH under go test: %v", err)
+		t.Fatalf("go env GOROOT GOCACHE: %v", err)
 	}
+	goroot, gocache, _ := strings.Cut(strings.TrimSpace(string(goEnv)), "\n")
+	goBin := filepath.Join(goroot, "bin", "go")
 
-	// Isolate git from the user's config (signing, hooks, default branch) and
-	// from inherited GIT_* variables: a git hook exports GIT_DIR and
-	// GIT_INDEX_FILE, which would point the commands below at another repo.
-	// BASH_ENV and ENV would make bash source a file before the script. GOENV=off
-	// keeps the user's go env file (a GOFLAGS=-buildvcs=false there, say) out of
-	// the builds, since an empty GOFLAGS falls back to it.
-	gitCfg := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(gitCfg, nil, 0o600); err != nil {
-		t.Fatalf("write %s: %v", gitCfg, err)
-	}
+	// The child processes get only the environment built here, not the
+	// test's: a git hook exports GIT_DIR and GIT_INDEX_FILE, which would point
+	// git at another repo; BASH_ENV and exported functions run code inside
+	// bash -c; a git config or global ignore under the user's HOME could hide
+	// the untracked file; and GOFLAGS, or the go env file (GOENV=off), could
+	// add -buildvcs=false. HOME is an empty directory, so git reads no user
+	// config, and GOCACHE stays the test's own so the builds stay warm.
 	repo := t.TempDir()
-	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "GIT_") || strings.HasPrefix(kv, "BASH_ENV=") || strings.HasPrefix(kv, "ENV=")
-	})
-	env = append(env,
-		"PATH="+filepath.Dir(goBin)+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"GIT_CONFIG_GLOBAL="+gitCfg, "GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CEILING_DIRECTORIES="+filepath.Dir(repo),
-		"CGO_ENABLED=0", "GOFLAGS=", "GOENV=off", "GOWORK=off", "GOTOOLCHAIN=local",
-	)
+	env := []string{
+		"PATH=" + filepath.Dir(goBin) + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HOME=" + t.TempDir(),
+		"GOCACHE=" + gocache,
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CEILING_DIRECTORIES=" + filepath.Dir(repo),
+		"CGO_ENABLED=0", "GOENV=off", "GOWORK=off", "GOTOOLCHAIN=local",
+	}
+	if tmp := os.Getenv("TMPDIR"); tmp != "" {
+		env = append(env, "TMPDIR="+tmp)
+	}
 
 	run := func(name string, args ...string) (string, error) {
 		cmd := exec.Command(name, args...) // #nosec G204 -- test-owned go, git and bash, run on the ci.yml step script in a t.TempDir repo
@@ -462,7 +463,7 @@ func TestReleaseDirtyCheckScript(t *testing.T) {
 	write(t, "main.go", "package main\n\nfunc main() {}\n")
 	write(t, ".gitignore", "/dist/\n")
 	for _, args := range [][]string{
-		{"init", "-q"},
+		{"init", "-q", "--template="}, // no hooks from the system template dir
 		{"add", "-A"},
 		{"-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"},
 	} {
