@@ -38,13 +38,15 @@ go tool govulncheck ./...
 `go mod tidy -diff` fails on any go.mod/go.sum drift, so commit a tidy module
 file set. CI also runs a `release-check` job that validates `.goreleaser.yaml`
 (`goreleaser check`) and does a snapshot build with publishing and signing
-skipped, so a broken release config fails the PR instead of the tag. The
+skipped, so a broken release config fails the PR instead of the tag. The job
+also fails if the snapshot's linux/amd64 binary is stamped as a dirty build
+(anything but `vcs.modified=false` in `go version -m`). The
 snapshot still builds the container image with ko and loads it into the local
 Docker daemon as `goreleaser.ko.local`, so it needs a running Docker daemon;
 nothing is pushed or signed. If you change `.goreleaser.yaml`, `cmd/descry` or
 the build flags, run it locally (goreleaser v2.18.3, the version `ci.yml` and
-`release.yml` pin; it writes `dist/`, which is not gitignored, so delete it
-before committing, and remove the `goreleaser.ko.local` images when done):
+`release.yml` pin; it writes `dist/`, which is gitignored; remove the
+`goreleaser.ko.local` images when done):
 
 ```
 goreleaser check
