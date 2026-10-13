@@ -428,13 +428,16 @@ state.
 **Cost:** The main module then reads `(devel)` and the `vcs.revision`,
 `vcs.time` and `vcs.modified` lines disappear from `go version -m` and from
 the image's SPDX SBOM. `descry --version` and `descry_build_info` keep the
-version and commit, since they come from ldflags.
+version and commit, since they come from ldflags. It also replaces today's
+dirty-build guard: with no stamp left, the release-check step "snapshot binary
+is not stamped dirty" fails every run, and `TestReleaseBinariesNotDirty` and
+`TestReleaseDirtyCheckScript` (its "no vcs stamp" case) must change with it.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
 ### Harden the release guard tests
 
-**What:** Three gaps in `cmd/descry/release_test.go` let a broken release
+**What:** Four gaps in `cmd/descry/release_test.go` let a broken release
 config pass every guard:
 
 - Require a fixed concurrency group, a literal with no `${{`. A per-ref group
@@ -447,6 +450,11 @@ config pass every guard:
 - Tie the README identity guard to the full
   `https://github.com/fairbearlab/descry/.github/workflows/release.yml@refs/tags/`
   prefix.
+- Fail if the release-check step "snapshot binary is not stamped dirty", or
+  its job, sets `if:` or `continue-on-error`. Either switches the dirty-build
+  check off while `TestReleaseBinariesNotDirty` and
+  `TestReleaseDirtyCheckScript` stay green, since they read only the step's
+  `run:` text.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 

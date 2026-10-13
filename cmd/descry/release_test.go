@@ -3,7 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -373,6 +376,150 @@ func TestReleaseBinariesNotDirty(t *testing.T) {
 	case check < snap:
 		t.Errorf("release-check checks the binary's VCS stamp at step %d, before the snapshot builds it at step %d", check, snap)
 	}
+}
+
+// Value: protects=the release-check stamp script fails closed on a dirty, missing or unstamped binary and passes a clean one
+// fails_when=the grep is loosened (matches =true, loses its anchors, or greps only for vcs.modified), the check or its exit 1 is removed, or a missing binary stops failing the step
+// why_new=CI only ever runs the clean path, and TestReleaseBinariesNotDirty reads the script text, not what it does
+// seam=none; no_claim=does not run goreleaser or prove the CI runner's go and git behave like the local ones
+//
+// TestReleaseDirtyCheckScript runs the release-check step's own script in a
+// throwaway git repo, against a binary built from a clean tree, one built
+// with an untracked file present, one built with no VCS stamp, and no binary
+// at all. Only the clean one may pass, and the dirty and unstamped ones must
+// fail on the check itself (its ::error:: line), not on a crash.
+func TestReleaseDirtyCheckScript(t *testing.T) {
+	var ci struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string `yaml:"name"`
+				Run  string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	readYAML(t, "../../.github/workflows/ci.yml", &ci)
+	const stepName = "snapshot binary is not stamped dirty"
+	var script string
+	for _, st := range ci.Jobs["release-check"].Steps {
+		if st.Name == stepName {
+			script = st.Run
+		}
+	}
+	if strings.TrimSpace(script) == "" {
+		t.Fatalf("release-check has no %q step with a run script, so there is nothing to run", stepName)
+	}
+
+	if runtime.GOOS == "windows" {
+		t.Skip("the step is a bash script for the Linux runner")
+	}
+	for _, tool := range []string{"bash", "git"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not found, which the step needs: %v", tool, err)
+		}
+	}
+	// go test puts its own GOROOT/bin first on PATH, so this is the toolchain
+	// running the test.
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("go not found on PATH under go test: %v", err)
+	}
+
+	// Isolate git from the user's config (signing, hooks, default branch) and
+	// from inherited GIT_* variables: a git hook exports GIT_DIR and
+	// GIT_INDEX_FILE, which would point the commands below at another repo.
+	// BASH_ENV and ENV would make bash source a file before the script. GOENV=off
+	// keeps the user's go env file (a GOFLAGS=-buildvcs=false there, say) out of
+	// the builds, since an empty GOFLAGS falls back to it.
+	gitCfg := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(gitCfg, nil, 0o600); err != nil {
+		t.Fatalf("write %s: %v", gitCfg, err)
+	}
+	repo := t.TempDir()
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "GIT_") || strings.HasPrefix(kv, "BASH_ENV=") || strings.HasPrefix(kv, "ENV=")
+	})
+	env = append(env,
+		"PATH="+filepath.Dir(goBin)+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GIT_CONFIG_GLOBAL="+gitCfg, "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CEILING_DIRECTORIES="+filepath.Dir(repo),
+		"CGO_ENABLED=0", "GOFLAGS=", "GOENV=off", "GOWORK=off", "GOTOOLCHAIN=local",
+	)
+
+	run := func(name string, args ...string) (string, error) {
+		cmd := exec.Command(name, args...) // #nosec G204 -- test-owned go, git and bash, run on the ci.yml step script in a t.TempDir repo
+		cmd.Dir = repo
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	write := func(t *testing.T, name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write(t, "go.mod", "module example.com/stampcheck\n\ngo 1.21\n")
+	write(t, "main.go", "package main\n\nfunc main() {}\n")
+	write(t, ".gitignore", "/dist/\n")
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"add", "-A"},
+		{"-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"},
+	} {
+		if out, err := run("git", args...); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+
+	build := func(t *testing.T, flags ...string) {
+		t.Helper()
+		args := slices.Concat([]string{"build"}, flags, []string{"-o", "dist/descry_linux_amd64_v1/descry", "."})
+		if out, err := run(goBin, args...); err != nil {
+			t.Fatalf("go %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	reset := func(t *testing.T) {
+		t.Helper()
+		if err := os.RemoveAll(filepath.Join(repo, "dist")); err != nil {
+			t.Fatalf("remove dist: %v", err)
+		}
+	}
+
+	t.Run("clean", func(t *testing.T) {
+		reset(t)
+		build(t)
+		if out, err := run("bash", "-c", script); err != nil {
+			t.Errorf("step failed on a binary built from a clean tree: %v\n%s", err, out)
+		}
+	})
+	t.Run("untracked file", func(t *testing.T) {
+		reset(t)
+		// Go decides the stamp at build time, so the file only has to exist
+		// while the binary builds.
+		write(t, "untracked.txt", "x\n")
+		build(t)
+		if err := os.Remove(filepath.Join(repo, "untracked.txt")); err != nil {
+			t.Fatalf("remove untracked.txt: %v", err)
+		}
+		out, err := run("bash", "-c", script)
+		if err == nil || !strings.Contains(out, "::error::") {
+			t.Errorf("step on a binary stamped vcs.modified=true: err %v, want it to fail with ::error::\n%s", err, out)
+		}
+	})
+	t.Run("no vcs stamp", func(t *testing.T) {
+		reset(t)
+		build(t, "-buildvcs=false")
+		out, err := run("bash", "-c", script)
+		if err == nil || !strings.Contains(out, "::error::") {
+			t.Errorf("step on a binary with no VCS stamp: err %v, want it to fail with ::error::\n%s", err, out)
+		}
+	})
+	t.Run("missing binary", func(t *testing.T) {
+		reset(t)
+		if out, err := run("bash", "-c", script); err == nil {
+			t.Errorf("step passed with no binary in dist/; want it to fail\n%s", out)
+		}
+	})
 }
 
 // Value: protects=CI's release-check runs the exact goreleaser a tag releases with
