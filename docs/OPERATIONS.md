@@ -212,12 +212,14 @@ Per-target (labelled `url`; about seven series per target; dropped with
 | `descry_check_status_code{url}` | gauge | last HTTP status code; 0 when the request failed (no response, or a redirect refused by the SSRF guard or by the redirect limit: the check follows at most 4 redirects, and a 5th fails the run) or when the check returned an error |
 | `descry_check_latency_seconds{url}` | gauge | last run's latency, millisecond resolution; left as it was when the check returned an error |
 | `descry_check_last_run_timestamp_seconds{url}` | gauge | when the last run was observed (or when the check's error was recorded), unix seconds |
-| `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the final response's certificate, unix seconds; only for targets that report one (https). Absent until the first run that reports a certificate; after that it keeps its last value when a run reports none (a failed handshake, or any other run whose request failed: a timeout, a refused connection, an SSRF block, a 5th redirect), so read it together with `descry_check_up` or `last_run` |
+| `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the certificate of the final response after redirects, unix seconds; only for targets whose final response came over TLS (so an `http://` target that redirects to `https://` has it too). Absent until the first run that reports a certificate; after that it keeps its last value when a run reports none: a failed handshake, any other run whose request failed (a timeout, a refused connection, an SSRF block, a 5th redirect), and a successful run whose final response was plain HTTP, such as an `https://` target that redirects to `http://`, which keeps the old expiry while `descry_check_up` is 1. Read it together with `last_run` |
 | `descry_check_runs_total{url,status}` | counter | runs, `status` `up` or `down`; any run that was not up, including a check that returned an error, counts as `down` |
 
 A target's series appear on its first completed run, not at startup, so a
-target has none until its first check, up to one interval after start (see
-[First fire](#first-fire-is-up-to-one-interval-after-start)). That first run
+target has none until its first check finishes: that check starts up to one
+interval after start (see
+[First fire](#first-fire-is-up-to-one-interval-after-start)), later if it
+waits for a free worker, and can then run for up to `timeout`. That first run
 creates both `runs_total` values, the one that did not fire at 0, so a target
 whose first run fails makes `status="down"` appear at 1, which `increase()`
 does not count. A "check that returned an error" is only possible with a
@@ -281,15 +283,20 @@ same for the `descry` binary and for any program that uses
 by the engine: it sets each target's event subject to
 `metrics.TargetLabel` of the target URL, and renders `data.final_url` the
 same way before the event is built. A program that embeds `runner.New`
-directly publishes the `url` label it sets as `subject` (no subject if it
-sets none) and the check's `Observation.FinalURL` as it is; for the bundled
+directly publishes the Observation's `Labels["url"]` as `subject` (no
+subject if there is none). The bundled HTTP check copies the target's
+`Labels` into its Observation, so with it that is the `url` label the program
+sets on the target; a custom `Check` must carry the target's labels through
+itself, or the event has no subject or carries whatever `url` label the check
+put there. It also publishes the check's `Observation.FinalURL` as it is; for the bundled
 HTTP check that is the URL after redirects, userinfo (password in clear) and
 query included. To match the binary, set `Labels["url"] =
 metrics.TargetLabel(t.URL)` and wrap the check so a non-empty `FinalURL` is
 replaced by `metrics.TargetLabel(obs.FinalURL)`. In both cases a `url` label
 you set yourself is published verbatim, except that the CloudEvents library
 trims surrounding whitespace and omits a subject left empty, so two labels
-that differ only in surrounding whitespace share a subject. Log lines are a third path, through
+that differ only in surrounding whitespace share a subject, and the
+startup `targets share an event subject` warning does not catch that case. Log lines are a third path, through
 `check.RedactURL`, which can still print a password from a misparsed URL; see
 [Log lines and their levels](#log-lines-and-their-levels).
 
@@ -395,7 +402,9 @@ written), nor in a password with a literal `/`, `?` or `#` whose part before
 that character is empty or all digits: `url.Parse` reads that part as a port,
 which moves the `@` out of the authority (`https://user:12/34@host/p`). Any
 other password of that shape fails to parse, and a URL that fails to parse
-prints as `<unparseable>`. This is a known gap, to be fixed in
+prints as `<unparseable>`. A literal `/`, `?` or `#` in the username, or in a
+bare token with no password (`https://tok/en@host/p`), leaves a valid host
+before it, so that URL parses and is printed in full. This is a known gap, to be fixed in
 `check.RedactURL`. The `skipping slot`, `publish failed` and `dropping
 results` lines come from the engine, so they reach a program that embeds the
 runner too; the startup warnings and the per-run stderr diagnostics come from

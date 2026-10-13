@@ -175,8 +175,8 @@ consumer asks, not speculatively.
 
 **What:** Add a stable `target_id` label to the per-target `descry_check_*` series in
 `metrics/`, derived from a target identity key (defined alongside the dynamic target
-set, `Runner.SetTargets`), so targets that differ only in query string or fragment stop
-sharing one series set.
+set, `Runner.SetTargets`), so targets that differ only in userinfo, query string,
+fragment or normalisation stop sharing one series set.
 
 **Why:** The `url` label is built from scheme, host and path only (credential safety:
 the label is persistent and served on an unauthenticated port), so two targets

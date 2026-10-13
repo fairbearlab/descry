@@ -165,7 +165,7 @@ curl -s 127.0.0.1:9090/metrics | grep '^descry_check_up'
 
 | Endpoint | Answers |
 |---|---|
-| `GET /metrics` | the `descry_*` series in the Prometheus text format (no Go or process collectors). At most 2 scrapes run at once (a third gets 503, and so can a scrape that follows a timed-out or abandoned one while its gather finishes) and a scrape times out after 10s |
+| `GET /metrics` | the `descry_*` series in the Prometheus exposition format (text, or protobuf if the scraper asks for it; no Go or process collectors). At most 2 scrapes run at once (a third gets 503, and so can a scrape that follows a timed-out or abandoned one while its gather finishes) and a scrape times out after 10s |
 | `GET /healthz` | 200 `ok` whenever the server is serving |
 | `GET /readyz` | 503 `not ready` until the runner starts, 200 while it runs, 503 again from the first shutdown signal on. It does **not** wait for a first observation (see "First fire" above) |
 
