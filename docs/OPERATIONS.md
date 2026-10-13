@@ -35,8 +35,8 @@ the normalisation described under
 `https://h` and `https://h/`, or more than one URL that renders as
 `<unparseable>`) are refused with exit 2
 instead (see [Metrics and health endpoints](#metrics-and-health-endpoints)).
-Targets that differ only in userinfo, query or fragment also share an event
-subject; where they are
+Targets that differ only in userinfo, query, fragment or normalisation also
+share an event subject; where they are
 not refused, `descry` warns once per shared subject, and a `url` label on each
 target (`targets[].labels.url`) tells their events apart.
 
@@ -209,10 +209,10 @@ Per-target (labelled `url`; about seven series per target; dropped with
 | Series | Type | Meaning |
 |---|---|---|
 | `descry_check_up{url}` | gauge | 1 when the last run was up, else 0 (a check that returned an error counts as 0) |
-| `descry_check_status_code{url}` | gauge | last HTTP status code; 0 with no response or when the check returned an error |
+| `descry_check_status_code{url}` | gauge | last HTTP status code; 0 when the request failed (no response, or a redirect refused by the SSRF guard or past the 5-redirect limit) or when the check returned an error |
 | `descry_check_latency_seconds{url}` | gauge | last run's latency, millisecond resolution; left as it was when the check returned an error |
 | `descry_check_last_run_timestamp_seconds{url}` | gauge | when the last run was observed (or when the check's error was recorded), unix seconds |
-| `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the final response's certificate, unix seconds; only for targets that report one (https). Absent until the first run that reports a certificate; after that it keeps its last value when a run reports none (a failed handshake, or any other run that got no response: a timeout, a refused connection, an SSRF block), so read it together with `descry_check_up` or `last_run` |
+| `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the final response's certificate, unix seconds; only for targets that report one (https). Absent until the first run that reports a certificate; after that it keeps its last value when a run reports none (a failed handshake, or any other run whose request failed: a timeout, a refused connection, an SSRF block, a redirect past the limit), so read it together with `descry_check_up` or `last_run` |
 | `descry_check_runs_total{url,status}` | counter | runs, `status` `up` or `down`; any run that was not up, including a check that returned an error, counts as `down` |
 
 A target's series appear on its first completed run, not at startup, so a
@@ -301,7 +301,7 @@ fragment is dropped along with userinfo and query.
 | Field | Published by `descry` as |
 |---|---|
 | `subject` | `scheme://host[:port]/path` of the target URL, or `<unparseable>`. Equal to the metrics `url` label, so events and series join on it |
-| `data.final_url` | the same rendering of the URL the response came from (the target URL itself when there was no redirect); omitted when there was no response |
+| `data.final_url` | the same rendering of the URL the response came from (the target URL itself when there was no redirect); omitted when the request failed (no response, or a redirect refused by the SSRF guard or past the 5-redirect limit) |
 | `subject` from a `url` label you set (`targets[].labels.url`) | verbatim |
 | `source` | verbatim |
 | `data.extra.body` | verbatim |
