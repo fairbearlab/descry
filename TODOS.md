@@ -383,8 +383,13 @@ Kubernetes example fail with an authorization error.
 
 **Context:** 2026-10-12 — if the release fails after the image push (the
 image is signed before the GitHub release is created), patch forward with
-v0.5.1 rather than retagging; `newTag` and the README examples then move to
-the release that worked.
+v0.5.1 rather than retagging; the first published version then moves in
+every place that names it: `newTag` in `examples/kubernetes/kustomization.yaml`,
+README.md (the install line, the `cosign verify` and `verify-blob` identities,
+the checksum file names and "Releases before v0.5.0"), the
+`examples/kubernetes/README.md` kind walkthrough, the comments in
+`kustomization.yaml` and `deployment.yaml`, and the changelog. Once the image
+is published, also reword the walkthrough's "Until that release exists".
 
 **Effort:** S · **Priority:** P1 · **Depends on:** the v0.5.0 release
 
@@ -430,8 +435,16 @@ now say the release workflow publishes the image from v0.5.0, and keep the
 local ko build for before that release and for local changes.
 `TestReleaseImageMatchesKustomization` in `cmd/descry` fails if the kos
 repository and the kustomization image name drift apart, if the kos tags use
-`{{ .Version }}` or lose `{{ .Tag }}`, or if `newTag` loses its `v`. The
-release-day steps are tracked under Release.
+`{{ .Version }}` or lose `{{ .Tag }}`, if `newTag` loses its `v`, if any
+`latest` tag loses its prerelease guard, or if the base image loses its digest
+pin or a platform. `TestReleaseSigningContract` fails if the release job loses
+`id-token` or `packages` write, a workflow-wide write is added, the Go cache is
+re-enabled, the trigger stops being a `v*` tag push, the tag run is not a
+plain `goreleaser release`, or the cosign entries stop signing the checksums
+into a `.sigstore.json` bundle and the image by digest.
+`TestReleaseCheckBuildsImage` fails if the CI `release-check` snapshot stops
+running the release subcommand or skips ko, which would leave the image
+unbuilt until a tag. The release-day steps are tracked under Release.
 
 ### Prometheus deny-list fails open on new packages
 

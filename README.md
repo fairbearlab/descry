@@ -34,7 +34,8 @@ go get github.com/fairbearlab/descry
 As a container image, from v0.5.0: `ghcr.io/fairbearlab/descry:<tag>`, where
 `<tag>` is the release tag with its `v` (`v0.5.0`). It is a distroless static
 image for linux/amd64 and linux/arm64 that runs as a non-root user, with an
-SPDX SBOM attached; final releases also move `latest`.
+SPDX SBOM attached (the SBOM is not signed; the signature below covers the
+image); final releases also move `latest`.
 [`examples/kubernetes/`](examples/kubernetes/) runs it in a cluster.
 
 ### Verify a release
