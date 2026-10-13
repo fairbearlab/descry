@@ -170,7 +170,10 @@ root of the repository.
 
    With a published release image, `kubectl apply -k examples/kubernetes`
    is all you need, with `newTag` in `kustomization.yaml` set to the release
-   you want (v0.5.0 or later, with the `v`).
+   you want (v0.5.0 or later, with the `v`). Verify it first as the main
+   README's [Verify a release](../../README.md#verify-a-release) shows, and
+   for a real deployment pin the digest you verified: `digest:` in place of
+   `newTag` in the kustomization, since a tag can be moved.
 
 4. Port-forward the metrics port. This holds the terminal, so run the next step
    in another one.

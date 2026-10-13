@@ -85,7 +85,7 @@ jobs:
   # and signing skipped. The ko pipe still runs: it builds the linux/amd64
   # and linux/arm64 images and loads the linux/amd64 one into the runner's
   # Docker daemon under goreleaser.ko.local (the daemon publisher loads a
-  # single platform). That is the only check of the image config before a
+  # single platform). That is the only build of the image before a
   # tag. The push and the cosign signatures first run on a tag. Both steps
   # pin the exact goreleaser release.yml runs, so CI checks the same one a
   # tag releases with; bump all three together.

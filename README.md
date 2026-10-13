@@ -73,11 +73,14 @@ checksums file, then the archives against it:
 cosign verify-blob \
   --certificate-identity 'https://github.com/fairbearlab/descry/.github/workflows/release.yml@refs/tags/v0.5.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  --bundle descry_0.5.0_checksums.txt.sigstore.json descry_0.5.0_checksums.txt
-sha256sum --check --ignore-missing descry_0.5.0_checksums.txt
+  --bundle descry_0.5.0_checksums.txt.sigstore.json descry_0.5.0_checksums.txt &&
+  sha256sum --check --ignore-missing descry_0.5.0_checksums.txt
 ```
 
-Releases before v0.5.0 are not signed.
+These are cosign v3 signatures: the image's are stored as OCI referrers and
+the checksums file's as a Sigstore bundle, which cosign v2 and older
+verifiers may report as missing, so use cosign v3.x. Releases before v0.5.0
+are not signed.
 
 ## Design
 

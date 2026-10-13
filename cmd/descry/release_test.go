@@ -129,7 +129,7 @@ type goreleaserRun struct {
 	sub      string   // subcommand: release, build, check
 	skips    []string // from --skip=a,b and --skip a,b
 	snapshot bool
-	config   bool // --config or -f: a file other than .goreleaser.yaml
+	config   bool // set by any --config or -f, whatever file it names
 }
 
 func parseGoreleaserArgs(args string) goreleaserRun {

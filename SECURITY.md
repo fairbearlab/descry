@@ -29,6 +29,9 @@ reporting lets us assess and fix before details are public.
 - CodeQL analyses pushes to `main` and pull requests targeting `main`, plus a
   weekly run to catch newly published rules.
 - GitHub Actions are pinned to commit SHAs and run with minimal token permissions.
+- From v0.5.0, the container image and each release's checksums file are
+  signed with cosign keyless signing from the release workflow; README.md's
+  [Verify a release](README.md#verify-a-release) has the commands.
 - Secret scanning and push protection are enabled on the repository.
 - The SSRF guard has Go fuzz targets on both layers (`assertSafeURL`,
   `isBlockedIP`), and `check.RedactURL` and `metrics.TargetLabel` have their own.

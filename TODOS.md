@@ -391,6 +391,11 @@ the checksum file names and "Releases before v0.5.0"), the
 `kustomization.yaml` and `deployment.yaml`, and the changelog. Once the image
 is published, also reword the walkthrough's "Until that release exists".
 
+**Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so if
+signing fails the tags are live and unsigned with no GitHub release. Delete
+them in GHCR, or overwrite them by patching forward, and do not announce the
+release until `cosign verify` passes.
+
 **Effort:** S · **Priority:** P1 · **Depends on:** the v0.5.0 release
 
 ### Protect release tags with a ruleset
@@ -421,6 +426,20 @@ Scorecard does not recognise the `.sigstore.json` bundle name, note that here
 rather than adding a second signing mechanism for the score.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** the v0.5.0 release
+
+### Bump the distroless base image digest
+
+**What:** Move the `base_image` digest in `.goreleaser.yaml`'s `kos` entry to
+the current `gcr.io/distroless/static-debian13:nonroot` index digest (the
+comment above `kos` has the command), and keep it moving: a release-checklist
+step that bumps it before each tag, or a Renovate regex manager that opens a
+PR when the digest changes.
+
+**Why:** `.github/dependabot.yml` covers only `gomod` and `github-actions`, so
+nothing updates the pinned base. Every release ships on the same base until
+someone bumps it by hand, including after distroless publishes a fix.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
 ## Completed
 
@@ -456,9 +475,18 @@ pin or a platform. `TestReleaseSigningContract` fails if the release job loses
 re-enabled, the trigger stops being a `v*` tag push, the tag run is not a
 plain `goreleaser release`, or the cosign entries stop signing the checksums
 into a `.sigstore.json` bundle and the image by digest.
+`TestReleaseSigningContract` also fails if the goreleaser step stops setting
+`GORELEASER_CURRENT_TAG` to the pushed ref, the workflow loses its concurrency
+group or cancels in progress, a setup step moves after goreleaser, or another
+job gets `id-token: write`.
 `TestReleaseCheckBuildsImage` fails if the CI `release-check` snapshot stops
 running the release subcommand or skips ko, which would leave the image
-unbuilt until a tag. The release-day steps are tracked under Release.
+unbuilt until a tag. `TestGoreleaserVersionPinned` fails if `release.yml` and
+`ci.yml` stop pinning the same exact goreleaser.
+`TestReadmeVerifyMatchesKustomization` fails if README.md's "Verify a
+release" names a release other than `newTag`, or checksum and bundle file
+names other than the ones `.goreleaser.yaml` produces. The release-day steps
+are tracked under Release.
 
 ### Prometheus deny-list fails open on new packages
 

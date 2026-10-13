@@ -42,9 +42,9 @@ skipped, so a broken release config fails the PR instead of the tag. The
 snapshot still builds the container image with ko and loads it into the local
 Docker daemon as `goreleaser.ko.local`, so it needs a running Docker daemon;
 nothing is pushed or signed. If you change `.goreleaser.yaml`, `cmd/descry` or
-the build flags, run it locally (goreleaser v2; it writes `dist/`, which is not
-gitignored, so delete it before committing, and remove the
-`goreleaser.ko.local` images when done):
+the build flags, run it locally (goreleaser v2.18.3, the version `ci.yml` and
+`release.yml` pin; it writes `dist/`, which is not gitignored, so delete it
+before committing, and remove the `goreleaser.ko.local` images when done):
 
 ```
 goreleaser check
