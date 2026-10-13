@@ -271,6 +271,28 @@ then; drop that caveat with the fix.
 
 **Effort:** S · **Priority:** P1 · **Depends on:** nothing
 
+### HTTP error class can follow the target URL's text
+
+**What:** Make `classifyError` in `checks/http/http.go` match its substring
+fallback against the underlying error, not the full `err.Error()`, which for a
+`*url.Error` includes the request URL.
+
+**Why:** When no typed check matches, the fallback lower-cases the whole
+message and looks for `timeout`, `tls`, `certificate`, `no such host` and so
+on. The message starts with `Get "<url>":`, so a target whose host or path
+contains one of those words (`https://tls-gateway.example/`,
+`/api/timeout`) can be counted under the wrong
+`descry_check_errors_total{class}` and carry the wrong error class in its
+event.
+
+**Context:** 2026-10-13 — found during the v0.5.0 docs review. Unwrap
+`*url.Error` (its `Err` field) before the substring switch, and add table
+rows with misleading URLs to the classifier tests. This is an engine change
+(`checks/http`), so it ships as its own PR with the embedding consumer's repin
+check.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
 ## Admin server
 
 ### Reserved capacity for health probes
@@ -363,6 +385,22 @@ and 1 after a double `Close`. For `limitInFlight`, wrap a handler that panics
 the write, then assert a third request still gets 200, not 503.
 `TestLimitConn_CloseWriteForwardsHalfClose` and
 `TestAdminMux_MetricsSlotHeldThroughWrite` are the nearest existing tests.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
+### Pin the documented `/metrics` responses and shared-subject triggers
+
+**What:** Add tests for behaviour docs/OPERATIONS.md now documents but no test
+pins: the two exact `/metrics` 503 bodies (the 2-scrape limit and the 10s
+timeout), content negotiation (text and protobuf, no OpenMetrics), and every
+documented trigger of the `targets share an event subject` warning (URLs that
+differ only in userinfo, query, fragment or normalisation, more than one
+`<unparseable>` URL with no `url` label, and two targets given the same `url`
+label).
+
+**Why:** The documented behaviour is correct today (checked during the v0.5.0
+docs review), but nothing fails if a dependency bump or a refactor changes it
+and the docs go stale.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 

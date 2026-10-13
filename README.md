@@ -282,7 +282,8 @@ What descry publishes about a target URL:
   library publishes the check's raw values unless it does the same (see
   [Which event fields are clean](docs/OPERATIONS.md#which-event-fields-are-clean)).
 - **A `url` label you set on a target (`targets[].labels.url`) is published
-  verbatim** as the event subject. It is yours to keep clean, and it is how to
+  verbatim** as the event subject (trimmed of surrounding whitespace). It is
+  yours to keep clean, and it is how to
   give two targets that share a rendering distinct subjects (it does not change
   the metrics label).
 - **`source` and the failure body (`data.extra.body`) are not rewritten.**

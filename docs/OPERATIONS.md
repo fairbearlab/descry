@@ -287,7 +287,9 @@ HTTP check that is the URL after redirects, userinfo (password in clear) and
 query included. To match the binary, set `Labels["url"] =
 metrics.TargetLabel(t.URL)` and wrap the check so a non-empty `FinalURL` is
 replaced by `metrics.TargetLabel(obs.FinalURL)`. In both cases a `url` label
-you set yourself is published verbatim. Log lines are a third path, through
+you set yourself is published verbatim, except that the CloudEvents library
+trims surrounding whitespace and omits a subject left empty, so two labels
+that differ only in surrounding whitespace share a subject. Log lines are a third path, through
 `check.RedactURL`, which can still print a password from a misparsed URL; see
 [Log lines and their levels](#log-lines-and-their-levels).
 
@@ -302,7 +304,7 @@ fragment is dropped along with userinfo and query.
 |---|---|
 | `subject` | `scheme://host[:port]/path` of the target URL, or `<unparseable>`. Equal to the metrics `url` label, so events and series join on it |
 | `data.final_url` | the same rendering of the URL the response came from (the target URL itself when there was no redirect); omitted when the request failed (no response, or a redirect refused by the SSRF guard or by the redirect limit: the check follows at most 4 redirects, and a 5th fails the run) |
-| `subject` from a `url` label you set (`targets[].labels.url`) | verbatim |
+| `subject` from a `url` label you set (`targets[].labels.url`) | verbatim, trimmed of surrounding whitespace; omitted if that leaves it empty |
 | `source` | verbatim |
 | `data.extra.body` | verbatim |
 
@@ -389,9 +391,11 @@ pass it through `check.RedactURL`. It masks the password (the username
 stays) and a bare username with no password, but leaves the query string as
 it is, so a `?token=` is printed even in a well-formed URL. It masks nothing
 in a URL with no `//` after the scheme (`https:user:pass@host` is printed as
-written), nor in a password with a literal `/`, `?` or `#`, which moves the
-`@` out of the authority (`https://user:12/34@host/p`); a URL that fails to
-parse prints as `<unparseable>`. This is a known gap, to be fixed in
+written), nor in a password with a literal `/`, `?` or `#` whose part before
+that character is empty or all digits: `url.Parse` reads that part as a port,
+which moves the `@` out of the authority (`https://user:12/34@host/p`). Any
+other password of that shape fails to parse, and a URL that fails to parse
+prints as `<unparseable>`. This is a known gap, to be fixed in
 `check.RedactURL`. The `skipping slot`, `publish failed` and `dropping
 results` lines come from the engine, so they reach a program that embeds the
 runner too; the startup warnings and the per-run stderr diagnostics come from
