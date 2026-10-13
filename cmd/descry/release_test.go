@@ -323,6 +323,58 @@ func TestReleaseCheckBuildsImage(t *testing.T) {
 	}
 }
 
+// Value: protects=release binaries are not stamped dirty: goreleaser's dist/ stays ignored, and CI checks the snapshot binary's VCS stamp after the snapshot builds it
+// fails_when=.gitignore stops ignoring dist/ (line dropped, or a later !dist negation), or release-check loses the step that greps go version -m on the snapshot binary for vcs.modified=false, or that step runs before the snapshot
+// why_new=Go stamps an untracked dist/ as +dirty and vcs.modified=true, which no build or test fails on; only go version -m on a release binary shows it
+// seam=none; no_claim=does not run goreleaser; the release-check step itself checks the stamp
+func TestReleaseBinariesNotDirty(t *testing.T) {
+	raw, err := os.ReadFile("../../.gitignore")
+	if err != nil {
+		t.Fatalf("read .gitignore: %v", err)
+	}
+	// The last pattern that matches a path decides it, so a later negation
+	// would un-ignore dist/ again.
+	ignored := false
+	for line := range strings.Lines(string(raw)) {
+		p := strings.TrimSpace(line)
+		pat, neg := strings.CutPrefix(p, "!")
+		if strings.Trim(pat, "/") == "dist" {
+			ignored = !neg
+		}
+	}
+	if !ignored {
+		t.Error(".gitignore does not ignore dist/: goreleaser writes it before it builds, so Go would stamp every release binary +dirty")
+	}
+
+	var ci struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string         `yaml:"uses"`
+				With map[string]any `yaml:"with"`
+				Run  string         `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	readYAML(t, "../../.github/workflows/ci.yml", &ci)
+	snap, check := -1, -1
+	for i, st := range ci.Jobs["release-check"].Steps {
+		args, _ := st.With["args"].(string)
+		if parseGoreleaserArgs(args).snapshot {
+			snap = i
+		}
+		if strings.Contains(st.Run, "go version -m") && strings.Contains(st.Run, "dist/") &&
+			strings.Contains(st.Run, "vcs.modified=false") {
+			check = i
+		}
+	}
+	switch {
+	case check < 0:
+		t.Error("release-check has no step that checks go version -m on a dist/ binary for vcs.modified=false")
+	case check < snap:
+		t.Errorf("release-check checks the binary's VCS stamp at step %d, before the snapshot builds it at step %d", check, snap)
+	}
+}
+
 // Value: protects=CI's release-check runs the exact goreleaser a tag releases with
 // fails_when=a goreleaser-action step in release.yml or ci.yml has no version, a range (~>, ^, latest), or a version the other steps do not, or either file has no such step
 // why_new=with a range, a tag can release with a goreleaser that CI never checked the config against

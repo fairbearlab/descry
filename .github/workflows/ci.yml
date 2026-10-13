@@ -108,6 +108,24 @@ jobs:
         with:
           version: v2.18.3
           args: release --snapshot --clean --skip=publish,sign
+      # Go stamps the git state into the binary, and a tree with any change
+      # or untracked file reads +dirty and vcs.modified=true in
+      # `go version -m`. goreleaser writes dist/ into the tree before it
+      # builds, and its before hook runs go mod tidy, so an unignored output
+      # or a tidy that rewrites go.sum would mark every release binary dirty.
+      # The ko image is built from the same tree. The check fails closed: a
+      # missing binary, or one with no VCS stamp at all, fails it too.
+      - name: snapshot binary is not stamped dirty
+        run: |
+          set -euo pipefail
+          bin=dist/descry_linux_amd64_v1/descry
+          info="$(go version -m "$bin")"
+          printf '%s\n' "$info"
+          if ! grep -q $'^\tbuild\tvcs.modified=false$' <<<"$info"; then
+            echo "::error::$bin is not stamped vcs.modified=false; git status --porcelain:"
+            git status --porcelain
+            exit 1
+          fi
   # The alerting rules ship as a PrometheusRule CR, which promtool cannot read,
   # so the job extracts the plain rule groups with yq and runs promtool on
   # those, with --lint-fatal so a lint finding (a duplicate rule) fails the

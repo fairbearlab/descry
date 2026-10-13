@@ -367,19 +367,22 @@ the write, then assert a third request still gets 200, not 503.
 
 ## Release
 
-### Make the first published image public and verify its signatures
+### Confirm the first published image is public and verify its signatures
 
-**What:** After the v0.5.0 release workflow runs, set the
-`ghcr.io/fairbearlab/descry` package's visibility to public (GHCR creates a
-new package private), confirm it is linked to this repository, then run the
-`cosign verify` and `cosign verify-blob` commands from README.md's "Verify a
-release" against v0.5.0, and `kubectl apply -k examples/kubernetes` on a kind
-cluster without the local overlay.
+**What:** After the v0.5.0 release workflow runs, confirm the
+`ghcr.io/fairbearlab/descry` package is public and linked to
+fairbearlab/descry, then run the `cosign verify` and `cosign verify-blob`
+commands from README.md's "Verify a release" against v0.5.0, and
+`kubectl apply -k examples/kubernetes` on a kind cluster without the local
+overlay.
 
 **Why:** The push, the image signature and the checksums signature first run
 on the v0.5.0 tag: the CI snapshot builds the image but skips publishing and
-signing. A private package makes anonymous pulls, `cosign verify` and the
-Kubernetes example fail with an authorization error.
+signing. A first push with the workflow's `GITHUB_TOKEN` from this public
+repository creates the package public and linked to it (seen in a
+2026-10-13 rehearsal), but a private package would make anonymous pulls,
+`cosign verify` and the Kubernetes example fail with an authorization error,
+so check it rather than assume it.
 
 **Context:** 2026-10-12 — if the release fails after the image push (the
 image is signed before the GitHub release is created), patch forward with
@@ -391,16 +394,43 @@ the checksum file names and "Releases before v0.5.0"), the
 `kustomization.yaml` and `deployment.yaml`, and the changelog. Once the image
 is published, also reword the walkthrough's "Until that release exists".
 
-**Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so if
-signing fails the tags are live and unsigned with no GitHub release. A patch
-release moves only `:latest`, so an unsigned `:vX` stays live. Either delete
-the failed `:vX` in GHCR (and roll `:latest` back if it moved), or, once the
-cause is fixed, re-run the failed workflow run: no GitHub release exists yet
-and the build is reproducible (commit-time dates), so a re-run pushes the
-same digest and signs it. Do not announce the release until `cosign verify`
-passes.
+**Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so even
+a run that succeeds leaves `:latest` pointing at an unsigned digest for the
+few seconds until the signature is pushed; if signing fails, the tags stay
+live and unsigned with no GitHub release. A patch release moves only
+`:latest`, so an unsigned `:vX` stays live. Either delete the failed `:vX` in
+GHCR (and roll `:latest` back if it moved), or, once the cause is fixed,
+re-run the failed workflow run: no GitHub release exists yet and the build is
+reproducible (commit-time dates), so a re-run pushes the same digest and
+signs it. That holds only while the tag is the only one on its commit: Go
+stamps the highest tag at HEAD into the binary, whatever
+`GORELEASER_CURRENT_TAG` says (see "Deterministic build info" below). Never
+re-run a tag once its GitHub release exists: the run re-pushes and re-signs
+the image and moves `:latest` before it fails with 422s at asset upload.
+Do not announce the release until `cosign verify` passes.
 
 **Effort:** S · **Priority:** P1 · **Depends on:** the v0.5.0 release
+
+### Deterministic build info (`-buildvcs=false`)
+
+**What:** Decide whether to add `flags: [-buildvcs=false]` to the `descry`
+build in `.goreleaser.yaml` (ko reuses the build's flags when its `kos` entry
+sets none), with a guard test that the flag stays and no `kos` entry drops it.
+
+**Why:** Go stamps the module version from the highest semver tag at HEAD and
+ignores `GORELEASER_CURRENT_TAG`. If v0.5.1 is tagged on the commit v0.5.0
+points at, a re-run of v0.5.0 builds a binary stamped v0.5.1, so it pushes a
+new `:v0.5.0` digest and moves `:latest`. Today only practice prevents it:
+`release.yml` says to patch forward rather than re-run once a newer tag
+exists. `-buildvcs=false` makes the build info the same whatever the git
+state.
+
+**Cost:** The main module then reads `(devel)` and the `vcs.revision`,
+`vcs.time` and `vcs.modified` lines disappear from `go version -m` and from
+the image's SPDX SBOM. `descry --version` and `descry_build_info` keep the
+version and commit, since they come from ldflags.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
 ### Harden the release guard tests
 
