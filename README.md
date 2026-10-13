@@ -181,8 +181,9 @@ interface, not a public one.
 
 With `--listen` and per-target series on, descry refuses to start (exit 2)
 when two targets share a metrics label: the label keeps only scheme, host and
-path, so targets that differ only in userinfo or query, exact duplicates, and
-URLs that have no safe rendering (`<unparseable>`) would merge into one series
+path, so targets that differ only in userinfo, query, fragment or
+normalisation (`https://h` and `https://h/`), exact duplicates, and URLs that
+have no safe rendering (`<unparseable>`) would merge into one series
 set. Give each a distinct scheme, host or path, or run with
 `--metrics-per-target=false`.
 

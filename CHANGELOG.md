@@ -61,7 +61,8 @@ Pre-1.0, the minor version carries breaking changes.
 
 - **Shared metrics labels are refused.** With `--listen` and per-target series
   on, two targets whose URLs render to the same metrics label (exact
-  duplicates, URLs that differ only in userinfo, query or fragment, or more than one
+  duplicates, URLs that differ only in userinfo, query, fragment or
+  normalisation such as `https://h` and `https://h/`, or more than one
   `<unparseable>` URL) exit 2 with an error naming the label and the targets'
   config positions, never the URLs. Without
   `--listen`, or with `--metrics-per-target=false`, nothing changes: exact
@@ -134,7 +135,7 @@ Pre-1.0, the minor version carries breaking changes.
   raw target URL and `final_url` could carry the target's credentials and
   query (including through a relative redirect). An explicit `url` label on a
   target is still published verbatim as the subject. Targets that differ only
-  in userinfo, query or fragment now share a subject; `descry` warns once per shared subject at
+  in userinfo, query, fragment or normalisation now share a subject; `descry` warns once per shared subject at
   startup, and a `url` label tells them apart. The rendering also normalises,
   so subjects change even for URLs that carried no secret: a bare host gains
   a trailing `/` (`https://example.com` becomes `https://example.com/`), the

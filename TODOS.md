@@ -384,15 +384,17 @@ gh release download "$TAG" -R fairbearlab/descry -p "descry_${VER}_Linux_x86_64.
 mkdir archive && tar -xzf "descry_${VER}_Linux_x86_64.tar.gz" -C archive descry
 go version -m archive/descry
 digest="$(crane digest ghcr.io/fairbearlab/descry:${TAG})"
-mkdir image && crane export --platform linux/amd64 "ghcr.io/fairbearlab/descry@${digest}" - | tar -xf - -C image ko-app/descry
+mkdir image && crane export --platform linux/amd64 "ghcr.io/fairbearlab/descry@${digest}" - | tar -xf - -C image
 go version -m image/ko-app/descry
 ```
 
 Both must show `mod github.com/fairbearlab/descry v0.5.0` (no `+dirty`),
 `build vcs.modified=false`, and `vcs.revision` equal to
-`git rev-parse v0.5.0^{commit}`. If `crane export` finds no `ko-app/descry`
-member, list the stream with `tar -tf -` first, or copy the file out with
-`docker create --platform linux/amd64` and `docker cp`.
+`git rev-parse v0.5.0^{commit}`. ko writes the binary as `/ko-app/descry`,
+with a leading `/`, so the `tar` above extracts the whole (small) image
+filesystem rather than naming that member; tar strips the `/`. If
+`image/ko-app/descry` is missing, list the stream with `tar -tf -` first, or
+copy the file out with `docker create --platform linux/amd64` and `docker cp`.
 
 **Why:** The push, the image signature and the checksums signature first run
 on the v0.5.0 tag: the CI snapshot builds the image but skips publishing and
