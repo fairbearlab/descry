@@ -392,11 +392,33 @@ the checksum file names and "Releases before v0.5.0"), the
 is published, also reword the walkthrough's "Until that release exists".
 
 **Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so if
-signing fails the tags are live and unsigned with no GitHub release. Delete
-them in GHCR, or overwrite them by patching forward, and do not announce the
-release until `cosign verify` passes.
+signing fails the tags are live and unsigned with no GitHub release. A patch
+release moves only `:latest`, so an unsigned `:vX` stays live. Either delete
+the failed `:vX` in GHCR (and roll `:latest` back if it moved), or, once the
+cause is fixed, re-run the failed workflow run: no GitHub release exists yet
+and the build is reproducible (commit-time dates), so a re-run pushes the
+same digest and signs it. Do not announce the release until `cosign verify`
+passes.
 
 **Effort:** S · **Priority:** P1 · **Depends on:** the v0.5.0 release
+
+### Harden the release guard tests
+
+**What:** Three gaps in `cmd/descry/release_test.go` let a broken release
+config pass every guard:
+
+- Require a fixed concurrency group, a literal with no `${{`. A per-ref group
+  such as `release-${{ github.ref }}` passes `TestReleaseSigningContract` today
+  but stops serializing tag runs.
+- Fail if a higher-priority goreleaser config exists. goreleaser reads
+  `.config/goreleaser.yaml`/`.yml` and `.goreleaser.yml` before
+  `.goreleaser.yaml`, so a new file with `kos: []`/`signs: []` would pass every
+  guard and release unsigned with no image.
+- Tie the README identity guard to the full
+  `https://github.com/fairbearlab/descry/.github/workflows/release.yml@refs/tags/`
+  prefix.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
 ### Protect release tags with a ruleset
 

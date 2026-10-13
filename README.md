@@ -74,8 +74,12 @@ cosign verify-blob \
   --certificate-identity 'https://github.com/fairbearlab/descry/.github/workflows/release.yml@refs/tags/v0.5.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle descry_0.5.0_checksums.txt.sigstore.json descry_0.5.0_checksums.txt &&
-  sha256sum --check --ignore-missing descry_0.5.0_checksums.txt
+  shasum -a 256 --check --ignore-missing descry_0.5.0_checksums.txt
 ```
+
+Look for the `<archive>: OK` line for the archive you downloaded. `shasum`
+fails with "no file was verified" if the archive is missing or renamed, where
+macOS's `sha256sum` exits 0 and prints nothing.
 
 These are cosign v3 signatures: the image's are stored as OCI referrers and
 the checksums file's as a Sigstore bundle, which cosign v2 and older
