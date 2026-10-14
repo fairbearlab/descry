@@ -28,11 +28,15 @@ itself: if it comes due while its previous run is still in flight, that slot is
 listed twice is two independent targets, probed and reported separately (with
 equal intervals they share a slot). When `descry` is not serving per-target
 metrics it warns once per duplicated URL at startup; with `--listen` and
-`--metrics-per-target` on, two targets that share a metrics label (exact
-duplicates, URLs that differ only in userinfo or query, or more than one URL
-that renders as `<unparseable>`) are refused with exit 2 instead (see
-[Metrics and health endpoints](#metrics-and-health-endpoints)). Targets that
-differ only in query or userinfo also share an event subject; where they are
+`--metrics-per-target` on, and only then, two targets that share a metrics
+label (exact duplicates, URLs that differ only in userinfo, query, fragment or
+the normalisation described under
+[Which event fields are clean](#which-event-fields-are-clean), such as
+`https://h` and `https://h/`, or more than one URL that renders as
+`<unparseable>`) are refused with exit 2
+instead (see [Metrics and health endpoints](#metrics-and-health-endpoints)).
+Targets that differ only in userinfo, query, fragment or normalisation also
+share an event subject; where they are
 not refused, `descry` warns once per shared subject, and a `url` label on each
 target (`targets[].labels.url`) tells their events apart.
 
@@ -168,7 +172,7 @@ The endpoints are unauthenticated: bind them to loopback or a private interface.
 
 | Endpoint | Status | Notes |
 |---|---|---|
-| `GET /metrics` | 200 | Prometheus text format, `descry_*` series only (no Go or process collectors). At most 2 scrapes in flight; a further scrape gets 503, sometimes with fewer than 2 visibly in flight (see below). A scrape that takes longer than 10s gets 503 |
+| `GET /metrics` | 200 | Prometheus exposition format (text, or protobuf if the scraper asks for it; OpenMetrics is not offered), `descry_*` series only (no Go or process collectors). At most 2 scrapes in flight; a further scrape gets 503 `Limit of concurrent requests reached (2), try again later.`, sometimes with fewer than 2 visibly in flight (see below). A scrape that takes longer than 10s gets 503 `Exceeded configured timeout of 10s.` |
 | `GET /healthz` | 200 `ok` | whenever the server is serving. It says the process is up, nothing about targets |
 | `GET /readyz` | 503 `not ready` / 200 `ok` | 503 until the runner starts, 200 while it runs, 503 from the first shutdown signal on (and if `Run` returns for any other reason). It does **not** wait for a first observation: a target's first check is up to one interval after start (see [First fire](#first-fire-is-up-to-one-interval-after-start)) |
 
@@ -204,25 +208,36 @@ Per-target (labelled `url`; about seven series per target; dropped with
 
 | Series | Type | Meaning |
 |---|---|---|
-| `descry_check_up{url}` | gauge | 1 when the last run was up, else 0 |
-| `descry_check_status_code{url}` | gauge | last HTTP status code; 0 with no response |
-| `descry_check_latency_seconds{url}` | gauge | last run's latency |
-| `descry_check_last_run_timestamp_seconds{url}` | gauge | when the last run was observed, unix seconds |
-| `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the final response's certificate, unix seconds; only for targets that report one (https) |
-| `descry_check_runs_total{url,status}` | counter | runs, `status` `up` or `down` |
+| `descry_check_up{url}` | gauge | 1 when the last run was up, else 0 (a check that returned an error counts as 0) |
+| `descry_check_status_code{url}` | gauge | last HTTP status code; 0 when the request failed (no response, or a redirect refused by the SSRF guard or by the redirect limit: the check follows at most 4 redirects, and a 5th fails the run) or when the check returned an error |
+| `descry_check_latency_seconds{url}` | gauge | last run's latency, millisecond resolution; left as it was when the check returned an error |
+| `descry_check_last_run_timestamp_seconds{url}` | gauge | when the last run was observed (or when the check's error was recorded), unix seconds |
+| `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the certificate of the final response after redirects, unix seconds; only for targets whose final response came over TLS (so an `http://` target that redirects to `https://` has it too). Absent until the first run that reports a certificate; after that it keeps its last value when a run reports none: a failed handshake, any other run whose request failed (a timeout, a refused connection, an SSRF block, a 5th redirect), and a successful run whose final response was plain HTTP, such as an `https://` target that redirects to `http://`, which keeps the old expiry while `descry_check_up` is 1. Read it together with `last_run` |
+| `descry_check_runs_total{url,status}` | counter | runs, `status` `up` or `down`; any run that was not up, including a check that returned an error, counts as `down` |
+
+A target's series appear on its first completed run, not at startup, so a
+target has none until its first check finishes: that check starts up to one
+interval after start (see
+[First fire](#first-fire-is-up-to-one-interval-after-start)), later if it
+waits for a free worker, and can then run for up to `timeout`. That first run
+creates both `runs_total` values, the one that did not fire at 0, so a target
+whose first run fails makes `status="down"` appear at 1, which `increase()`
+does not count. A "check that returned an error" is only possible with a
+custom `Check`; the bundled HTTP check reports a down target as a down
+Observation and never returns one.
 
 Fleet-wide (always served):
 
 | Series | Type | Meaning |
 |---|---|---|
-| `descry_check_duration_seconds` | histogram | latency of every completed check |
-| `descry_check_errors_total{class}` | counter | failed checks by error class (`timeout`, `ssrf_blocked`, …) |
+| `descry_check_duration_seconds` | histogram | latency of every completed check, in buckets (seconds) of 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30 and `+Inf`. The 30s bucket sits past the 10s default `timeout`, so a timed-out probe lands in `le="30"`, not `+Inf`. A check that returned an error is not observed; a target refused before any request is sent (a URL the parse-time SSRF check rejects) observes 0, and one blocked at dial time or on a redirect observes the time spent until then |
+| `descry_check_errors_total{class}` | counter | runs whose Observation carries an error class. `class` is one of `timeout`, `connection_refused`, `dns_failure`, `tls_error`, `ssrf_blocked`, `http_error`, `unknown`, all seven exported at 0 from startup. A check that returned an error, or a class outside the set, counts as `unknown`. With the bundled HTTP check this moves in step with `runs_total{status="down"}` |
 | `descry_runner_skipped_slots_total` | counter | `Runner.Skipped()`, both skip kinds, exact. Alert on this one |
 | `descry_runner_dropped_results_total` | counter | `Runner.Dropped()`, exact |
 | `descry_runner_result_errors_total` | counter | non-skip error `Result`s seen by the drain (publish and mapping failures); best-effort |
 | `descry_runner_skips_observed_total{kind}` | counter | skips seen by the drain, `kind` `queued` or `in_flight`; best-effort, triage only |
-| `descry_runner_targets` | gauge | number of configured targets |
-| `descry_build_info{version,commit}` | gauge | constant 1 |
+| `descry_runner_targets` | gauge | number of configured targets, counting exact duplicates |
+| `descry_build_info{version,commit}` | gauge | constant 1. `version` is the release version without the leading `v` (`0.5.0`), `commit` the full git commit; a local `go build` reports `version="dev"`, `commit="none"`. There is no date label |
 
 The best-effort series undercount when the runner drops `Result`s; the exact
 counters are the ones to alert on. The `metrics` package doc has the details,
@@ -239,8 +254,12 @@ as `%40`) becomes `<unparseable>`. The path is exported as-is, so a fleet whose
 URLs carry a secret in the path should run with `--metrics-per-target=false`.
 
 Two targets with the same label would share one series set (counters summed,
-gauges last-writer-wins), so with `--listen` and per-target series on, descry
-refuses to start, naming config positions rather than URLs:
+gauges last-writer-wins). So the rule is: **only with `--listen` and
+per-target series on** does descry refuse to start (exit 2, before the port is
+bound or the sink opened); in every other mode a shared label is at most a
+startup warning. When it refuses, it names config positions rather than URLs,
+and reports only the first shared label in config order, as one of these
+lines (fix it and restart to see any other):
 
 ```
 error: targets 1 and 2 share the metrics label "https://h/p" (labels drop userinfo, query and fragment); give each a distinct scheme, host or path, or run with --metrics-per-target=false
@@ -251,22 +270,48 @@ The label comes from the target URL, not from a `url` label set in the
 config, so setting one does not resolve this. A single `<unparseable>` target
 is allowed. Without `--listen`, or with
 `--metrics-per-target=false`, nothing is refused: exact duplicates get the
-startup warning and query variants run as distinct targets.
+duplicate-URL warning, and URLs that differ only in userinfo, query,
+fragment or normalisation run as distinct targets and get the shared-subject warning (set a
+`url` label on each to tell their events apart).
 
 ### Which event fields are clean
 
-The same rendering is applied to the events, whether or not `--listen` is set.
-It normalises as well as strips, so a consumer keyed on `subject` sees changed
+Events and metrics are redacted in different places. The metrics `url` label
+is rendered by the `metrics` package (`metrics.TargetLabel`), so it is the
+same for the `descry` binary and for any program that uses
+`metrics.Collector`. The event fields are rendered by the `descry` binary, not
+by the engine: it sets each target's event subject to
+`metrics.TargetLabel` of the target URL, and renders `data.final_url` the
+same way before the event is built. A program that embeds `runner.New`
+directly publishes the Observation's `Labels["url"]` as `subject` (no
+subject if there is none). The bundled HTTP check copies the target's
+`Labels` into its Observation, so with it that is the `url` label the program
+sets on the target; a custom `Check` must carry the target's labels through
+itself, or the event has no subject or carries whatever `url` label the check
+put there. It also publishes the check's `Observation.FinalURL` as it is; for the bundled
+HTTP check that is the URL after redirects, userinfo (password in clear) and
+query included. To match the binary, set `Labels["url"] =
+metrics.TargetLabel(t.URL)` and wrap the check so a non-empty `FinalURL` is
+replaced by `metrics.TargetLabel(obs.FinalURL)`. In both cases a `url` label
+you set yourself is published verbatim, except that the CloudEvents library
+trims surrounding whitespace and omits a subject left empty, so two labels
+that differ only in surrounding whitespace share a subject, and the
+startup `targets share an event subject` warning does not catch that case. Log lines are a third path, through
+`check.RedactURL`, which can still print a password from a misparsed URL; see
+[Log lines and their levels](#log-lines-and-their-levels).
+
+The `descry` binary applies the same rendering to the events, whether or not
+`--listen` is set. It normalises as well as strips, so a consumer keyed on `subject` sees changed
 values even for URLs that carried no secret: a bare host gains a trailing `/`
 (`https://example.com` becomes `https://example.com/`), the path is
 re-escaped (a literal space becomes `%20`), the scheme is lower-cased, and the
 fragment is dropped along with userinfo and query.
 
-| Field | Published as |
+| Field | Published by `descry` as |
 |---|---|
 | `subject` | `scheme://host[:port]/path` of the target URL, or `<unparseable>`. Equal to the metrics `url` label, so events and series join on it |
-| `data.final_url` | the same rendering of the URL after redirects |
-| `subject` from a `url` label you set (`targets[].labels.url`) | verbatim |
+| `data.final_url` | the same rendering of the URL the response came from (the target URL itself when there was no redirect); omitted when the request failed (no response, or a redirect refused by the SSRF guard or by the redirect limit: the check follows at most 4 redirects, and a 5th fails the run) |
+| `subject` from a `url` label you set (`targets[].labels.url`) | verbatim, trimmed of surrounding whitespace; omitted if that leaves it empty |
 | `source` | verbatim |
 | `data.extra.body` | verbatim |
 
@@ -339,7 +384,7 @@ Fix it by raising that target's `interval` above `timeout`, or by lowering
 | INFO | `admin server listening` | `--listen` only: the server is up; `addr` is the bound address |
 | WARN | `check timeout exceeds interval; …` | startup, once per offending target |
 | WARN | `duplicate target URL; each entry is probed independently` | startup, once per URL listed more than once; only when not serving per-target metrics (otherwise it is an exit 2) |
-| WARN | `targets share an event subject; set a distinct url label to tell them apart` | startup, once per subject shared by targets with different URLs: URLs differing only in query or userinfo, or two targets given the same `url` label. `subject` is printed through `check.RedactURL` |
+| WARN | `targets share an event subject; set a distinct url label to tell them apart` | startup, once per subject shared by targets with different URLs: URLs that render the same (differing only in userinfo, query, fragment or the normalisation described under [Which event fields are clean](#which-event-fields-are-clean), such as `https://h` and `https://h/`), more than one `<unparseable>` URL with no `url` label, or two targets given the same `url` label. `subject` is printed through `check.RedactURL` |
 | WARN | `target URL cannot be shown safely; its event subject is <unparseable>` | startup, once per target whose URL has no safe rendering and that has no `url` label. `target` is its 1-based position in `targets`; this line does not include the URL |
 | WARN | `--metrics-per-target has no effect without --listen` | startup, when `--metrics-per-target` is set explicitly and `--listen` is not |
 | WARN | `admin server shutdown` | `--listen` only: in-flight requests did not finish within 5s at shutdown, so their connections were closed. The exit code is unchanged |
@@ -349,13 +394,22 @@ Fix it by raising that target's `interval` above `timeout`, or by lowering
 
 Lines that print a target URL (`url` above, `subject` when it comes from a
 `url` label you set, and the per-run diagnostics `descry` writes to stderr)
-pass it through `check.RedactURL`. It masks userinfo, but leaves the query
-string as it is, so a `?token=` is printed even in a well-formed URL. It masks
-nothing in a URL with no `//` after the scheme (`https:user:pass@host` is
-printed as written), nor in a password with a literal `/` that moves the `@`
-into the path (`https://user:12/34@host/p`); a URL that fails to parse prints
-as `<unparseable>`. Keep credentials and tokens out of target URLs, or out of
-URLs of those shapes at least.
+pass it through `check.RedactURL`. It masks the password (the username
+stays) and a bare username with no password, but leaves the query string as
+it is, so a `?token=` is printed even in a well-formed URL. It masks nothing
+in a URL with no `//` after the scheme (`https:user:pass@host` is printed as
+written), nor in a password with a literal `/`, `?` or `#` whose part before
+that character is empty or all digits: `url.Parse` reads that part as a port,
+which moves the `@` out of the authority (`https://user:12/34@host/p`). Any
+other password of that shape fails to parse, and a URL that fails to parse
+prints as `<unparseable>`. A literal `/`, `?` or `#` in the username, or in a
+bare token with no password (`https://tok/en@host/p`), leaves a valid host
+before it, so that URL parses and is printed in full. This is a known gap, to be fixed in
+`check.RedactURL`. The `skipping slot`, `publish failed` and `dropping
+results` lines come from the engine, so they reach a program that embeds the
+runner too; the startup warnings and the per-run stderr diagnostics come from
+the `descry` binary. Keep credentials and tokens out of target URLs, or out
+of URLs of those shapes at least.
 
 Publishing is best-effort by design: bounded retry, then log and continue. The
 scheduler goroutine is never blocked by a sink — a slow `Publish` holds one
@@ -445,7 +499,7 @@ fires on a run that is genuinely wedged. The `descry` binary does not set it.
 |---|---|
 | 0 | `-h`; `--version`; a clean SIGINT/SIGTERM shutdown, with or without `--listen`; `Run` returning without error |
 | 1 | `--listen` bind failure (port in use, permission; before the sink opens, so no events file); an admin server error, which prints `error: admin server: …` at once and cancels the run; any `Run` error other than cancellation; a file-sink `Close` failure when the code would otherwise be 0; `metrics.New` failing (also before the sink opens) |
-| 2 | flag parse error; missing `--config`; `--listen` not `host:port`, or with a port that is empty, not a number or above 65535; `config.Load` error; two targets sharing a metrics label (only with `--listen` and per-target series on); invalid sink settings; invalid event `source`; the file sink cannot be opened |
+| 2 | flag parse error; missing `--config`; `--listen` not `host:port`, or with a port that is empty, not a number or above 65535; `config.Load` error; two targets sharing a metrics label (only with `--listen` and per-target series on; otherwise at most a startup warning); invalid sink settings; invalid event `source`; the file sink cannot be opened |
 
 An admin server that does not finish shutting down within 5s is closed
 forcibly with a WARN; that does not change the exit code.

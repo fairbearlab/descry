@@ -127,6 +127,22 @@ so an embedder that does not import `metrics` never links it. CI enforces this
 on linux, darwin and windows, and derives the engine package list from
 `go list`, so a new package is covered without editing the check.
 
+`metrics/` follows the seam's own rules: it measures the engine from the
+outside, not through a hook the engine exposes. `Collector.Check` is a
+decorator, a `check.Check` that wraps another one: it delegates `Name` and
+`Run`, records each run, and returns the inner `Observation` and error
+unchanged, so the runner schedules it like any other check and never learns it
+is being measured. The runner's exact skip and drop counts come from its
+existing `Skipped` and `Dropped` methods, read through the small `RunnerStats`
+interface. The wiring order follows from `runner.New` taking the decorated
+check: `metrics.New(opts)`, then `runner.New(c.Check(inner), …)`, then
+`c.SetRunner(r)` and `c.SetTargetCount(len(targets))`, with the caller's
+single `Results()` drain reporting skips through `ObserveSkip`. Series are
+served from the collector's own `Registry()`, never the global default, and
+`Target.Labels` are never exported as metric labels. The CLI wires it this way
+behind `--listen`; an embedder that wants metrics makes the same calls, and
+one that does not import `metrics` pays nothing for it.
+
 ## Worked example — `WithUserAgent` (the seam done right)
 
 A consumer needed a configurable `User-Agent` to get past WAFs that 403 the

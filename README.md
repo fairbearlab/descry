@@ -165,7 +165,7 @@ curl -s 127.0.0.1:9090/metrics | grep '^descry_check_up'
 
 | Endpoint | Answers |
 |---|---|
-| `GET /metrics` | the `descry_*` series in the Prometheus text format (no Go or process collectors). At most 2 scrapes run at once (a third gets 503, and so can a scrape that follows a timed-out or abandoned one while its gather finishes) and a scrape times out after 10s |
+| `GET /metrics` | the `descry_*` series in the Prometheus exposition format (text, or protobuf if the scraper asks for it; no Go or process collectors). At most 2 scrapes run at once (a third gets 503, and so can a scrape that follows a timed-out or abandoned one while its gather finishes) and a scrape times out after 10s |
 | `GET /healthz` | 200 `ok` whenever the server is serving |
 | `GET /readyz` | 503 `not ready` until the runner starts, 200 while it runs, 503 again from the first shutdown signal on. It does **not** wait for a first observation (see "First fire" above) |
 
@@ -181,8 +181,9 @@ interface, not a public one.
 
 With `--listen` and per-target series on, descry refuses to start (exit 2)
 when two targets share a metrics label: the label keeps only scheme, host and
-path, so targets that differ only in userinfo or query, exact duplicates, and
-URLs that have no safe rendering (`<unparseable>`) would merge into one series
+path, so targets that differ only in userinfo, query, fragment or
+normalisation (`https://h` and `https://h/`), exact duplicates, and URLs that
+have no safe rendering (`<unparseable>`) would merge into one series
 set. Give each a distinct scheme, host or path, or run with
 `--metrics-per-target=false`.
 
@@ -277,9 +278,12 @@ What descry publishes about a target URL:
   `--metrics-per-target=false`.
 - **The event `subject` and `data.final_url`** use the same rendering, so they
   drop userinfo, query and fragment too, and a URL with no safe rendering shows
-  as `<unparseable>`.
+  as `<unparseable>`. The `descry` binary does this; a program that embeds the
+  library publishes the check's raw values unless it does the same (see
+  [Which event fields are clean](docs/OPERATIONS.md#which-event-fields-are-clean)).
 - **A `url` label you set on a target (`targets[].labels.url`) is published
-  verbatim** as the event subject. It is yours to keep clean, and it is how to
+  verbatim** as the event subject (trimmed of surrounding whitespace). It is
+  yours to keep clean, and it is how to
   give two targets that share a rendering distinct subjects (it does not change
   the metrics label).
 - **`source` and the failure body (`data.extra.body`) are not rewritten.**

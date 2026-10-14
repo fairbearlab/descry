@@ -44,7 +44,8 @@ state keyed by target.
 
 **Context:** 2026-10-11 — the `metrics/` collector caches one set of per-target children
 per raw target URL and never drops them. A plain `DeleteLabelValues` is not enough: the
-`url` label is shared (targets that differ only in query or fragment, every
+`url` label is shared (targets that differ only in userinfo, query, fragment or
+normalisation such as `https://h` and `https://h/`, every
 `<unparseable>` URL, and duplicate entries of one URL all map to one label), so the
 delete must wait until no remaining target maps to the label, must evict or rebuild the
 affected cache entries in the same step, and must not race a removed target's in-flight
@@ -174,8 +175,8 @@ consumer asks, not speculatively.
 
 **What:** Add a stable `target_id` label to the per-target `descry_check_*` series in
 `metrics/`, derived from a target identity key (defined alongside the dynamic target
-set, `Runner.SetTargets`), so targets that differ only in query string or fragment stop
-sharing one series set.
+set, `Runner.SetTargets`), so targets that differ only in userinfo, query string,
+fragment or normalisation stop sharing one series set.
 
 **Why:** The `url` label is built from scheme, host and path only (credential safety:
 the label is persistent and served on an unauthenticated port), so two targets
@@ -269,6 +270,28 @@ its tests. OPERATIONS.md ("Log lines and their levels") documents the gap until
 then; drop that caveat with the fix.
 
 **Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+### HTTP error class can follow the target URL's text
+
+**What:** Make `classifyError` in `checks/http/http.go` match its substring
+fallback against the underlying error, not the full `err.Error()`, which for a
+`*url.Error` includes the request URL.
+
+**Why:** When no typed check matches, the fallback lower-cases the whole
+message and looks for `timeout`, `tls`, `certificate`, `no such host` and so
+on. The message starts with `Get "<url>":`, so a target whose host or path
+contains one of those words (`https://tls-gateway.example/`,
+`/api/timeout`) can be counted under the wrong
+`descry_check_errors_total{class}` and carry the wrong error class in its
+event.
+
+**Context:** 2026-10-13 — found during the v0.5.0 docs review. Unwrap
+`*url.Error` (its `Err` field) before the substring switch, and add table
+rows with misleading URLs to the classifier tests. This is an engine change
+(`checks/http`), so it ships as its own PR with the embedding consumer's repin
+check.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
 ## Admin server
 
@@ -365,6 +388,22 @@ the write, then assert a third request still gets 200, not 503.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
+### Pin the documented `/metrics` responses and shared-subject triggers
+
+**What:** Add tests for behaviour docs/OPERATIONS.md now documents but no test
+pins: the two exact `/metrics` 503 bodies (the 2-scrape limit and the 10s
+timeout), content negotiation (text and protobuf, no OpenMetrics), and every
+documented trigger of the `targets share an event subject` warning (URLs that
+differ only in userinfo, query, fragment or normalisation, more than one
+`<unparseable>` URL with no `url` label, and two targets given the same `url`
+label).
+
+**Why:** The documented behaviour is correct today (checked during the v0.5.0
+docs review), but nothing fails if a dependency bump or a refactor changes it
+and the docs go stale.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 ## Release
 
 ### Confirm the first published image is public and verify its signatures
@@ -374,7 +413,27 @@ the write, then assert a third request still gets 200, not 503.
 fairbearlab/descry, then run the `cosign verify` and `cosign verify-blob`
 commands from README.md's "Verify a release" against v0.5.0, and
 `kubectl apply -k examples/kubernetes` on a kind cluster without the local
-overlay.
+overlay. Then run `go version -m` on one release archive binary (linux/amd64)
+and on the image's `/ko-app/descry` (linux/amd64), in a fresh empty
+directory:
+
+```bash
+TAG=v0.5.0; VER=${TAG#v}
+gh release download "$TAG" -R fairbearlab/descry -p "descry_${VER}_Linux_x86_64.tar.gz"
+mkdir archive && tar -xzf "descry_${VER}_Linux_x86_64.tar.gz" -C archive descry
+go version -m archive/descry
+digest="$(crane digest ghcr.io/fairbearlab/descry:${TAG})"
+mkdir image && crane export --platform linux/amd64 "ghcr.io/fairbearlab/descry@${digest}" - | tar -xf - -C image
+go version -m image/ko-app/descry
+```
+
+Both must show `mod github.com/fairbearlab/descry v0.5.0` (no `+dirty`),
+`build vcs.modified=false`, and `vcs.revision` equal to
+`git rev-parse v0.5.0^{commit}`. ko writes the binary as `/ko-app/descry`,
+with a leading `/`, so the `tar` above extracts the whole (small) image
+filesystem rather than naming that member; tar strips the `/`. If
+`image/ko-app/descry` is missing, list the stream with `tar -tf -` first, or
+copy the file out with `docker create --platform linux/amd64` and `docker cp`.
 
 **Why:** The push, the image signature and the checksums signature first run
 on the v0.5.0 tag: the CI snapshot builds the image but skips publishing and
@@ -382,7 +441,9 @@ signing. A first push with the workflow's `GITHUB_TOKEN` from this public
 repository creates the package public and linked to it (seen in a
 2026-10-13 rehearsal), but a private package would make anonymous pulls,
 `cosign verify` and the Kubernetes example fail with an authorization error,
-so check it rather than assume it.
+so check it rather than assume it. The build stamp needs the same check: CI
+checks only the linux/amd64 snapshot binary, never a tag run's archive binary
+or the binary inside the image.
 
 **Context:** 2026-10-12 — if the release fails after the image push (the
 image is signed before the GitHub release is created), patch forward with
@@ -391,8 +452,7 @@ every place that names it: `newTag` in `examples/kubernetes/kustomization.yaml`,
 README.md (the install line, the `cosign verify` and `verify-blob` identities,
 the checksum file names and "Releases before v0.5.0"), the
 `examples/kubernetes/README.md` kind walkthrough, the comments in
-`kustomization.yaml` and `deployment.yaml`, and the changelog. Once the image
-is published, also reword the walkthrough's "Until that release exists".
+`kustomization.yaml` and `deployment.yaml`, and the changelog.
 
 **Cleanup:** ko pushes `:vX` and `:latest` before cosign signs them, so even
 a run that succeeds leaves `:latest` pointing at an unsigned digest for the
@@ -481,20 +541,6 @@ config pass every guard:
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
-### Protect release tags with a ruleset
-
-**What:** Add a repository tag ruleset on `v*` that blocks updates and
-deletions and restricts creation to the maintainers who cut releases. This is
-a repository setting the owner applies; nothing in the tree enforces it.
-
-**Why:** Any pushed `v*` tag runs `release.yml`, and that run gets a valid
-keyless signature for `release.yml@refs/tags/<tag>`, the identity README.md's
-"Verify a release" pins. Tags are mutable: without the ruleset, anyone who can
-push a tag can create one or move an existing one to another commit, and the
-release it publishes still verifies.
-
-**Effort:** S · **Priority:** P1 · **Depends on:** nothing
-
 ### Verify Scorecard credits the signed releases
 
 **What:** After v0.5.0, check the OpenSSF Scorecard result for this
@@ -525,6 +571,25 @@ someone bumps it by hand, including after distroless publishes a fix.
 **Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
 ## Completed
+
+### Protect release tags with a ruleset
+
+**What:** Add a repository tag ruleset on `v*` that blocks updates and
+deletions and restricts creation to the maintainers who cut releases. This is
+a repository setting the owner applies; nothing in the tree enforces it.
+
+**Why:** Any pushed `v*` tag runs `release.yml`, and that run gets a valid
+keyless signature for `release.yml@refs/tags/<tag>`, the identity README.md's
+"Verify a release" pins. Tags are mutable: without the ruleset, anyone who can
+push a tag can create one or move an existing one to another commit, and the
+release it publishes still verifies.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+**Completed:** 2026-10-13 — done in repository settings: a ruleset on
+`refs/tags/v*` blocks updates, deletions and non-fast-forward pushes with no
+bypass, and a second ruleset restricts creating `v*` tags to repository
+admins. Nothing in the tree enforces either.
 
 ### Publish the container image before v0.5.0 is tagged
 
