@@ -85,14 +85,21 @@ yval() {
     sed -e 's/[[:space:]]*$//' -e "s/^'\\(.*\\)'\$/\\1/" -e 's/^"\(.*\)"$/\1/'
 }
 
-# step_window FILE ACTION: print the lines of the first step that has
-# "uses: ACTION@", from the uses line until the next step (a line starting
-# "- ") or a line indented less than the uses line. Comments and blank lines
+# uses_lines FILE ACTION: the line numbers of the "uses: ACTION@" lines in FILE,
+# comment lines excluded.
+uses_lines() {
+  grep -nF "uses: $2@" "$1" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' | sed -e 's/:.*$//'
+}
+
+# step_window FILE ACTION [LINE]: print the lines of a step that has
+# "uses: ACTION@" (the one at LINE, else the first), from the uses line until
+# the next step (a line starting "- ") or a line indented less than the uses
+# line. Comment lines never open a window; comments and blank lines inside one
 # are skipped.
 step_window() {
-  awk -v act="$2@" '
+  awk -v act="$2@" -v start="${3:-0}" '
     function ind(s) { match(s, /^[ \t]*/); return RLENGTH }
-    st == 0 && index($0, "uses: " act) { st = 1; base = ind($0); print; next }
+    st == 0 && $0 !~ /^[ \t]*#/ && index($0, "uses: " act) && (start == 0 || NR == start) { st = 1; base = ind($0); print; next }
     st == 1 {
       if ($0 ~ /^[ \t]*$/ || $0 ~ /^[ \t]*#/) next
       if ($0 ~ /^[ \t]*-[ \t]/) exit
@@ -102,9 +109,9 @@ step_window() {
   ' "$1"
 }
 
-# step_version FILE ACTION: the first version: value inside the action's step.
+# step_version FILE ACTION [LINE]: the first version: value inside the step.
 step_version() {
-  step_window "$1" "$2" | yval version | grep -v '^$' | head -1
+  step_window "$1" "$2" "${3:-0}" | yval version | grep -v '^$' | head -1
 }
 
 tv() { # tool name in .tool-versions
@@ -125,20 +132,27 @@ else
   gomod_ver=
 fi
 
-# pins-go-workflows
-occ=
+# pins-go-workflows: every actions/setup-go step must read go.mod and set no
+# go-version. A step with neither key would run the runner's preinstalled Go.
+nsteps=0
+bad=0
 godirect=
 for f in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -f "$f" ] || continue
-  o=$(grep -nE '(^|[[:space:],{])go-version-file:' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' |
-    while IFS= read -r l; do
-      v=$(printf '%s\n' "${l#*:}" | yval go-version-file | head -1)
-      printf '%s:%s %s\n' "$f" "${l%%:*}" "$v"
-    done)
-  if [ -n "$o" ]; then
-    occ="$occ$o
-"
-  fi
+  for ln in $(uses_lines "$f" actions/setup-go); do
+    nsteps=$((nsteps + 1))
+    win=$(step_window "$f" actions/setup-go "$ln")
+    has_gv=$(printf '%s\n' "$win" | grep -cE '(^|[[:space:],{])go-version:')
+    gvf=$(printf '%s\n' "$win" | yval go-version-file | head -1)
+    gvf=${gvf#./}
+    if [ -z "$gvf" ] && [ "$has_gv" -eq 0 ]; then
+      bad=1
+      emit FAIL pins-go-workflows "$f:$ln setup-go step sets neither go-version-file nor go-version; it would use the runner's Go, so set go-version-file: go.mod"
+    elif [ -n "$gvf" ] && [ "$gvf" != go.mod ]; then
+      bad=1
+      emit FAIL pins-go-workflows "$f:$ln uses '$gvf', want go.mod"
+    fi
+  done
   g=$(grep -nE '(^|[[:space:],{])go-version:' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' |
     while IFS= read -r l; do printf '%s:%s\n' "$f" "${l%%:*}"; done)
   if [ -n "$g" ]; then
@@ -146,34 +160,17 @@ for f in .github/workflows/*.yml .github/workflows/*.yaml; do
 "
   fi
 done
-if [ -z "$occ" ]; then
-  emit FAIL pins-go-workflows "cannot parse: no go-version-file in workflows"
-else
-  bad=0
-  nocc=0
-  while IFS= read -r l; do
-    [ -n "$l" ] || continue
-    nocc=$((nocc + 1))
-    case $l in
-      *" go.mod") ;;
-      *)
-        bad=1
-        emit FAIL pins-go-workflows "${l% *} uses '${l#* }', want go.mod"
-        ;;
-    esac
-  done <<EOF_OCC
-$occ
-EOF_OCC
-  while IFS= read -r l; do
-    [ -n "$l" ] || continue
-    bad=1
-    emit FAIL pins-go-workflows "$l sets go-version; use go-version-file: go.mod"
-  done <<EOF_DIRECT
+while IFS= read -r l; do
+  [ -n "$l" ] || continue
+  bad=1
+  emit FAIL pins-go-workflows "$l sets go-version; use go-version-file: go.mod"
+done <<EOF_DIRECT
 $godirect
 EOF_DIRECT
-  if [ "$bad" -eq 0 ]; then
-    emit PASS pins-go-workflows "$nocc setup-go steps read go.mod (go $gomod_ver)"
-  fi
+if [ "$nsteps" -eq 0 ]; then
+  emit FAIL pins-go-workflows "cannot parse: no actions/setup-go step in workflows"
+elif [ "$bad" -eq 0 ]; then
+  emit PASS pins-go-workflows "$nsteps setup-go steps read go.mod (go $gomod_ver)"
 fi
 
 # pins-tool-versions-go
@@ -185,11 +182,27 @@ elif [ -z "$gomod_ver" ]; then
 elif [ "$tv_go" = "$gomod_ver" ]; then
   emit PASS pins-tool-versions-go ".tool-versions golang $tv_go matches go.mod"
 else
-  msg=".tool-versions golang $tv_go != go.mod $gomod_ver; bump .tool-versions golang to $gomod_ver (dependabot bumps go.mod only)"
-  if [ "$mode" = static ]; then
-    emit WARN pins-tool-versions-go "$msg"
-  else
-    emit FAIL pins-tool-versions-go "$msg"
+  minor_only=0
+  case $gomod_ver in *.*.*) ;; *) minor_only=1 ;; esac
+  case $tv_go in
+    "$gomod_ver".*)
+      if [ "$minor_only" -eq 1 ]; then
+        emit WARN pins-tool-versions-go ".tool-versions golang $tv_go is within go.mod $gomod_ver; go.mod pins a minor only"
+        tv_go=
+      fi
+      ;;
+  esac
+  if [ -n "$tv_go" ]; then
+    if [ "$minor_only" -eq 1 ]; then
+      msg=".tool-versions golang $tv_go != go.mod $gomod_ver.x; bump .tool-versions golang to a $gomod_ver release (dependabot bumps go.mod only)"
+    else
+      msg=".tool-versions golang $tv_go != go.mod $gomod_ver; bump .tool-versions golang to $gomod_ver (dependabot bumps go.mod only)"
+    fi
+    if [ "$mode" = static ]; then
+      emit WARN pins-tool-versions-go "$msg"
+    else
+      emit FAIL pins-tool-versions-go "$msg"
+    fi
   fi
 fi
 
@@ -210,16 +223,48 @@ else
   emit FAIL pins-golangci "ci.yml pins golangci-lint $ci_lint but .tool-versions has $tv_lint"
 fi
 
-emit PASS pins-goreleaser "agreement across ci.yml/release.yml guarded by TestGoreleaserVersionPinned"
+# pins-goreleaser: every goreleaser-action step in ci.yml and release.yml must
+# pin one version. TestGoreleaserVersionPinned also demands an exact vX.Y.Z.
+gr_seen=
+gr_bad=0
+gr_n=0
+for f in .github/workflows/ci.yml .github/workflows/release.yml; do
+  [ -f "$f" ] || continue
+  for ln in $(uses_lines "$f" goreleaser/goreleaser-action); do
+    gr_n=$((gr_n + 1))
+    v=$(step_version "$f" goreleaser/goreleaser-action "$ln")
+    v=${v#v}
+    if [ -z "$v" ]; then
+      gr_bad=1
+      emit FAIL pins-goreleaser "cannot parse: no version in the goreleaser-action step at $f:$ln"
+    else
+      case " $gr_seen " in
+        *" $v "*) ;;
+        *) gr_seen="$gr_seen $v" ;;
+      esac
+    fi
+  done
+done
+if [ "$gr_n" -eq 0 ]; then
+  emit FAIL pins-goreleaser "cannot parse: no goreleaser-action step in ci.yml or release.yml"
+elif [ "$gr_bad" -eq 0 ]; then
+  case ${gr_seen# } in
+    *" "*) emit FAIL pins-goreleaser "goreleaser-action steps pin different versions:$gr_seen" ;;
+    *) emit PASS pins-goreleaser "$gr_n goreleaser-action steps pin ${gr_seen# }" ;;
+  esac
+fi
 
 go_ok=1
+go_skip="Go version mismatch, see go-installed"
 if [ "$mode" = full ]; then
   # go-installed
   if ! command -v go >/dev/null 2>&1; then
     go_ok=0
+    go_skip="go not on PATH, see go-installed"
     emit FAIL go-installed "go not found on PATH; asdf install / mise install"
   elif [ -z "$gomod_ver" ]; then
     go_ok=0
+    go_skip="go.mod has no go line, see go-installed"
     emit FAIL go-installed "cannot parse: no go line in go.mod"
   else
     gov=$(go env GOVERSION 2>/dev/null | head -1)
@@ -274,11 +319,15 @@ if [ "$mode" = full ]; then
       gr_pin=${gr_pin#v}
     fi
     gr_out=$(goreleaser --version 2>/dev/null)
+    gr_rc=$?
     gr=$(printf '%s\n' "$gr_out" | grep 'GitVersion' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     if [ -z "$gr" ]; then
       gr=$(printf '%s\n' "$gr_out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     fi
-    if [ -z "$gr_pin" ]; then
+    if [ "$gr_rc" -ne 0 ]; then
+      # Typically an asdf/mise shim with no goreleaser version set for this repo.
+      emit SKIP goreleaser-installed "goreleaser on PATH but not runnable here (only needed for release-config changes)"
+    elif [ -z "$gr_pin" ]; then
       emit WARN goreleaser-installed "cannot parse goreleaser pin in release.yml"
     elif [ -z "$gr" ]; then
       emit WARN goreleaser-installed "goreleaser on PATH but its version is unreadable; CI pins $gr_pin"
@@ -371,8 +420,8 @@ fi
 
 if [ "$mode" = full ]; then
   if [ "$go_ok" -eq 0 ]; then
-    emit SKIP harness-modcache "Go version mismatch, see go-installed"
-    emit SKIP harness-govulncheck "Go version mismatch, see go-installed"
+    emit SKIP harness-modcache "$go_skip"
+    emit SKIP harness-govulncheck "$go_skip"
   else
     if GOPROXY=off GOFLAGS=-mod=readonly go list -deps -test ./... >/dev/null 2>&1; then
       emit PASS harness-modcache "module cache complete"

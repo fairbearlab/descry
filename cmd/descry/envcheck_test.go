@@ -338,12 +338,15 @@ type envFixture struct {
 	parent string
 	repo   string
 	stubs  string
+	path   string // PATH override set by omit; the stubs plus the system path when empty
 	files  map[string]string
 }
 
 const envStubGo = `#!/bin/sh
 case "$1 $2" in
   "env GOVERSION") echo "${STUB_GOVERSION:-go1.26.9}" ;;
+  "list "*) exit "${STUB_GO_LIST_RC:-0}" ;;
+  "tool "*) exit "${STUB_GO_TOOL_RC:-0}" ;;
   *) exit 0 ;;
 esac
 `
@@ -355,7 +358,12 @@ case "$1 $2" in
 esac
 `
 
+// envStubGoreleaser prints a version; STUB_GORELEASER_BROKEN mimics an
+// asdf/mise shim with no version set (exit 1, nothing on stdout) and
+// STUB_GORELEASER_BLANK a goreleaser that exits 0 without naming a version.
 const envStubGoreleaser = `#!/bin/sh
+if [ -n "${STUB_GORELEASER_BROKEN:-}" ]; then echo "No version is set for command goreleaser" >&2; exit 1; fi
+if [ -n "${STUB_GORELEASER_BLANK:-}" ]; then echo "goreleaser"; exit 0; fi
 echo "GitVersion:    ${STUB_GORELEASER:-2.18.3}"
 `
 
@@ -389,7 +397,43 @@ func newEnvFixture(t *testing.T, interp envCheckInterp, mutate func(*testing.T, 
 }
 
 func (fx *envFixture) env(extra ...string) []string {
-	return envCheckEnv(fx.t, fx.parent, fx.stubs+string(os.PathListSeparator)+envCheckSysPath(fx.t), extra...)
+	path := fx.path
+	if path == "" {
+		path = fx.stubs + string(os.PathListSeparator) + envCheckSysPath(fx.t)
+	}
+	return envCheckEnv(fx.t, fx.parent, path, extra...)
+}
+
+// envCheckTools are the external commands bin/env-check runs besides the
+// stubbed go, golangci-lint and goreleaser.
+var envCheckTools = []string{"git", "awk", "sed", "grep", "head", "tr", "basename"}
+
+// omit removes the named stubs and narrows PATH to the stubs left plus
+// one-line wrappers for envCheckTools. The system path is dropped because a
+// real go or golangci-lint can live in the directory of git or in /usr/bin,
+// and a case about a missing tool must not depend on the machine.
+func (fx *envFixture) omit(names ...string) {
+	fx.t.Helper()
+	for _, name := range names {
+		if err := os.Remove(filepath.Join(fx.stubs, name)); err != nil {
+			fx.t.Fatalf("remove stub %s: %v", name, err)
+		}
+	}
+	wrap := filepath.Join(fx.parent, "tools")
+	if err := os.MkdirAll(wrap, 0o750); err != nil {
+		fx.t.Fatalf("mkdir tools: %v", err)
+	}
+	for _, tool := range envCheckTools {
+		resolved, err := exec.LookPath(tool)
+		if err != nil {
+			fx.t.Skipf("%s not on PATH", tool)
+		}
+		body := "#!/bin/sh\nexec " + resolved + " \"$@\"\n"
+		if err := os.WriteFile(filepath.Join(wrap, tool), []byte(body), 0o700); err != nil { // #nosec G306 -- test wrapper on PATH must be executable
+			fx.t.Fatalf("write wrapper %s: %v", tool, err)
+		}
+	}
+	fx.path = fx.stubs + string(os.PathListSeparator) + wrap
 }
 
 func (fx *envFixture) git(dir string, args ...string) {
@@ -487,7 +531,7 @@ func TestEnvCheckRealRepoParses(t *testing.T) {
 }
 
 // Value: protects=each pin comparison in env-check fails (or warns, under --static) on drift, and fails closed when it cannot read a pin
-// fails_when=a drifted .tool-versions, go.mod toolchain, workflow go-version or golangci-lint version still passes, a missing step or key borrows another step's version:, or a flow-style or commented value is misread
+// fails_when=a drifted .tool-versions, go.mod toolchain, workflow go-version, golangci-lint or goreleaser version still passes, a setup-go step without a version key passes, a missing step or key borrows another step's version:, a missing go or golangci-lint passes, or a flow-style, commented or ./go.mod value is misread
 // why_new=a silent pass here would let local and CI toolchains drift unseen; the real repo has no drift to exercise it
 // seam=none; no_claim=does not prove the goreleaser pins agree across workflows, TestGoreleaserVersionPinned does
 //
@@ -501,6 +545,7 @@ func TestEnvCheckPinDrift(t *testing.T) {
 		static   bool
 		mutate   func(*testing.T, map[string]string)
 		env      map[string]string // STUB_* overrides
+		omit     []string          // stubs to leave off PATH
 		wantCode int
 		want     map[string]envExp
 		strict   bool
@@ -554,7 +599,7 @@ func TestEnvCheckPinDrift(t *testing.T) {
 			want:     map[string]envExp{"pins-go-workflows": {"FAIL", "other/go.mod"}},
 		},
 		{
-			name:   "no go-version-file anywhere fails closed",
+			name:   "no workflow steps anywhere fails closed",
 			static: true,
 			mutate: func(_ *testing.T, m map[string]string) {
 				m[".github/workflows/ci.yml"] = "name: ci\non: [push]\njobs: {}\n"
@@ -564,6 +609,7 @@ func TestEnvCheckPinDrift(t *testing.T) {
 			want: map[string]envExp{
 				"pins-go-workflows": {"FAIL", "cannot parse"},
 				"pins-golangci":     {"FAIL", "cannot parse"},
+				"pins-goreleaser":   {"FAIL", "cannot parse"},
 			},
 		},
 		{
@@ -651,6 +697,160 @@ func TestEnvCheckPinDrift(t *testing.T) {
 			want:     map[string]envExp{"golangci-installed": {"FAIL", "2.11.0"}},
 		},
 		{
+			name:   "setup-go step with a with block but no version key fails",
+			static: true,
+			mutate: func(t *testing.T, m map[string]string) {
+				replaceOnce(t, m, ".github/workflows/ci.yml", "        with:\n          go-version-file: go.mod\n          cache: true\n", "        with:\n          cache: true\n")
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-go-workflows": {"FAIL", "neither go-version-file nor go-version"}},
+		},
+		{
+			name:   "setup-go step with no with block fails",
+			static: true,
+			mutate: func(t *testing.T, m map[string]string) {
+				replaceOnce(t, m, ".github/workflows/release.yml", "        with: { go-version-file: go.mod, cache: false }\n", "")
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-go-workflows": {"FAIL", "release.yml:"}},
+		},
+		{
+			name:   "go-version-file ./go.mod is the same file",
+			static: true,
+			mutate: func(t *testing.T, m map[string]string) {
+				replaceOnce(t, m, ".github/workflows/ci.yml", "go-version-file: go.mod", "go-version-file: ./go.mod")
+			},
+			want:   map[string]envExp{"pins-go-workflows": {"PASS", "4 setup-go steps"}},
+			strict: true,
+		},
+		{
+			name:   "commented-out golangci-lint step above the real one",
+			static: true,
+			mutate: func(t *testing.T, m map[string]string) {
+				replaceOnce(t, m, ".github/workflows/ci.yml", envFixtureGolangciStep,
+					"      # - uses: golangci/golangci-lint-action@deadbeef # old pin\n      #   with:\n      #     version: v1.0.0\n"+envFixtureGolangciStep)
+			},
+			want:   map[string]envExp{"pins-golangci": {"PASS", ""}},
+			strict: true,
+		},
+		{
+			name:   "goreleaser versions differ between ci.yml and release.yml",
+			static: true,
+			mutate: func(t *testing.T, m map[string]string) {
+				replaceOnce(t, m, ".github/workflows/release.yml", "version: v2.18.3", "version: v2.19.0")
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-goreleaser": {"FAIL", "different versions"}},
+		},
+		{
+			name:   "goreleaser versions differ inside ci.yml",
+			static: true,
+			mutate: func(t *testing.T, m map[string]string) {
+				replaceOnce(t, m, ".github/workflows/ci.yml", "version: v2.18.3", "version: v2.19.0")
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-goreleaser": {"FAIL", "different versions"}},
+		},
+		{
+			name:   "goreleaser step with no version fails closed",
+			static: true,
+			mutate: func(t *testing.T, m map[string]string) {
+				replaceOnce(t, m, ".github/workflows/release.yml", "          version: v2.18.3\n", "")
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-goreleaser": {"FAIL", "cannot parse"}},
+		},
+		{
+			name: "go.mod pins a minor only and the installed go is within it",
+			mutate: func(_ *testing.T, m map[string]string) {
+				m["go.mod"] = "module example.com/envcheckfixture\n\ngo 1.26\n"
+			},
+			wantCode: 0,
+			want: map[string]envExp{
+				"go-installed":          {"WARN", "minor only"},
+				"pins-tool-versions-go": {"WARN", "minor only"},
+			},
+			strict: true,
+		},
+		{
+			name: "go.mod pins a minor only and .tool-versions is another minor",
+			mutate: func(t *testing.T, m map[string]string) {
+				m["go.mod"] = "module example.com/envcheckfixture\n\ngo 1.26\n"
+				replaceOnce(t, m, ".tool-versions", "golang 1.26.9", "golang 1.25.3")
+			},
+			wantCode: 1,
+			want: map[string]envExp{
+				"go-installed":          {"WARN", "minor only"},
+				"pins-tool-versions-go": {"FAIL", "1.26 release"},
+			},
+		},
+		{
+			name:     "go.mod has no go line",
+			mutate:   func(_ *testing.T, m map[string]string) { m["go.mod"] = "module example.com/envcheckfixture\n" },
+			wantCode: 1,
+			want: map[string]envExp{
+				"go-installed":          {"FAIL", "cannot parse"},
+				"pins-tool-versions-go": {"FAIL", "cannot parse"},
+				"harness-modcache":      {"SKIP", "go.mod has no go line"},
+				"harness-govulncheck":   {"SKIP", "go.mod has no go line"},
+			},
+		},
+		{
+			name:     "go missing from PATH",
+			omit:     []string{"go"},
+			wantCode: 1,
+			want: map[string]envExp{
+				"go-installed":        {"FAIL", "go not found"},
+				"harness-tools":       {"FAIL", "missing from PATH: go"},
+				"harness-modcache":    {"SKIP", "go not on PATH"},
+				"harness-govulncheck": {"SKIP", "go not on PATH"},
+			},
+		},
+		{
+			name:     "golangci-lint missing from PATH",
+			omit:     []string{"golangci-lint"},
+			wantCode: 1,
+			want: map[string]envExp{
+				"golangci-installed": {"FAIL", "not found"},
+				"harness-tools":      {"FAIL", "golangci-lint"},
+			},
+		},
+		{
+			name:     "goreleaser not installed is skipped",
+			omit:     []string{"goreleaser"},
+			wantCode: 0,
+			want:     map[string]envExp{"goreleaser-installed": {"SKIP", "not installed"}},
+			strict:   true,
+		},
+		{
+			name:     "goreleaser shim with no runnable version is skipped",
+			env:      map[string]string{"STUB_GORELEASER_BROKEN": "1"},
+			wantCode: 0,
+			want:     map[string]envExp{"goreleaser-installed": {"SKIP", "not runnable"}},
+			strict:   true,
+		},
+		{
+			name:     "goreleaser that names no version is a warning",
+			env:      map[string]string{"STUB_GORELEASER_BLANK": "1"},
+			wantCode: 0,
+			want:     map[string]envExp{"goreleaser-installed": {"WARN", "unreadable"}},
+			strict:   true,
+		},
+		{
+			name:     "incomplete module cache is a warning",
+			env:      map[string]string{"STUB_GO_LIST_RC": "1"},
+			wantCode: 0,
+			want:     map[string]envExp{"harness-modcache": {"WARN", "module cache incomplete"}},
+			strict:   true,
+		},
+		{
+			name:     "govulncheck unavailable offline is a warning",
+			env:      map[string]string{"STUB_GO_TOOL_RC": "1"},
+			wantCode: 0,
+			want:     map[string]envExp{"harness-govulncheck": {"WARN", "unavailable offline"}},
+			strict:   true,
+		},
+		{
 			name:     "installed goreleaser differs is a warning",
 			env:      map[string]string{"STUB_GORELEASER": "2.17.0"},
 			wantCode: 0,
@@ -662,6 +862,9 @@ func TestEnvCheckPinDrift(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(strings.ReplaceAll(tc.name, " ", "_"), func(t *testing.T) {
 				fx := newEnvFixture(t, interp, tc.mutate)
+				if len(tc.omit) > 0 {
+					fx.omit(tc.omit...)
+				}
 				args := []string(nil)
 				extra := []string{envAllowMain}
 				if tc.static {
