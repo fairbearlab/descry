@@ -289,6 +289,12 @@ jobs:
           version: v2.18.3
           args: release --clean
 `
+
+	// envFixtureExtraJob opens one more ci.yml job; a case appends its steps.
+	envFixtureExtraJob = `  extra:
+    runs-on: ubuntu-latest
+    steps:
+`
 )
 
 func envFixtureFiles(t *testing.T) map[string]string {
@@ -531,7 +537,7 @@ func TestEnvCheckRealRepoParses(t *testing.T) {
 }
 
 // Value: protects=each pin comparison in env-check fails (or warns, under --static) on drift, and fails closed when it cannot read a pin
-// fails_when=a drifted .tool-versions, go.mod toolchain, workflow go-version, golangci-lint or goreleaser version still passes, a setup-go step without a version key passes, a missing step or key borrows another step's version:, a missing go or golangci-lint passes, or a flow-style, commented or ./go.mod value is misread
+// fails_when=a drifted .tool-versions, go.mod toolchain, workflow go-version, golangci-lint or goreleaser version still passes, a setup-go step without a version key passes, a quoted or re-spaced uses: line hides a step from the scan, a missing step or key borrows another step's version:, a missing go or golangci-lint passes, or a flow-style, commented or ./go.mod value is misread
 // why_new=a silent pass here would let local and CI toolchains drift unseen; the real repo has no drift to exercise it
 // seam=none; no_claim=does not prove the goreleaser pins agree across workflows, TestGoreleaserVersionPinned does
 //
@@ -713,6 +719,42 @@ func TestEnvCheckPinDrift(t *testing.T) {
 			},
 			wantCode: 1,
 			want:     map[string]envExp{"pins-go-workflows": {"FAIL", "release.yml:"}},
+		},
+		{
+			name:   "double-quoted setup-go step with no version key fails",
+			static: true,
+			mutate: func(_ *testing.T, m map[string]string) {
+				m[".github/workflows/ci.yml"] += envFixtureExtraJob + "      - uses: \"actions/setup-go@0000000000000000000000000000000000000002\"\n"
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-go-workflows": {"FAIL", "neither go-version-file nor go-version"}},
+		},
+		{
+			name:   "setup-go step with extra blanks after uses: and no version key fails",
+			static: true,
+			mutate: func(_ *testing.T, m map[string]string) {
+				m[".github/workflows/ci.yml"] += envFixtureExtraJob + "      - uses:   actions/setup-go@0000000000000000000000000000000000000002\n"
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-go-workflows": {"FAIL", "neither go-version-file nor go-version"}},
+		},
+		{
+			name:   "single-quoted setup-go step that reads go.mod is counted",
+			static: true,
+			mutate: func(_ *testing.T, m map[string]string) {
+				m[".github/workflows/ci.yml"] += envFixtureExtraJob + "      - name: setup\n        uses: 'actions/setup-go@0000000000000000000000000000000000000002'\n        with: { go-version-file: \"go.mod\" }\n"
+			},
+			want:   map[string]envExp{"pins-go-workflows": {"PASS", "5 setup-go steps"}},
+			strict: true,
+		},
+		{
+			name:   "quoted goreleaser step pinning another version fails",
+			static: true,
+			mutate: func(_ *testing.T, m map[string]string) {
+				m[".github/workflows/release.yml"] += "      - uses: \"goreleaser/goreleaser-action@0000000000000000000000000000000000000003\"\n        with:\n          version: v2.19.0\n"
+			},
+			wantCode: 1,
+			want:     map[string]envExp{"pins-goreleaser": {"FAIL", "different versions"}},
 		},
 		{
 			name:   "go-version-file ./go.mod is the same file",

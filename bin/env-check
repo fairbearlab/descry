@@ -85,21 +85,30 @@ yval() {
     sed -e 's/[[:space:]]*$//' -e "s/^'\\(.*\\)'\$/\\1/" -e 's/^"\(.*\)"$/\1/'
 }
 
+# act_re ACTION: ACTION as an ERE with each "." bracketed, so it matches only
+# itself. Action names are owner/repo, so no other ERE character appears.
+act_re() {
+  printf '%s\n' "$1" | sed -e 's/[.]/[.]/g'
+}
+
 # uses_lines FILE ACTION: the line numbers of the "uses: ACTION@" lines in FILE,
-# comment lines excluded.
+# comment lines excluded. Any run of blanks after "uses:" and a single or double
+# quote before the action count, so a quoted or re-spaced step is still seen.
 uses_lines() {
-  grep -nF "uses: $2@" "$1" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' | sed -e 's/:.*$//'
+  grep -nE "uses:[[:space:]]+[\"']?$(act_re "$2")@" "$1" 2>/dev/null |
+    grep -vE '^[0-9]+:[[:space:]]*#' | sed -e 's/:.*$//'
 }
 
 # step_window FILE ACTION [LINE]: print the lines of a step that has
-# "uses: ACTION@" (the one at LINE, else the first), from the uses line until
-# the next step (a line starting "- ") or a line indented less than the uses
-# line. Comment lines never open a window; comments and blank lines inside one
-# are skipped.
+# "uses: ACTION@" (the one at LINE, else the first; matched as in uses_lines),
+# from the uses line until the next step (a line starting "- ") or a line
+# indented less than the uses line. Comment lines never open a window; comments
+# and blank lines inside one are skipped.
 step_window() {
-  awk -v act="$2@" -v start="${3:-0}" '
+  awk -v act="$(act_re "$2")@" -v start="${3:-0}" '
     function ind(s) { match(s, /^[ \t]*/); return RLENGTH }
-    st == 0 && $0 !~ /^[ \t]*#/ && index($0, "uses: " act) && (start == 0 || NR == start) { st = 1; base = ind($0); print; next }
+    BEGIN { re = "uses:[ \t]+[\"\047]?" act }
+    st == 0 && $0 !~ /^[ \t]*#/ && $0 ~ re && (start == 0 || NR == start) { st = 1; base = ind($0); print; next }
     st == 1 {
       if ($0 ~ /^[ \t]*$/ || $0 ~ /^[ \t]*#/) next
       if ($0 ~ /^[ \t]*-[ \t]/) exit
