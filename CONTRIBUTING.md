@@ -97,6 +97,8 @@ so a local run is a sanity check, not the gate itself.
 
 - Branch from `main`, PR back to `main` — no direct pushes to `main`.
 - Keep PRs small and focused — one concern per PR.
+- Before /ship, look up changed paths in risk-zones.md and prefix the
+  invocation with the row.
 - Commit subjects follow the repo's existing style: `feat:`, `fix:`, `chore:`,
   `docs:` prefixes (see `git log`).
 - Vulnerabilities do not go in a PR — see [SECURITY.md](SECURITY.md) for private
