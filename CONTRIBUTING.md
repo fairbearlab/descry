@@ -21,6 +21,8 @@ git clone https://github.com/fairbearlab/descry && cd descry
 go build ./...
 ```
 
+Run `bin/env-check` before installing or editing: it checks your tool versions against CI, the test toolchain, and that you are working in a git worktree (`git worktree add ../descry-<topic>`); in a single plain clone, run `ENV_CHECK_ALLOW_MAIN=1 bin/env-check` instead.
+
 No code generation, no external services needed to build or run the tests.
 
 ## Before you push
