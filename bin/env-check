@@ -1,0 +1,673 @@
+#!/usr/bin/env bash
+# env-check: verify a descry checkout before installing or editing.
+#
+# Checks (one section below per check, in this order):
+#   a  tool pins match CI (and, unless --static, the installed tools match)
+#   b  no Compose file is tracked without container checks
+#   c  working in a linked git worktree, not the shared checkout
+#   d  test harness complete
+#   e  no Compose file is tracked without a per-worktree project name
+#
+# Contract (output format and exit codes are tested; keep the rest):
+#   - one line per result: PASS|FAIL|WARN|SKIP <id>: <reason>
+#   - last line: env-check: N FAIL, M WARN, P PASS, S SKIP
+#   - exit 0 when nothing FAILed, 1 on any FAIL, 2 on a usage error
+#   - read-only and offline: reads every version from files at run time
+#   - bash 3.2 (macOS /bin/bash): no arrays, mapfile or associative arrays,
+#     POSIX sed/awk/grep only; the tests run it with a PATH that offers only
+#     git, awk, sed, grep, head, tr and basename (plus the Go tools), and cat
+#     for --help
+#   - no `set -e` on purpose: every check runs even after one fails
+#   - no sidecar programs: everything is shell
+
+set -u -o pipefail
+
+# ------------------------------------------------------------------ constants
+readonly CI_WORKFLOW=.github/workflows/ci.yml
+readonly RELEASE_WORKFLOW=.github/workflows/release.yml
+readonly SCRIPT_REL=bin/env-check
+readonly HARNESS_FILES="go.mod go.sum .tool-versions .golangci.yml $CI_WORKFLOW $SCRIPT_REL"
+readonly ASDF_HINT='asdf install / mise install'
+readonly COMPOSE_RE='(^|/)([^/]*\.)?(docker-)?compose(\.[^/]*)?\.ya?ml$'
+
+# Shared state. Written by the step named in the comment, read by later steps.
+MODE=full            # parse_args: "full", or "static" with --static
+NFAIL=0 NWARN=0 NPASS=0 NSKIP=0   # emit
+TOP=""               # enter_checkout: physical repo root (also the cwd)
+GOMOD_VER=""         # derive_gomod_version: effective CI Go, "" if go.mod has none
+TV_LINT=""           # derive_tool_versions_lint: golangci-lint pin in .tool-versions
+SETUP_GO_STEPS=0     # scan_setup_go_steps: number of actions/setup-go steps
+GR_STEPS=0           # scan_goreleaser_steps: number of goreleaser-action steps
+GR_SEEN=""           # scan_goreleaser_steps: distinct pinned versions, each led by a space
+GO_OK=1              # check_go_installed: 0 when the installed Go cannot be used or mismatches
+GO_SKIP="Go version mismatch, see go-installed"   # check_go_installed: why, when GO_OK=0
+TRACKED_COMPOSE=""   # check_containers: first tracked Compose file (e reads it)
+
+# ------------------------------------------------------------------ output
+# Only emit() and finish() know the line and summary format, so changing the
+# format never touches a check. Checks call emit directly.
+emit() { # STATUS ID REASON: the only function that prints a result line
+  case $1 in
+    FAIL) NFAIL=$((NFAIL + 1)) ;;
+    WARN) NWARN=$((NWARN + 1)) ;;
+    PASS) NPASS=$((NPASS + 1)) ;;
+    SKIP) NSKIP=$((NSKIP + 1)) ;;
+  esac
+  printf '%s %s: %s\n' "$1" "$2" "$3"
+}
+
+finish() { # print the summary line and exit
+  printf 'env-check: %d FAIL, %d WARN, %d PASS, %d SKIP\n' "$NFAIL" "$NWARN" "$NPASS" "$NSKIP"
+  if [ "$NFAIL" -eq 0 ]; then exit 0; fi
+  exit 1
+}
+
+# ------------------------------------------------------------------ utilities
+# Generic helpers. A sed/awk one-liner gets its own named function with a
+# sample input and output line in a comment.
+
+# yval KEY: read lines on stdin, print the tokenized value of KEY for each line
+# that has it. The key needs a left boundary of line start, whitespace, "{" or
+# ","; the value runs to the first ",", "}" or "#", is trimmed, and loses one
+# pair of surrounding quotes. Works for block and flow style YAML.
+#   "          go-version-file: 'go.mod'  # pin"  ->  "go.mod"
+#   "- uses: x/y@v1, with: {version: v2.1}"        ->  "v2.1"  (KEY=version)
+yval() {
+  # Stage 1: keep what follows "KEY:" up to the first "," "}" or "#".
+  # Stage 2: trim trailing blanks, then strip one pair of '...' or "..." quotes.
+  sed -n -e "s/^\\(.*[[:space:]{,]\\)\\{0,1\\}$1:[[:space:]]*\\([^,}#]*\\).*\$/\\2/p" |
+    sed -e 's/[[:space:]]*$//' -e "s/^'\\(.*\\)'\$/\\1/" -e 's/^"\(.*\)"$/\1/'
+}
+
+# act_re ACTION: ACTION as an ERE with each "." bracketed, so it matches only
+# itself. Action names are owner/repo, so no other ERE character appears.
+#   "actions/setup-go"  ->  "actions/setup-go"
+#   "a.b/c"             ->  "a[.]b/c"
+act_re() {
+  printf '%s\n' "$1" | sed -e 's/[.]/[.]/g'
+}
+
+# uses_lines FILE ACTION: the line numbers of the "uses: ACTION@" lines in FILE,
+# comment lines excluded. Any run of blanks after "uses:" and a single or double
+# quote before the action count, so a quoted or re-spaced step is still seen.
+uses_lines() {
+  grep -nE "uses:[[:space:]]+[\"']?$(act_re "$2")@" "$1" 2>/dev/null |
+    grep -vE '^[0-9]+:[[:space:]]*#' | sed -e 's/:.*$//'
+}
+
+# step_window FILE ACTION [LINE]: print the lines of a step that has
+# "uses: ACTION@" (the one at LINE, else the first; matched as in uses_lines),
+# from the uses line until the next step (a line starting "- ") or a line
+# indented less than the uses line. Comment lines never open a window; comments
+# and blank lines inside one are skipped.
+#   "      - uses: actions/setup-go@v5"
+#   "        with:"
+#   "          go-version-file: go.mod"   -> the three lines, then stops at the
+#   "      - run: go test ./..."             next "- " line
+step_window() {
+  awk -v act="$(act_re "$2")@" -v start="${3:-0}" '
+    function ind(s) { match(s, /^[ \t]*/); return RLENGTH }
+    BEGIN { re = "uses:[ \t]+[\"\047]?" act }
+    st == 0 && $0 !~ /^[ \t]*#/ && $0 ~ re && (start == 0 || NR == start) { st = 1; base = ind($0); print; next }
+    st == 1 {
+      if ($0 ~ /^[ \t]*$/ || $0 ~ /^[ \t]*#/) next
+      if ($0 ~ /^[ \t]*-[ \t]/) exit
+      if (ind($0) < base) exit
+      print
+    }
+  ' "$1"
+}
+
+# step_version FILE ACTION [LINE]: the first version: value inside the step.
+step_version() {
+  step_window "$1" "$2" "${3:-0}" | yval version | grep -v '^$' | head -1
+}
+
+tv() { # NAME: the version of a tool in .tool-versions, empty if none
+  [ -f .tool-versions ] || return 0
+  awk -v t="$1" '$1 == t { print $2; exit }' .tool-versions
+}
+
+# git_index_mode FILE: the mode git has indexed for FILE, empty if untracked.
+#   "100755 3b18e5... 0	bin/env-check"  ->  "100755"
+git_index_mode() {
+  git ls-files -s "$1" 2>/dev/null | awk '{ print $1; exit }'
+}
+
+# physical_git_dir OPTION: physical path of what `git rev-parse OPTION` names
+# (--git-dir or --git-common-dir), empty if it cannot be entered.
+physical_git_dir() {
+  (cd "$(git rev-parse "$1")" 2>/dev/null && pwd -P)
+}
+
+# ------------------------------------------------------------------ setup
+setup() { # keep Go offline, then enter the repo root
+  # Never download a toolchain or read a go.work from a parent directory.
+  export GOTOOLCHAIN=local GOWORK=off
+  enter_checkout
+}
+
+enter_checkout() { # cd to the repo root, or FAIL git and stop
+  TOP=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -z "$TOP" ]; then
+    emit FAIL git "not inside a git work tree"
+    finish
+  fi
+  cd "$TOP" || {
+    emit FAIL git "cannot enter $TOP"
+    finish
+  }
+}
+
+# ------------------------------------------------------------------ check a
+# Pattern: read_* helpers print one value and emit nothing; check_* helpers
+# emit. Cross-check state is set in one visible place each: GOMOD_VER and
+# TV_LINT by the derive_* steps that check_tool_pins runs first, GO_OK and
+# GO_SKIP by check_go_installed.
+
+check_tool_pins() {
+  derive_gomod_version
+  derive_tool_versions_lint
+  check_pins_go_workflows
+  check_pins_tool_versions_go
+  check_pins_golangci
+  check_pins_goreleaser
+  check_installed_tools
+}
+
+# Effective CI Go: the toolchain line if present, else the go line. setup-go
+# reads this through go-version-file: go.mod.
+derive_gomod_version() { # sets GOMOD_VER
+  GOMOD_VER=
+  [ -f go.mod ] || return 0
+  GOMOD_VER=$(read_gomod_toolchain)
+  if [ -z "$GOMOD_VER" ]; then
+    GOMOD_VER=$(read_gomod_go)
+  fi
+}
+
+derive_tool_versions_lint() { # sets TV_LINT
+  TV_LINT=$(tv golangci-lint)
+}
+
+# "toolchain go1.25.3"  ->  "1.25.3"
+read_gomod_toolchain() {
+  awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2; exit }' go.mod
+}
+
+# "go 1.25"  ->  "1.25"
+read_gomod_go() {
+  awk '$1 == "go" { print $2; exit }' go.mod
+}
+
+# --------------------------------------------------- a: pins-go-workflows
+# Every actions/setup-go step must read go.mod and set no go-version. A step
+# with neither key would run the runner's preinstalled Go.
+check_pins_go_workflows() {
+  # PASS only if this group added no FAIL; every emit in the group is a FAIL of
+  # this id (here and in the other groups using fails_before).
+  local fails_before=$NFAIL
+  SETUP_GO_STEPS=0
+  scan_setup_go_steps
+  report_direct_go_versions
+  if [ "$SETUP_GO_STEPS" -eq 0 ]; then
+    emit FAIL pins-go-workflows "cannot parse: no actions/setup-go step in workflows"
+  elif [ "$NFAIL" -eq "$fails_before" ]; then
+    emit PASS pins-go-workflows "$SETUP_GO_STEPS setup-go steps read go.mod (go $GOMOD_VER)"
+  fi
+}
+
+scan_setup_go_steps() { # counts steps in SETUP_GO_STEPS; FAILs each bad one
+  local f ln
+  for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -f "$f" ] || continue
+    for ln in $(uses_lines "$f" actions/setup-go); do
+      SETUP_GO_STEPS=$((SETUP_GO_STEPS + 1))
+      check_setup_go_step "$f" "$ln"
+    done
+  done
+}
+
+check_setup_go_step() { # FILE LINE
+  local win has_gv gvf
+  win=$(step_window "$1" actions/setup-go "$2")
+  has_gv=$(printf '%s\n' "$win" | grep -cE '(^|[[:space:],{])go-version:')
+  gvf=$(printf '%s\n' "$win" | yval go-version-file | head -1)
+  gvf=${gvf#./}
+  if [ -z "$gvf" ] && [ "$has_gv" -eq 0 ]; then
+    emit FAIL pins-go-workflows "$1:$2 setup-go step sets neither go-version-file nor go-version; it would use the runner's Go, so set go-version-file: go.mod"
+  elif [ -n "$gvf" ] && [ "$gvf" != go.mod ]; then
+    emit FAIL pins-go-workflows "$1:$2 uses '$gvf', want go.mod"
+  fi
+}
+
+# FAIL every go-version: key in any workflow, setup-go step or not.
+report_direct_go_versions() {
+  local f hits line
+  for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -f "$f" ] || continue
+    hits=$(find_direct_go_version_lines "$f")
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      emit FAIL pins-go-workflows "$line sets go-version; use go-version-file: go.mod"
+    done <<< "$hits"
+  done
+}
+
+# find_direct_go_version_lines FILE: FILE:LINE for each non-comment line with a
+# go-version: key.
+#   "14:        go-version: '1.24'"  ->  ".github/workflows/ci.yml:14"
+find_direct_go_version_lines() {
+  grep -nE '(^|[[:space:],{])go-version:' "$1" | grep -vE '^[0-9]+:[[:space:]]*#' |
+    while IFS= read -r line; do printf '%s:%s\n' "$1" "${line%%:*}"; done
+}
+
+# ------------------------------------------------ a: pins-tool-versions-go
+check_pins_tool_versions_go() {
+  local tv_go
+  tv_go=$(tv golang)
+  if [ -z "$tv_go" ]; then
+    emit FAIL pins-tool-versions-go "cannot parse: no golang line in .tool-versions"
+  elif [ -z "$GOMOD_VER" ]; then
+    emit FAIL pins-tool-versions-go "cannot parse: no go line in go.mod"
+  elif [ "$tv_go" = "$GOMOD_VER" ]; then
+    emit PASS pins-tool-versions-go ".tool-versions golang $tv_go matches go.mod"
+  else
+    report_tool_versions_drift "$tv_go" "$GOMOD_VER"
+  fi
+}
+
+# .tool-versions and go.mod differ. A patch release inside a minor-only go.mod
+# pin is only a WARN; anything else is a FAIL, or a WARN under --static.
+report_tool_versions_drift() { # TV_GO GOMOD_VER
+  local tv_go=$1 gomod=$2 minor_only=0 msg
+  case $gomod in *.*.*) ;; *) minor_only=1 ;; esac
+  case $tv_go in
+    "$gomod".*)
+      if [ "$minor_only" -eq 1 ]; then
+        emit WARN pins-tool-versions-go ".tool-versions golang $tv_go is within go.mod $gomod; go.mod pins a minor only"
+        return
+      fi
+      ;;
+  esac
+  if [ "$minor_only" -eq 1 ]; then
+    msg=".tool-versions golang $tv_go != go.mod $gomod.x; bump .tool-versions golang to a $gomod release (dependabot bumps go.mod only)"
+  else
+    msg=".tool-versions golang $tv_go != go.mod $gomod; bump .tool-versions golang to $gomod (dependabot bumps go.mod only)"
+  fi
+  if [ "$MODE" = static ]; then
+    emit WARN pins-tool-versions-go "$msg"
+  else
+    emit FAIL pins-tool-versions-go "$msg"
+  fi
+}
+
+# --------------------------------------------------------- a: pins-golangci
+# read_step_pin FILE ACTION: the version: pin of ACTION's step in FILE, no v
+# prefix; empty if FILE is absent or the step has no version.
+read_step_pin() {
+  local version=
+  if [ -f "$1" ]; then
+    version=$(step_version "$1" "$2")
+    version=${version#v}
+  fi
+  printf '%s' "$version"
+}
+
+check_pins_golangci() { # reads TV_LINT
+  local ci_lint
+  ci_lint=$(read_step_pin "$CI_WORKFLOW" golangci/golangci-lint-action)
+  if [ -z "$ci_lint" ]; then
+    emit FAIL pins-golangci "cannot parse: no golangci-lint-action version in ci.yml"
+  elif [ -z "$TV_LINT" ]; then
+    emit FAIL pins-golangci "cannot parse: no golangci-lint line in .tool-versions"
+  elif [ "$ci_lint" = "$TV_LINT" ]; then
+    emit PASS pins-golangci "ci.yml and .tool-versions agree on golangci-lint $TV_LINT"
+  else
+    emit FAIL pins-golangci "ci.yml pins golangci-lint $ci_lint but .tool-versions has $TV_LINT"
+  fi
+}
+
+# ------------------------------------------------------- a: pins-goreleaser
+# Every goreleaser-action step in ci.yml and release.yml must pin one version.
+# TestGoreleaserVersionPinned also demands an exact vX.Y.Z.
+check_pins_goreleaser() {
+  local fails_before=$NFAIL
+  GR_STEPS=0
+  GR_SEEN=
+  scan_goreleaser_steps
+  if [ "$GR_STEPS" -eq 0 ]; then
+    emit FAIL pins-goreleaser "cannot parse: no goreleaser-action step in ci.yml or release.yml"
+  elif [ "$NFAIL" -eq "$fails_before" ]; then
+    case ${GR_SEEN# } in
+      *" "*) emit FAIL pins-goreleaser "goreleaser-action steps pin different versions:$GR_SEEN" ;;
+      *) emit PASS pins-goreleaser "$GR_STEPS goreleaser-action steps pin ${GR_SEEN# }" ;;
+    esac
+  fi
+}
+
+scan_goreleaser_steps() { # counts steps, collects versions, FAILs an unparsable step
+  local f ln v
+  for f in "$CI_WORKFLOW" "$RELEASE_WORKFLOW"; do
+    [ -f "$f" ] || continue
+    for ln in $(uses_lines "$f" goreleaser/goreleaser-action); do
+      GR_STEPS=$((GR_STEPS + 1))
+      v=$(step_version "$f" goreleaser/goreleaser-action "$ln")
+      v=${v#v}
+      if [ -z "$v" ]; then
+        emit FAIL pins-goreleaser "cannot parse: no version in the goreleaser-action step at $f:$ln"
+      else
+        case " $GR_SEEN " in
+          *" $v "*) ;;
+          *) GR_SEEN="$GR_SEEN $v" ;;
+        esac
+      fi
+    done
+  done
+}
+
+# ------------------------------------------------------ a: installed tools
+check_installed_tools() { # full mode only
+  [ "$MODE" = full ] || return 0
+  check_go_installed
+  check_golangci_installed
+  check_goreleaser_installed
+  skip_ci_only_tools
+}
+
+check_go_installed() { # sets GO_OK and GO_SKIP when the installed Go is unusable
+  local gov
+  if ! command -v go >/dev/null 2>&1; then
+    GO_OK=0
+    GO_SKIP="go not on PATH, see go-installed"
+    emit FAIL go-installed "go not found on PATH; $ASDF_HINT"
+  elif [ -z "$GOMOD_VER" ]; then
+    GO_OK=0
+    GO_SKIP="go.mod has no go line, see go-installed"
+    emit FAIL go-installed "cannot parse: no go line in go.mod"
+  else
+    gov=$(go env GOVERSION 2>/dev/null | head -1)
+    compare_go_version "$gov" "$GOMOD_VER" || GO_OK=0
+  fi
+}
+
+compare_go_version() { # INSTALLED GOMOD_VER; emits; returns 1 on a mismatch
+  local gov=$1 gomod=$2
+  case $gomod in
+    *.*.*)
+      if [ "$gov" = "go$gomod" ]; then
+        emit PASS go-installed "$gov"
+      else
+        emit FAIL go-installed "have '${gov:-none}', want go$gomod; $ASDF_HINT"
+        return 1
+      fi
+      ;;
+    *)
+      case $gov in
+        "go$gomod" | "go$gomod".*)
+          emit WARN go-installed "$gov; go.mod pins a minor only"
+          ;;
+        *)
+          emit FAIL go-installed "have '${gov:-none}', want go$gomod.x; $ASDF_HINT"
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+}
+
+read_golangci_version() { # -> installed golangci-lint version, no v prefix
+  local version
+  version=$(golangci-lint version --short 2>/dev/null | head -1)
+  if [ -z "$version" ]; then
+    version=$(golangci-lint --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  fi
+  printf '%s' "${version#v}"
+}
+
+check_golangci_installed() {
+  local gl
+  if ! command -v golangci-lint >/dev/null 2>&1; then
+    emit FAIL golangci-installed "golangci-lint not found on PATH; $ASDF_HINT"
+    return
+  fi
+  gl=$(read_golangci_version)
+  if [ -z "$TV_LINT" ]; then
+    emit FAIL golangci-installed "cannot parse: no golangci-lint line in .tool-versions"
+  elif [ "$gl" = "$TV_LINT" ]; then
+    emit PASS golangci-installed "$gl"
+  else
+    emit FAIL golangci-installed "have '${gl:-unknown}', want $TV_LINT; $ASDF_HINT"
+  fi
+}
+
+# parse_goreleaser_version OUTPUT: the X.Y.Z in `goreleaser --version` output,
+# preferring the GitVersion line.
+#   "GitVersion:    2.4.8"  ->  "2.4.8"
+parse_goreleaser_version() {
+  local version
+  version=$(printf '%s\n' "$1" | grep 'GitVersion' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [ -z "$version" ]; then
+    version=$(printf '%s\n' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  fi
+  printf '%s' "$version"
+}
+
+check_goreleaser_installed() {
+  local gr_pin gr_out gr_rc gr
+  if ! command -v goreleaser >/dev/null 2>&1; then
+    emit SKIP goreleaser-installed "goreleaser not installed (only needed for release-config changes)"
+    return
+  fi
+  gr_pin=$(read_step_pin "$RELEASE_WORKFLOW" goreleaser/goreleaser-action)
+  gr_out=$(goreleaser --version 2>/dev/null)
+  gr_rc=$?
+  gr=$(parse_goreleaser_version "$gr_out")
+  if [ "$gr_rc" -ne 0 ]; then
+    # Typically an asdf/mise shim with no goreleaser version set for this repo.
+    emit SKIP goreleaser-installed "goreleaser on PATH but not runnable here (only needed for release-config changes)"
+  elif [ -z "$gr_pin" ]; then
+    emit WARN goreleaser-installed "cannot parse goreleaser pin in release.yml"
+  elif [ -z "$gr" ]; then
+    emit WARN goreleaser-installed "goreleaser on PATH but its version is unreadable; CI pins $gr_pin"
+  elif [ "$gr" = "$gr_pin" ]; then
+    emit PASS goreleaser-installed "$gr"
+  else
+    emit WARN goreleaser-installed "have $gr, CI pins $gr_pin"
+  fi
+}
+
+skip_ci_only_tools() {
+  emit SKIP ci-only-tools "yq, promtool, kubectl, kubeconform, benchstat are CI-only pins with no local pin file"
+}
+
+# ------------------------------------------------------------------ check b
+check_containers() { # sets TRACKED_COMPOSE
+  TRACKED_COMPOSE=$(git ls-files 2>/dev/null | grep -E "$COMPOSE_RE" | head -1)
+  if [ -z "$TRACKED_COMPOSE" ]; then
+    emit SKIP containers "no Compose files in repo"
+  else
+    emit FAIL containers "$TRACKED_COMPOSE is tracked but env-check has no container checks; extend bin/env-check"
+  fi
+}
+
+# ------------------------------------------------------------------ check c
+check_worktree() {
+  local git_dir git_common
+  if [ "$MODE" = static ]; then
+    emit SKIP worktree "--static"
+    return
+  fi
+  git_dir=$(physical_git_dir --git-dir)
+  git_common=$(physical_git_dir --git-common-dir)
+  if [ -n "$git_dir" ] && [ "$git_dir" != "$git_common" ]; then
+    emit PASS worktree "linked worktree $(basename "$TOP")"
+  elif [ "${ENV_CHECK_ALLOW_MAIN:-}" = 1 ]; then
+    emit WARN worktree "main checkout (allowed by ENV_CHECK_ALLOW_MAIN=1)"
+  else
+    emit FAIL worktree "main checkout; create one with 'git worktree add ../descry-<topic>' (or set ENV_CHECK_ALLOW_MAIN=1 for a single plain clone)"
+  fi
+}
+
+# ------------------------------------------------------------------ check d
+check_test_harness() {
+  check_harness_tools
+  check_harness_files
+  check_harness_exec_bit
+  check_harness_sparse
+  check_harness_go_tools
+}
+
+list_missing_tools() { # -> " go golangci-lint" (each led by a space) for those not on PATH
+  local missing="" tool
+  for tool in go golangci-lint; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+  done
+  printf '%s' "$missing"
+}
+
+check_harness_tools() {
+  local missing
+  if ! command -v git >/dev/null 2>&1; then
+    emit FAIL harness-tools "git not found on PATH"
+  elif [ "$MODE" = full ]; then
+    missing=$(list_missing_tools)
+    if [ -n "$missing" ]; then
+      emit FAIL harness-tools "missing from PATH:$missing"
+    else
+      emit PASS harness-tools "git, go, golangci-lint on PATH"
+    fi
+  else
+    emit PASS harness-tools "git on PATH"
+  fi
+}
+
+check_harness_files() {
+  local fails_before=$NFAIL
+  check_required_files_present
+  check_no_tracked_files_deleted
+  if [ "$NFAIL" -eq "$fails_before" ]; then
+    emit PASS harness-files "required files tracked and present, none deleted"
+  fi
+}
+
+check_required_files_present() {
+  local f
+  for f in $HARNESS_FILES; do
+    if ! git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+      emit FAIL harness-files "$f is not tracked"
+    elif [ ! -f "$f" ]; then
+      emit FAIL harness-files "$f is tracked but missing on disk"
+    fi
+  done
+}
+
+check_no_tracked_files_deleted() {
+  local deleted ndel first
+  deleted=$(git ls-files --deleted 2>/dev/null)
+  [ -n "$deleted" ] || return 0
+  ndel=$(printf '%s\n' "$deleted" | grep -c .)
+  first=$(printf '%s\n' "$deleted" | head -5 | tr '\n' ' ')
+  emit FAIL harness-files "$ndel tracked files deleted from the working tree: ${first% }"
+}
+
+check_harness_exec_bit() {
+  local mode
+  mode=$(git_index_mode "$SCRIPT_REL")
+  if [ "$mode" = 100755 ]; then
+    emit PASS harness-exec-bit "$SCRIPT_REL is mode 100755"
+  else
+    emit FAIL harness-exec-bit "$SCRIPT_REL git mode is '${mode:-untracked}', want 100755"
+  fi
+}
+
+check_harness_sparse() {
+  if [ "$(git config --bool core.sparseCheckout 2>/dev/null)" = true ]; then
+    emit WARN harness-sparse "core.sparseCheckout is on; some files may be absent"
+  else
+    emit PASS harness-sparse "no sparse checkout"
+  fi
+}
+
+check_harness_go_tools() { # full mode only; needs a usable Go (see check_go_installed)
+  [ "$MODE" = full ] || return 0
+  if [ "$GO_OK" -eq 0 ]; then
+    emit SKIP harness-modcache "$GO_SKIP"
+    emit SKIP harness-govulncheck "$GO_SKIP"
+    return
+  fi
+  check_harness_modcache
+  check_harness_govulncheck
+}
+
+check_harness_modcache() {
+  if GOPROXY=off GOFLAGS=-mod=readonly go list -deps -test ./... >/dev/null 2>&1; then
+    emit PASS harness-modcache "module cache complete"
+  else
+    emit WARN harness-modcache "module cache incomplete; run go mod download (needs network)"
+  fi
+}
+
+check_harness_govulncheck() {
+  if GOPROXY=off GOFLAGS=-mod=readonly go tool -n govulncheck >/dev/null 2>&1; then
+    emit PASS harness-govulncheck "govulncheck tool available"
+  else
+    emit WARN harness-govulncheck "go tool govulncheck unavailable offline; run go mod download (needs network)"
+  fi
+}
+
+# ------------------------------------------------------------------ check e
+check_compose_project() { # reads TRACKED_COMPOSE (set by check_containers)
+  if [ -z "$TRACKED_COMPOSE" ]; then
+    emit SKIP compose-project "no Compose files in repo"
+  else
+    emit FAIL compose-project "$TRACKED_COMPOSE tracked; derive COMPOSE_PROJECT_NAME from the worktree before adding it"
+  fi
+}
+
+# ------------------------------------------------------------------ CLI
+usage() {
+  cat <<'USAGE'
+usage: bin/env-check [--static]
+
+  --static    file-only checks (no installed-tool probes, no worktree check)
+  -h, --help  show this help
+
+Environment:
+  ENV_CHECK_ALLOW_MAIN=1  downgrade the main-checkout FAIL to a WARN
+                          (for a single plain clone)
+USAGE
+}
+
+parse_args() { # sets MODE; handles --help and bad options
+  local arg
+  for arg in "$@"; do
+    case $arg in
+      --static) MODE=static ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "env-check: unknown option: $arg" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------ main
+# A table of contents: one call per step, no logic.
+main() {
+  parse_args "$@"
+  setup
+  check_tool_pins         # a
+  check_containers        # b
+  check_worktree          # c
+  check_test_harness      # d
+  check_compose_project   # e
+  finish
+}
+
+main "$@"

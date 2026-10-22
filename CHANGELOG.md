@@ -8,6 +8,10 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `bin/env-check`: local check of tool pins against CI, shared-checkout use, and harness completeness.
+
 ### Changed
 
 - **Go toolchain: `go.mod` now requires go 1.26.10 (was 1.26.9).** go1.26.10
