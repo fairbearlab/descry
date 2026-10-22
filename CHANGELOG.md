@@ -8,6 +8,13 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Go toolchain: `go.mod` now requires go 1.26.10 (was 1.26.9).** go1.26.10
+  carries the fix for GO-2026-6809 (`crypto/x509`), which `govulncheck`
+  reports against 1.26.9 on the file sink's `Close` path. `.tool-versions`
+  moves with it.
+
 ## [0.5.0] — 2026-10-13
 
 ### Added
