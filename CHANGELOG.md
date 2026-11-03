@@ -8,6 +8,15 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `bin/env-check`: an optional contributor check of a checkout before you
+  build in it (Go, golangci-lint and goreleaser pins against CI, local tool
+  versions, a module cache that already has what the tests and the
+  `govulncheck` tool need, and use of a git worktree). It wraps the shared `loops env-check` engine and is
+  configured in `.loops/env-check.toml`; exit 3 means the engine is not
+  installed and can be ignored. See CONTRIBUTING.md.
+
 ### Changed
 
 - **Go toolchain: `go.mod` now requires go 1.26.10 (was 1.26.9).** go1.26.10
