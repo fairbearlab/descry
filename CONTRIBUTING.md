@@ -28,8 +28,9 @@ No code generation, no external services needed to build or run the tests.
 `bin/env-check` checks a checkout before you build or test in it: that the Go,
 golangci-lint and goreleaser pins in `go.mod`, `.tool-versions` and the
 workflows agree, that your local Go and golangci-lint match them, that the
-module cache can run the tests and `govulncheck` offline, that the files CI
-needs are present, and that you are working in a git worktree
+module cache already has every module the tests and the `govulncheck` tool
+need (the scan itself still downloads the vulnerability database), that the
+files CI needs are present, and that you are working in a git worktree
 (`git worktree add ../descry-<topic> -b <branch> origin/main`) rather than the
 main checkout. It is a thin wrapper around the shared `loops env-check` engine
 (the `loops` plugin in
