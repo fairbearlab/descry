@@ -1,0 +1,48 @@
+# bin/env-check config, read by the shared `loops env-check` engine. See CONTRIBUTING.md.
+schema_version = 1
+engine = ">=0.7.0"
+
+[shared_checkout]
+hint = "git worktree add ../descry-<topic> -b <branch> origin/main"
+
+# Every setup-go step takes Go from go.mod (go-version-file); .tool-versions must agree.
+[[pins]]
+tool = "go"
+sources = ["go-mod:go.mod", "tool-versions", "setup-go:.github/workflows/*.yml"]
+compare = "exact"
+local = "fail"
+
+# CI's golangci-lint comes from the golangci-lint-action step in ci.yml.
+[[pins]]
+tool = "golangci-lint"
+sources = ["golangci-action:.github/workflows/ci.yml", "tool-versions"]
+compare = "exact"
+local = "warn"
+
+# ci.yml (release-check) and release.yml must run the same goreleaser. Contributors rarely have it
+# installed and CI is what runs it, so there is no local probe.
+[[pins]]
+tool = "goreleaser"
+sources = ["goreleaser-action:.github/workflows/ci.yml", "goreleaser-action:.github/workflows/release.yml"]
+compare = "exact"
+local = "off"
+
+[harness]
+tools = ["git", "go", "golangci-lint"]
+files = ["go.mod", "go.sum", ".tool-versions", ".golangci.yml", ".goreleaser.yaml", ".github/workflows/ci.yml", ".github/workflows/release.yml"]
+entrypoints = ["bin/env-check", ".loops/checks/modcache.sh", ".loops/checks/govulncheck.sh"]
+tracked = true
+sparse = "warn"
+
+[compose]
+mode = "none"
+
+[[local]]
+id = "d.modcache"
+run = ".loops/checks/modcache.sh"
+timeout_s = 60
+
+[[local]]
+id = "d.govulncheck"
+run = ".loops/checks/govulncheck.sh"
+timeout_s = 60

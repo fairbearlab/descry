@@ -23,6 +23,28 @@ go build ./...
 
 No code generation, no external services needed to build or run the tests.
 
+## bin/env-check (optional)
+
+`bin/env-check` checks a checkout before you build or test in it: that the Go,
+golangci-lint and goreleaser pins in `go.mod`, `.tool-versions` and the
+workflows agree, that your local Go and golangci-lint match them, that the
+module cache can run the tests and `govulncheck` offline, that the files CI
+needs are present, and that you are working in a git worktree
+(`git worktree add ../descry-<topic> -b <branch> origin/main`) rather than the
+main checkout. It is a thin wrapper around the shared `loops env-check` engine
+(the `loops` plugin in
+[agentic-tools](https://github.com/adambware/agentic-tools)), configured in
+`.loops/env-check.toml`.
+
+- Exit 0: no FAIL. Exit 1: at least one FAIL; every FAIL and WARN line ends
+  with a fix. Exit 2: a usage or config error, for example an engine older
+  than the config needs; update the engine.
+- **Exit 3 (`env-check: not run`) means the engine (or node) is not
+  installed. You can ignore it**; the commands under
+  [Before you push](#before-you-push), and CI, stay the gate.
+- `bin/env-check --static` reads repo files only. In a single plain clone,
+  run `ENV_CHECK_ALLOW_MAIN=1 bin/env-check`.
+
 ## Before you push
 
 Every command below runs in CI on your PR. Run them locally first:
