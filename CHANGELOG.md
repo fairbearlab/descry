@@ -8,6 +8,8 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-08
+
 ### Added
 
 - `bin/env-check`: an optional contributor check of a checkout before you
@@ -27,14 +29,18 @@ Pre-1.0, the minor version carries breaking changes.
 ### Fixed
 
 - **`checks/http`: a dead pooled HTTP/2 connection no longer fails a target for
-  many minutes.** A check's timeout reset only its own stream, so the connection
+  many minutes.** Before this release, descry could report a healthy site as
+  down because of its own stale connection. A check's timeout reset only its own
+  stream, so the connection
   stayed pooled and later checks reused it until the kernel gave up. Connections
   are now pinged after 15s without a received frame and closed if the ping goes
   unanswered for 15s, so a dead connection is replaced within 30s: at most one
   failed check at a 60s interval with a 10s timeout. Targets now receive HTTP/2
   PINGs, and a check interrupted by the eviction is usually class `unknown`, so
-  `unknown` may appear briefly. See "Reused connections and false failures" in
-  docs/OPERATIONS.md.
+  `unknown` may appear briefly. This narrows the false failures and does not end
+  them: a dead connection can still cost a check before it is replaced, and a
+  connection that answers pings while its requests stall is not replaced. See
+  "Reused connections and false failures" in docs/OPERATIONS.md.
 
 ## [0.5.0] — 2026-10-13
 
@@ -397,7 +403,8 @@ two-layer SSRF guard, and the YAML-configured `descry` binary.
 <!-- Entries for 0.1.0–0.2.1 were reconstructed from git history when this file
      was added in 0.3.0; the GitHub release notes are authoritative for those tags. -->
 
-[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/fairbearlab/descry/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fairbearlab/descry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fairbearlab/descry/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fairbearlab/descry/compare/v0.2.1...v0.3.0
