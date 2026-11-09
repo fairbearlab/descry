@@ -293,6 +293,54 @@ check.
 
 **Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
+### Report connection reuse on failed checks
+
+**What:** Set `Extra["conn_reused"]` (bool) on down results, for the last attempted
+request of the run. Use `httptrace.GotConn`, with per-run state in the request context,
+reset on each allowed hop in `CheckRedirect` in both `New` and `newForTest` through a
+shared helper unless `GetConn` proves simpler. Omit the key when that hop obtained no connection.
+
+**Why:** Nothing in a result says whether a failing check ran on a reused connection,
+so the next stale-connection incident starts with no evidence.
+
+**Context:** 2026-11-08 — split out of the HTTP/2 ping fix. A last-write `GotConn` alone
+keeps an earlier hop's value when a later hop fails to connect. `GetConn` fires on pooled
+HTTP/2 too, so a reset there may replace the `CheckRedirect` helper; check it first. Test a first hop that connects
+with a second hop refused (key omitted), and the redirect limit (key kept). A new event
+field means a minor version.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+### Cap connection age and decide what a check proves
+
+**What:** Decide whether a check should prove a fresh connection, and bound how long a
+reused connection can live.
+
+**Why:** A target checked more often than the 90s idle window can keep one connection
+indefinitely. `TLSExpiry` comes from `resp.TLS`, the original handshake, so a renewed
+certificate may go unobserved, and DNS, TCP and TLS failures stay hidden while the old
+connection works. A connection that answers PING while its streams stall is also never
+replaced.
+
+**Context:** 2026-11-08 — found while reviewing the HTTP/2 ping fix. Options: a periodic
+`CloseIdleConnections`, or a fresh-connection probe mode. See `checks/http/http.go`
+where `TLSExpiry` is read.
+
+**Effort:** M · **Priority:** P2 · **Depends on:** nothing
+
+### Public option for the HTTP/2 ping timeouts
+
+**What:** Let embedders tune or disable the health-check pings; it must not be able to
+touch `Proxy` or `ControlContext`.
+
+**Why:** The timeouts are constants, and the only override today is a fork.
+
+**Context:** 2026-11-08 — deliberately not added with the ping fix. Trigger: a target
+whose PING round trip exceeds 15s is reported, or a strict server answers idle PINGs
+with GOAWAY often enough to matter.
+
+**Effort:** S · **Priority:** P4 · **Depends on:** a trigger above
+
 ## Admin server
 
 ### Reserved capacity for health probes

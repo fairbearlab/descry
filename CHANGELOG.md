@@ -24,6 +24,18 @@ Pre-1.0, the minor version carries breaking changes.
   reports against 1.26.9 on the file sink's `Close` path. `.tool-versions`
   moves with it.
 
+### Fixed
+
+- **`checks/http`: a dead pooled HTTP/2 connection no longer fails a target for
+  many minutes.** A check's timeout reset only its own stream, so the connection
+  stayed pooled and later checks reused it until the kernel gave up. Connections
+  are now pinged after 15s without a received frame and closed if the ping goes
+  unanswered for 15s, so a dead connection is replaced within 30s: at most one
+  failed check at a 60s interval with a 10s timeout. Targets now receive HTTP/2
+  PINGs, and a check interrupted by the eviction is usually class `unknown`, so
+  `unknown` may appear briefly. See "Reused connections and false failures" in
+  docs/OPERATIONS.md.
+
 ## [0.5.0] — 2026-10-13
 
 ### Added
