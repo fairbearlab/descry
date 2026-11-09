@@ -114,6 +114,38 @@ about target health. **Uptime alarms
 belong on the events, not on `Results()`.** `Results()` is where you watch the
 *engine*.
 
+### Reused connections and false failures
+
+The bundled HTTP check reuses connections. A check inside the 90s idle window can
+run on a connection that is already open, so a passing check does not re-prove
+DNS, TCP or TLS for that target. A target checked less often than every 90s gets
+a new connection each time.
+
+An HTTP/2 connection is pinged after 15s without a received frame, which on a
+healthy connection happens only between checks more than 15s apart, until the
+90s idle close. A target checked every 60s therefore gets about three small PING
+frames between checks, every interval, for as long as the connection lasts, since
+each check restarts the idle clock. A connection whose ping goes unanswered for
+15s is closed, so one that silently died leaves the pool within 30s.
+
+Until then, checks on that connection fail. At most about
+`ceil((30s + timeout) / interval)` checks fail per connection, assuming a new
+connection works and counting a check already in flight when the connection
+died: one at a 60s interval with a 10s timeout. At a 10s timeout, intervals under
+40s can produce two or more, so set failure thresholds with that in mind. One
+eviction fails every check in flight on that host's connection at the same time.
+
+A check interrupted by the eviction is `down`, usually with class `unknown`, or
+`timeout` if its own deadline fired first; the existing text matching on the
+error can yield another class. The result does not identify an eviction. A path
+that stalls long enough for a ping to go unanswered can also fail a check that
+would have finished inside its deadline; a longer `timeout` widens that exposure.
+
+**What to do:** after a known network change or path blackhole, a bounded number
+of failures needs no action, because the next check dials a new connection.
+Investigate repeated failures as usual. A connection that keeps answering pings
+while its requests stall is not replaced by this mechanism.
+
 ### Classifying skips
 
 `ErrSkippedQueued` wraps `ErrSkipped`, so `errors.Is(err, runner.ErrSkipped)` is
