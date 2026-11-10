@@ -292,6 +292,10 @@ func TestNew_Registration(t *testing.T) {
 	want(t, got, "descry_runner_skipped_slots_total", 3)
 	want(t, got, "descry_runner_dropped_results_total", 4)
 	want(t, got, `descry_build_info{commit="0123456",version="v1.2.3"}`, 1)
+	for _, r := range []string{"EMFILE", "ENFILE", "EADDRNOTAVAIL", "ENOBUFS", "ENOMEM", "other"} {
+		want(t, got, fmt.Sprintf(`descry_checks_not_run_total{reason=%q}`, r), 0)
+	}
+	want(t, got, "descry_checks_not_run_last_timestamp_seconds", 0)
 
 	c.SetTargetCount(42)
 	c.ObserveSkip(SkipQueued)
@@ -318,6 +322,8 @@ func TestNew_Registration(t *testing.T) {
 		"descry_check_status_code",
 		"descry_check_tls_expiry_timestamp_seconds",
 		"descry_check_up",
+		"descry_checks_not_run_last_timestamp_seconds",
+		"descry_checks_not_run_total",
 		"descry_runner_dropped_results_total",
 		"descry_runner_result_errors_total",
 		"descry_runner_skipped_slots_total",

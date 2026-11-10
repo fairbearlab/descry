@@ -268,7 +268,8 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	drained := make(chan struct{})
 	go func() {
 		defer close(drained)
-		drainResults(r.Results(), stderr, cfg.Interval, time.Now, &failures, observeSkip)
+		drainResults(r.Results(), stderr, cfg.Interval, time.Now, &failures, observeSkip,
+			cfg.Concurrency, len(targets))
 	}()
 
 	ready := &readyState{}
@@ -337,27 +338,63 @@ func exitCodeFor(runErr error) int {
 // drainResults prints each Result's diagnostic to w until results is closed
 // and adds one to failures for each check/mapping/publish failure seen, as it
 // is seen, so a caller can read the running count while the drain is live.
-// failures must be non-nil. Skipped slots are not check failures (the
-// scheduler chose not to run, not a bad probe) and are printed distinctly;
-// ErrSkippedQueued is tested before ErrSkipped since it wraps it. Each skip is
-// passed to observeSkip (when non-nil) before the rate limit below, so a skip
-// counter sees every skip, not only the printed ones. Under
-// saturation every slot of every target skips, so skip lines are rate-limited
-// to one per target per interval (with a suppressed count on the next line
-// printed) — otherwise a slow stderr would stall this drain, fill Results(),
-// and turn skips into drops. The window is the target's own effective
-// interval (its override, else interval), so a fast target under a slow
-// default is not silenced for several of its own slots. Failures are always
-// printed.
+// failures must be non-nil.
+//
+// Two kinds of Result are not failures and are printed distinctly:
+//
+//   - Skipped slots (the scheduler chose not to run, not a bad probe).
+//     ErrSkippedQueued is tested before ErrSkipped since it wraps it. Each
+//     skip is passed to observeSkip (when non-nil) before the rate limit
+//     below, so a skip counter sees every skip, not only the printed ones.
+//   - Checks that could not run (check.ErrNotRun): the prober, not the
+//     target, failed, so nothing was observed. The line names the reason, an
+//     action, and the configured concurrency and target count, which are what
+//     the action is sized against, and prints the target in its event form
+//     (no userinfo, query or fragment), because a not-run usually hits every
+//     target at once and the line should be safe to paste.
+//
+// Under saturation every slot of every target skips, and under resource
+// exhaustion every run of every target is not run, so both kinds of line are
+// rate-limited to one per target per kind per interval (with a suppressed
+// count on the next line printed) — otherwise a slow stderr would stall this
+// drain, fill Results(), and turn skips into drops. The window is the
+// target's own effective interval (its override, else interval), so a fast
+// target under a slow default is not silenced for several of its own slots.
+// Other failures are always printed.
 func drainResults(results <-chan runner.Result, w io.Writer, interval time.Duration, now func() time.Time,
-	failures *atomic.Int64, observeSkip func(metrics.SkipKind)) {
+	failures *atomic.Int64, observeSkip func(metrics.SkipKind), concurrency, targets int) {
 	// Diagnostics are best-effort: a failed stderr write is not something this
 	// loop can act on, so write errors are deliberately ignored.
-	type skipState struct {
+	type lineKey struct {
+		url    string
+		notRun bool
+	}
+	type lineState struct {
 		last       time.Time
 		suppressed int
 	}
-	skips := map[string]*skipState{}
+	lines := map[lineKey]*lineState{}
+	// admit applies the per-target, per-kind rate limit and returns the count
+	// suppressed since the last printed line, or ok=false to suppress this one.
+	admit := func(key lineKey, target check.Target) (suppressed int, ok bool) {
+		st, seen := lines[key]
+		if !seen {
+			st = &lineState{}
+			lines[key] = st
+		}
+		window := target.Interval
+		if window <= 0 {
+			window = interval
+		}
+		t := now()
+		if !st.last.IsZero() && t.Sub(st.last) < window && t.Sub(st.last) >= 0 {
+			st.suppressed++
+			return 0, false
+		}
+		st.last = t
+		suppressed, st.suppressed = st.suppressed, 0
+		return suppressed, true
+	}
 	for res := range results {
 		var reason string
 		var kind metrics.SkipKind
@@ -366,6 +403,19 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 			reason, kind = "prior run still queued (pool too small)", metrics.SkipQueued
 		case errors.Is(res.Err, runner.ErrSkipped):
 			reason, kind = "prior run still running (slow check)", metrics.SkipInFlight
+		case errors.Is(res.Err, check.ErrNotRun):
+			suppressed, ok := admit(lineKey{url: res.Target.URL, notRun: true}, res.Target)
+			if !ok {
+				continue
+			}
+			why := metrics.NotRunReason(res.Err)
+			_, _ = fmt.Fprintf(w, "check not run: %s reason=%s action=%q concurrency=%d targets=%d; retries at the next interval, no side effects",
+				eventURL(res.Target.URL), why, notRunAction(why), concurrency, targets)
+			if suppressed > 0 {
+				_, _ = fmt.Fprintf(w, " (%d more not-runs for this target since the last line)", suppressed)
+			}
+			_, _ = fmt.Fprintln(w)
+			continue
 		case res.Err != nil:
 			failures.Add(1)
 			_, _ = fmt.Fprintf(w, "check failed: %s: %v\n", check.RedactURL(res.Target.URL), res.Err)
@@ -376,28 +426,31 @@ func drainResults(results <-chan runner.Result, w io.Writer, interval time.Durat
 		if observeSkip != nil {
 			observeSkip(kind)
 		}
-		st, ok := skips[res.Target.URL]
+		suppressed, ok := admit(lineKey{url: res.Target.URL}, res.Target)
 		if !ok {
-			st = &skipState{}
-			skips[res.Target.URL] = st
-		}
-		window := res.Target.Interval
-		if window <= 0 {
-			window = interval
-		}
-		t := now()
-		if !st.last.IsZero() && t.Sub(st.last) < window && t.Sub(st.last) >= 0 {
-			st.suppressed++
 			continue
 		}
-		st.last = t
-		if st.suppressed > 0 {
+		if suppressed > 0 {
 			_, _ = fmt.Fprintf(w, "check skipped: %s: %s (%d more skips for this target since the last line)\n",
-				check.RedactURL(res.Target.URL), reason, st.suppressed)
-			st.suppressed = 0
+				check.RedactURL(res.Target.URL), reason, suppressed)
 		} else {
 			_, _ = fmt.Fprintf(w, "check skipped: %s: %s\n", check.RedactURL(res.Target.URL), reason)
 		}
+	}
+}
+
+// notRunAction is the operator action the not-run line suggests for a
+// metrics.NotRunReason value.
+func notRunAction(reason string) string {
+	switch reason {
+	case metrics.NotRunEMFILE, metrics.NotRunENFILE:
+		return "raise the file descriptor limit or lower concurrency"
+	case metrics.NotRunEADDRNOTAVAIL:
+		return "widen the ephemeral port range or lengthen intervals"
+	case metrics.NotRunENOBUFS, metrics.NotRunENOMEM:
+		return "reduce load on this host"
+	default:
+		return "the check reported that it could not run; see its own logs"
 	}
 }
 

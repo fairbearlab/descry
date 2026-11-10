@@ -2,8 +2,10 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -63,6 +65,48 @@ var errorClasses = []check.ErrorClass{
 	check.ErrUnknown,
 }
 
+// The reason label values of descry_checks_not_run_total. NotRunReason maps
+// an error to one of them.
+const (
+	NotRunEMFILE        = "EMFILE"        // the process is out of file descriptors
+	NotRunENFILE        = "ENFILE"        // the system is out of file descriptors
+	NotRunEADDRNOTAVAIL = "EADDRNOTAVAIL" // no local address or ephemeral port is free
+	NotRunENOBUFS       = "ENOBUFS"       // the kernel is out of socket buffer space
+	NotRunENOMEM        = "ENOMEM"        // the kernel is out of memory
+	NotRunOther         = "other"         // any other reason, or none given
+)
+
+// notRunReasons is the closed reason label set, in the order NotRunReason
+// tests them; every value is pre-initialised at 0.
+var notRunReasons = []struct {
+	reason string
+	errno  syscall.Errno
+}{
+	{NotRunEMFILE, syscall.EMFILE},
+	{NotRunENFILE, syscall.ENFILE},
+	{NotRunEADDRNOTAVAIL, syscall.EADDRNOTAVAIL},
+	{NotRunENOBUFS, syscall.ENOBUFS},
+	{NotRunENOMEM, syscall.ENOMEM},
+}
+
+// NotRunReason returns the reason label descry_checks_not_run_total uses for
+// err: the name of the first of EMFILE, ENFILE, EADDRNOTAVAIL, ENOBUFS and
+// ENOMEM that errors.Is finds in err's chain, else NotRunOther. It does not
+// test for check.ErrNotRun itself; callers do that first.
+func NotRunReason(err error) string {
+	for _, r := range notRunReasons {
+		if errors.Is(err, r.errno) {
+			return r.reason
+		}
+	}
+	return NotRunOther
+}
+
+// notRunsBeforeRemoval is how many consecutive not-run results remove a
+// target's descry_check_up. More than one, so intermittent local pressure
+// does not keep resetting DescryTargetDown's `for` window.
+const notRunsBeforeRemoval = 3
+
 // Collector records descry metrics on its own registry. Its methods and the
 // checks it decorates are safe for concurrent use.
 type Collector struct {
@@ -78,6 +122,7 @@ type Collector struct {
 
 	mu    sync.RWMutex
 	byURL map[string]*targetSeries // keyed by the raw target URL; values are resolved once
+	ups   map[string]*upState      // keyed by the url label, shared by every raw URL with that label
 
 	// Fleet series. errsBy is built in New and read-only afterwards.
 	duration      prometheus.Histogram
@@ -86,20 +131,62 @@ type Collector struct {
 	skipsInFlight prometheus.Counter
 	skipsQueued   prometheus.Counter
 	targetCount   prometheus.Gauge
+	notRunBy      map[string]prometheus.Counter // built in New and read-only afterwards
+	notRunLast    prometheus.Gauge
 }
 
 // targetSeries holds one target's pre-curried children, so a steady-state Run
 // neither renders the label nor looks the children up.
 type targetSeries struct {
-	label                         string
-	up, statusCode, latency, last prometheus.Gauge
-	runsUp, runsDown              prometheus.Counter
+	label                     string
+	up                        *upState // removable; see upState
+	statusCode, latency, last prometheus.Gauge
+	runsUp, runsDown          prometheus.Counter
 	// tls is resolved on the first Observation with a TLSExpiry, so targets
 	// that never report one (plain HTTP) export no tls series at all.
 	tls atomic.Pointer[tlsGauge]
 }
 
 type tlsGauge struct{ g prometheus.Gauge }
+
+// upState is one url label's descry_check_up child, which consecutive
+// not-run results remove and the next completed run recreates. Deleting a
+// child from the vec orphans every cached handle to it (a Set on the old
+// handle never reaches a scrape again), so the handle is re-resolved with
+// WithLabelValues after a delete, and it lives here, once per label, so that
+// raw URLs sharing a label all see the same handle. mu serialises a run's Set
+// with a concurrent delete, so a completed run never writes to an orphan.
+type upState struct {
+	mu      sync.Mutex
+	g       prometheus.Gauge // nil while the series is removed
+	notRuns int              // consecutive not-run results, capped at notRunsBeforeRemoval
+}
+
+// set records a completed run: it resets the not-run streak and sets the
+// gauge, recreating the series if not-runs removed it.
+func (u *upState) set(vec *prometheus.GaugeVec, label string, v float64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.notRuns = 0
+	if u.g == nil {
+		u.g = vec.WithLabelValues(label)
+	}
+	u.g.Set(v)
+}
+
+// notRun records a not-run result: the series is removed on the
+// notRunsBeforeRemoval-th in a row and stays removed until set.
+func (u *upState) notRun(vec *prometheus.GaugeVec, label string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.notRuns < notRunsBeforeRemoval {
+		u.notRuns++
+	}
+	if u.notRuns >= notRunsBeforeRemoval && u.g != nil {
+		vec.DeleteLabelValues(label)
+		u.g = nil
+	}
+}
 
 // runnerRef boxes a RunnerStats so it can sit in an atomic.Pointer.
 type runnerRef struct{ RunnerStats }
@@ -115,6 +202,8 @@ func New(opts Options) (*Collector, error) {
 		reg:             prometheus.NewRegistry(),
 		now:             time.Now,
 		byURL:           make(map[string]*targetSeries),
+		ups:             make(map[string]*upState),
+		notRunBy:        make(map[string]prometheus.Counter, len(notRunReasons)+1),
 		errsBy:          make(map[check.ErrorClass]prometheus.Counter, len(errorClasses)),
 		perTargetActive: !opts.DisablePerTarget,
 	}
@@ -126,7 +215,7 @@ func New(opts Options) (*Collector, error) {
 			cs = append(cs, v)
 			return v
 		}
-		c.up = gauge("up", "1 when the target's last run was up, else 0.")
+		c.up = gauge("up", "1 when the target's last completed run was up, else 0; removed after 3 consecutive runs that could not run.")
 		c.statusCode = gauge("status_code", "HTTP status code of the target's last run; 0 with no response.")
 		c.latency = gauge("latency_seconds", "Latency of the target's last completed run.")
 		c.lastRun = gauge("last_run_timestamp_seconds", "Unix time of the target's last run.")
@@ -173,7 +262,20 @@ func New(opts Options) (*Collector, error) {
 	})
 	buildInfo.Set(1)
 
-	cs = append(cs, c.duration, errs, skips, c.targetCount, buildInfo,
+	notRun := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "descry", Subsystem: "checks", Name: "not_run_total",
+		Help: "Runs that could not run (the check returned check.ErrNotRun), by reason; no verdict was recorded for them.",
+	}, []string{"reason"})
+	for _, r := range notRunReasons {
+		c.notRunBy[r.reason] = notRun.WithLabelValues(r.reason)
+	}
+	c.notRunBy[NotRunOther] = notRun.WithLabelValues(NotRunOther)
+	c.notRunLast = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "descry", Subsystem: "checks", Name: "not_run_last_timestamp_seconds",
+		Help: "Unix time of the last run that could not run; 0 until one happens.",
+	})
+
+	cs = append(cs, c.duration, errs, skips, c.targetCount, buildInfo, notRun, c.notRunLast,
 		prometheus.NewCounterFunc(prometheus.CounterOpts{
 			Namespace: "descry", Subsystem: "runner", Name: "skipped_slots_total",
 			Help: "Slots skipped because the target's prior run was still running or still queued (both skip kinds); exact.",
@@ -245,13 +347,29 @@ func (c *Collector) SetTargetCount(n int) { c.targetCount.Set(float64(n)) }
 // delegates to inner, and Run returns inner's Observation and error
 // unchanged. inner must be non-nil.
 //
-// On a Run error, up and status_code go to 0, last_run takes the collector's
-// clock, runs_total{status="down"} and errors_total{class="unknown"} count
-// one, and latency, the histogram and the tls gauge are left alone. A later
-// Observation without a TLSExpiry also leaves the tls gauge at its last value.
-// A run cancelled through ctx (the runner cancels in-flight runs at shutdown)
-// is recorded like any other failed run, and an Observation that never made
-// a request (an SSRF-blocked target, say) records its 0 latency.
+// A run whose ctx was cancelled by the time inner returns (the runner
+// cancels in-flight runs at shutdown) records nothing at all, whatever inner
+// returned: the process is exiting, and the run is no evidence about the
+// target. A per-call deadline is not a cancellation, so a run that hit one is
+// recorded as usual.
+//
+// A Run error that wraps check.ErrNotRun is not a verdict either: the check
+// could not run. descry_checks_not_run_total{reason} counts one (the reason
+// is NotRunReason(err)) and descry_checks_not_run_last_timestamp_seconds
+// takes the collector's clock. Nothing else changes: status_code, latency,
+// last_run, runs_total, errors_total, the histogram and the tls gauge keep
+// their values, so a target that cannot be checked goes stale. Its
+// descry_check_up keeps its value for the first two not-runs in a row and is
+// removed on the third, so a verdict alert stops firing on evidence that is
+// no longer being refreshed; the next completed run recreates it. A not-run
+// on a target with no per-target series yet creates none.
+//
+// On any other Run error, up and status_code go to 0, last_run takes the
+// collector's clock, runs_total{status="down"} and errors_total{class="unknown"}
+// count one, and latency, the histogram and the tls gauge are left alone. A
+// later Observation without a TLSExpiry also leaves the tls gauge at its last
+// value. An Observation that never made a request (an SSRF-blocked target,
+// say) records its 0 latency.
 //
 // errors_total counts Observations with an ErrorClass other than ErrNone,
 // while runs_total{status="down"} counts those with a Status other than
@@ -275,8 +393,43 @@ func (i *instrumented) Name() string { return i.inner.Name() }
 
 func (i *instrumented) Run(ctx context.Context, t check.Target) (check.Observation, error) {
 	obs, err := i.inner.Run(ctx, t)
-	i.c.record(t.URL, &obs, err)
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		// Abandoned at shutdown (or by the caller): no evidence either way.
+	case errors.Is(err, check.ErrNotRun):
+		i.c.recordNotRun(t.URL, err)
+	default:
+		i.c.record(t.URL, &obs, err)
+	}
 	return obs, err
+}
+
+// recordNotRun updates the not-run series for one run that could not run.
+func (c *Collector) recordNotRun(rawURL string, err error) {
+	c.notRunBy[NotRunReason(err)].Inc()
+	c.notRunLast.Set(unixSeconds(c.now()))
+	if !c.perTargetActive {
+		return
+	}
+	c.mu.RLock()
+	ts := c.byURL[rawURL]
+	var up *upState
+	label := ""
+	if ts != nil {
+		up, label = ts.up, ts.label
+	} else {
+		// This raw URL has no completed run, but another one with the same
+		// label may have: its up series is this target's too, so the streak
+		// must count here as well, or a stale verdict would outlive the
+		// not-runs. Rendering the label allocates, but only on this path.
+		label = TargetLabel(rawURL)
+		up = c.ups[label]
+	}
+	c.mu.RUnlock()
+	if up == nil {
+		return // no completed run under this label: create nothing, which would export up=0
+	}
+	up.notRun(c.up, label)
 }
 
 // record updates every series for one run.
@@ -288,7 +441,7 @@ func (c *Collector) record(rawURL string, obs *check.Observation, err error) {
 	if err != nil {
 		c.errUnknown.Inc()
 		if ts != nil {
-			ts.up.Set(0)
+			ts.up.set(c.up, ts.label, 0)
 			ts.statusCode.Set(0)
 			ts.last.Set(unixSeconds(c.now()))
 			ts.runsDown.Inc()
@@ -309,10 +462,10 @@ func (c *Collector) record(rawURL string, obs *check.Observation, err error) {
 		return
 	}
 	if obs.Status == check.StatusUp {
-		ts.up.Set(1)
+		ts.up.set(c.up, ts.label, 1)
 		ts.runsUp.Inc()
 	} else {
-		ts.up.Set(0)
+		ts.up.set(c.up, ts.label, 0)
 		ts.runsDown.Inc()
 	}
 	ts.statusCode.Set(float64(obs.StatusCode))
@@ -342,7 +495,6 @@ func (c *Collector) series(rawURL string) *targetSeries {
 	label := TargetLabel(rawURL)
 	ts = &targetSeries{
 		label:      label,
-		up:         c.up.WithLabelValues(label),
 		statusCode: c.statusCode.WithLabelValues(label),
 		latency:    c.latency.WithLabelValues(label),
 		last:       c.lastRun.WithLabelValues(label),
@@ -358,6 +510,14 @@ func (c *Collector) series(rawURL string) *targetSeries {
 	if prior := c.byURL[rawURL]; prior != nil {
 		return prior
 	}
+	// The up child is resolved lazily by the first upState.set, which every
+	// caller of series makes, so it is only ever created with a value.
+	up := c.ups[label]
+	if up == nil {
+		up = &upState{}
+		c.ups[label] = up
+	}
+	ts.up = up
 	c.byURL[rawURL] = ts
 	return ts
 }

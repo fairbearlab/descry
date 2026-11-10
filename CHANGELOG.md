@@ -10,6 +10,51 @@ Pre-1.0, the minor version carries breaking changes.
 
 ### Added
 
+- **`check.ErrNotRun`: a check can say it could not run.** A `Check` returns an
+  error wrapping `check.ErrNotRun` when it could not run for a reason local to
+  the prober (out of file descriptors or ephemeral ports, say), so it has no
+  verdict. The metrics decorator records no verdict for it and counts it in
+  the new `descry_checks_not_run_total{reason}` (`EMFILE`, `ENFILE`,
+  `EADDRNOTAVAIL`, `ENOBUFS`, `ENOMEM`, `other`) and
+  `descry_checks_not_run_last_timestamp_seconds`; `metrics.NotRunReason` gives
+  the reason. The `descry` CLI prints a rate-limited `check not run:` line
+  with the reason and an action instead of `check failed:`, and does not count
+  it in `descry_runner_result_errors_total`. The bundled HTTP check does not
+  return it yet.
+- `contrib/prometheus`: `DescryChecksNotRun` (warning, no wait) fires for 10
+  minutes after a check could not run, with a runbook in
+  `docs/OPERATIONS.md`.
+
+### Changed
+
+- **`descry_check_up` is removed after three checks in a row that could not
+  run**, and recreated by the next completed run, so verdict alerts do not
+  keep firing on evidence nobody refreshed. `last_run` and the other
+  per-target series keep their values, so `DescryChecksStale` still fires
+  for a target that has completed a run. A URL that has never completed but
+  shares its `url` label with one that has counts toward that label's streak.
+- **Checks run on a context that `Runner.Run`'s context cancels.** It carries
+  `Run`'s context values but not its deadline, and ends as
+  `context.Canceled` whether `Run`'s context was cancelled or hit its
+  deadline, so a run cut short at shutdown never reads as a timeout of the
+  target.
+
+### Fixed
+
+- **Shutdown no longer publishes a false `down`.** A run that returns after
+  `Run`'s context is done (cancelled or past its deadline) is dropped: no
+  event and no `Result`. A run cut short by it records nothing in the
+  metrics decorator either (which ignores any run whose context was
+  cancelled); one that finished in the moment between `Run`'s context ending
+  and its checks' context being cancelled is a real observation and may still
+  be recorded. A rollout or drain used to publish one `down` event per
+  target that was mid-check. Under `WithShutdownGrace`, only a run whose check
+  returned before the cancel can still publish after `Run` returns.
+
+## [0.5.1] — 2026-11-08
+
+### Added
+
 - `bin/env-check`: an optional contributor check of a checkout before you
   build in it (Go, golangci-lint and goreleaser pins against CI, local tool
   versions, a module cache that already has what the tests and the
@@ -23,6 +68,22 @@ Pre-1.0, the minor version carries breaking changes.
   carries the fix for GO-2026-6809 (`crypto/x509`), which `govulncheck`
   reports against 1.26.9 on the file sink's `Close` path. `.tool-versions`
   moves with it.
+
+### Fixed
+
+- **`checks/http`: a dead pooled HTTP/2 connection no longer fails a target for
+  many minutes.** Before this release, descry could report a healthy site as
+  down because of its own stale connection. A check's timeout reset only its own
+  stream, so the connection
+  stayed pooled and later checks reused it until the kernel gave up. Connections
+  are now pinged after 15s without a received frame and closed if the ping goes
+  unanswered for 15s, so a dead connection is replaced within 30s: at most one
+  failed check at a 60s interval with a 10s timeout. Targets now receive HTTP/2
+  PINGs, and a check interrupted by the eviction is usually class `unknown`, so
+  `unknown` may appear briefly. This narrows the false failures and does not end
+  them: a dead connection can still cost a check before it is replaced, and a
+  connection that answers pings while its requests stall is not replaced. See
+  "Reused connections and false failures" in docs/OPERATIONS.md.
 
 ## [0.5.0] — 2026-10-13
 
@@ -385,7 +446,8 @@ two-layer SSRF guard, and the YAML-configured `descry` binary.
 <!-- Entries for 0.1.0–0.2.1 were reconstructed from git history when this file
      was added in 0.3.0; the GitHub release notes are authoritative for those tags. -->
 
-[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/fairbearlab/descry/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fairbearlab/descry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fairbearlab/descry/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fairbearlab/descry/compare/v0.2.1...v0.3.0

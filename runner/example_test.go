@@ -73,3 +73,84 @@ func ExampleNew_perTargetIntervals() {
 		fmt.Println("run:", err) // e.g. an invalid event config
 	}
 }
+
+// verdictBook is an event consumer that treats the absence of a fresh event
+// as unknown: it keeps each subject's last verdict with the event's time and
+// stops trusting it once it is older than the subject's expected cadence.
+type verdictBook struct {
+	maxAge time.Duration // e.g. 2 × interval + timeout
+	last   map[string]lastVerdict
+}
+
+type lastVerdict struct {
+	status string
+	at     time.Time
+}
+
+// Publish is the consumer's sink: it records the verdict an event carries.
+func (b *verdictBook) Publish(_ context.Context, e cloudevents.Event) error {
+	var data struct {
+		Status string `json:"status"`
+	}
+	if err := e.DataAs(&data); err != nil {
+		return err
+	}
+	b.last[e.Subject()] = lastVerdict{data.Status, e.Time()}
+	return nil
+}
+
+// verdict is the subject's status at now: its last verdict while fresh, else
+// "unknown". It never returns a verdict it has no current evidence for.
+func (b *verdictBook) verdict(subject string, now time.Time) string {
+	v, ok := b.last[subject]
+	if !ok || now.Sub(v.at) > b.maxAge {
+		return "unknown"
+	}
+	return v.status
+}
+
+// Example_absenceIsUnknown shows a consumer that does not let a verdict
+// outlive its evidence. A check that could not run (check.ErrNotRun) and a
+// run cut short by shutdown publish no event, so a consumer that kept the last
+// event forever would keep reporting a verdict nobody re-checked. Here the
+// Results drain reports not-runs as a prober problem, and the event side
+// expires each verdict after the target's expected cadence.
+func Example_absenceIsUnknown() {
+	const interval, timeout = time.Minute, 10 * time.Second
+	book := &verdictBook{maxAge: 2*interval + timeout, last: map[string]lastVerdict{}}
+	enc, err := event.NewEncoder(event.Config{Source: "example"})
+	if err != nil {
+		panic(err)
+	}
+	t0 := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	tgt := check.Target{URL: "https://example.com/", Labels: map[string]string{"url": "https://example.com/"}}
+
+	// The runner publishes one up event for the target...
+	e, err := enc.Encode(check.Observation{Status: check.StatusUp, StatusCode: 200, ObservedAt: t0, Labels: tgt.Labels})
+	if err != nil {
+		panic(err)
+	}
+	_ = book.Publish(context.Background(), e)
+
+	// ...and then its checks cannot run: Results carries ErrNotRun and no
+	// event is published.
+	for _, res := range []runner.Result{
+		{Target: tgt, Err: fmt.Errorf("%w: dial: too many open files", check.ErrNotRun)},
+	} {
+		switch {
+		case errors.Is(res.Err, check.ErrNotRun):
+			fmt.Println("prober problem, no verdict:", res.Target.URL)
+		case errors.Is(res.Err, runner.ErrSkipped):
+			fmt.Println("skipped:", res.Target.URL)
+		case res.Err != nil:
+			fmt.Println("failed:", res.Err)
+		}
+	}
+
+	fmt.Println("at +1m:", book.verdict("https://example.com/", t0.Add(time.Minute)))
+	fmt.Println("at +5m:", book.verdict("https://example.com/", t0.Add(5*time.Minute)))
+	// Output:
+	// prober problem, no verdict: https://example.com/
+	// at +1m: up
+	// at +5m: unknown
+}

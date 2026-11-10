@@ -711,7 +711,7 @@ func TestDrainResults_ObservesSkipsBeforeRateLimit(t *testing.T) {
 	clock := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
 	var out lockedBuffer
 	var failures atomic.Int64
-	drainResults(ch, &out, 30*time.Second, func() time.Time { return clock }, &failures, c.ObserveSkip)
+	drainResults(ch, &out, 30*time.Second, func() time.Time { return clock }, &failures, c.ObserveSkip, 4, 1)
 
 	rec := httptest.NewRecorder()
 	newAdminMux(c.Registry(), &readyState{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
