@@ -88,7 +88,8 @@ never accumulates.
 
 Everything the runner knows shows up in exactly two places: the `Results()`
 channel and two counters. Nothing is silent, with one deliberate exception: a
-run that returns after `Run`'s context is cancelled is dropped, with no event
+run that returns after `Run`'s context is done (cancelled or past its
+deadline) is dropped, with no event
 and no `Result`, because a run cut short by shutdown says nothing about its
 target (see [Shutdown](#shutdown)).
 
@@ -347,7 +348,7 @@ Fleet-wide (always served):
 | `descry_check_errors_total{class}` | counter | runs whose Observation carries an error class. `class` is one of `timeout`, `connection_refused`, `dns_failure`, `tls_error`, `ssrf_blocked`, `http_error`, `unknown`, all seven exported at 0 from startup. A check that returned an error, or a class outside the set, counts as `unknown`. With the bundled HTTP check this moves in step with `runs_total{status="down"}` |
 | `descry_runner_skipped_slots_total` | counter | `Runner.Skipped()`, both skip kinds, exact. Alert on this one |
 | `descry_runner_dropped_results_total` | counter | `Runner.Dropped()`, exact |
-| `descry_runner_result_errors_total` | counter | non-skip error `Result`s seen by the drain (publish and mapping failures); best-effort |
+| `descry_runner_result_errors_total` | counter | non-skip error `Result`s seen by the drain (publish and mapping failures), not counting checks that could not run; best-effort |
 | `descry_runner_skips_observed_total{kind}` | counter | skips seen by the drain, `kind` `queued` or `in_flight`; best-effort, triage only |
 | `descry_runner_targets` | gauge | number of configured targets, counting exact duplicates |
 | `descry_checks_not_run_total{reason}` | counter | runs whose check could not run (`check.ErrNotRun`), with no verdict recorded. `reason` is one of `EMFILE`, `ENFILE`, `EADDRNOTAVAIL`, `ENOBUFS`, `ENOMEM` and `other`, all six exported at 0 from startup. Not fed from `Results()`, so it is exact |
@@ -565,11 +566,17 @@ The runner's side is the same for any program: cancel the context passed to
 `Run`. The runner stops dispatching, waits for in-flight runs to finish, then
 closes `Results()` so a draining consumer's loop exits. Targets that were
 queued but not yet started are acked without running, so shutdown produces
-no burst of `context.Canceled` results. A run still in flight is handed the
-cancelled context, and whatever it returns once that context is done (a
+no burst of `context.Canceled` results. A run still in flight has its
+context cancelled: checks run on a context that carries `Run`'s context values
+but not its deadline, and that is cancelled when `Run`'s context ends, so a
+check cut short at shutdown sees `context.Canceled` even when `Run`'s context
+ended at a deadline. Whatever a run returns once `Run`'s context is done (a
 `down` Observation, which is what the bundled HTTP check returns for a
 cancelled request, an error, or the check's own `context.Canceled`) is
-dropped: no event, no `Result`, and nothing in the metrics. A rollout,
+dropped: no event and no `Result`. The metrics record nothing for a run the
+cancel cut short; one that finished in the moment between `Run`'s context
+ending and its check's context being cancelled is a real observation and may
+still be recorded there, though it is dropped all the same. A rollout,
 eviction or drain therefore no longer publishes a false `down` for each target
 that was mid-check; it loses that one sample instead, including a genuine
 result that happened to return just after the cancel. A run whose check
