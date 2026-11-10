@@ -262,6 +262,50 @@ root tag.
 
 ## Check
 
+### `EADDRNOTAVAIL` from the target's address family reads as not-run
+
+**What:** Decide whether an `EADDRNOTAVAIL` dial error caused by the target's
+address family (for example an AAAA-only target checked from a host or
+container with no IPv6 address) should stay a not-run (`check.ErrNotRun`) or be
+reported as `down`, and narrow the local-failure mapping if it should be `down`.
+
+**Why:** `localFailure` in `checks/http/http.go` treats every `EADDRNOTAVAIL` as
+local port exhaustion. When it is really "this host cannot reach that address
+family", the target gets no event and no verdict instead of a `down`, which a
+consumer of events sees as silence. `DescryChecksNotRun` and `DescryChecksStale`
+still fire, so it is not silent to an operator, but the not-run line's advice
+(widen the ephemeral port range) is wrong for it.
+
+**Context:** 2026-11-10, raised by the v0.6.0 PR-B adversarial review. Options:
+only treat `EADDRNOTAVAIL` as not-run when an IPv4 or same-family dial also
+fails, or when the error came from `bind` rather than `connect`; or keep it and
+document the case in OPERATIONS. Owner decision.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** owner decision
+
+### Response-parsing errors can still steer the HTTP error class
+
+**What:** Classify as `unknown` any `client.Do` cause that comes from parsing the
+target's response, or from an HTTP/2 stream or connection error, before
+`classifyError`'s keyword fallback, instead of the current denylist of
+`malformed http`, `malformed mime header` and `goaway`.
+
+**Why:** net/http quotes target-sent bytes in more errors than the denylist
+covers. A `Content-Length: timeout` or `Transfer-Encoding: tls-timeout` header, an
+unparseable `Location`, invalid trailer keys, and an HTTP/2 `StreamError` for an
+invalid header field name or value all reach the substring switch, so a target
+can choose the `error_class` (and the `descry_check_errors_total{class}` series)
+it is reported under. The verdict is `down` in every case; only the label is wrong.
+
+**Context:** 2026-11-10, found by the v0.6.0 PR-B pre-landing review (pass 2)
+after the denylist landed. Start at `targetTextErrors` in `checks/http/http.go`.
+Prefer a structural test (the typed error, or "the request was written and the
+failure came while reading the response") over more strings. Add matrix rows
+in `checks/http/verdict_matrix_test.go` for each case, including an HTTP/2 one
+(the GOAWAY row has no HTTP/2 test today), and narrow the CHANGELOG wording.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
 ### Per-check timing breakdown in `Extra`
 
 **What:** Record DNS, connect, TLS and time-to-first-byte durations for each check in

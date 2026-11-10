@@ -90,8 +90,12 @@ Pre-1.0, the minor version carries breaking changes.
   The classifier's text fallback matched the whole error message, which
   includes the request URL, so a target such as `https://tls-gateway.example/`
   or `/api/timeout` could be counted under the wrong class. It now matches
-  only the underlying cause, and a malformed status or header line or an
-  HTTP/2 GOAWAY, whose error text quotes what the target sent, is `unknown`.
+  only the underlying cause, and a malformed status line, a malformed header
+  line or an HTTP/2 GOAWAY, whose error text quotes what the target sent, is
+  `unknown`. Some other response-parsing errors (a bad `Content-Length`,
+  `Transfer-Encoding` or `Location` value, an invalid HTTP/2 header field)
+  still quote target bytes and can still steer the class; the verdict is
+  `down` either way. See TODOS.md.
 - **Shutdown no longer publishes a false `down`.** A run that returns after
   `Run`'s context is done (cancelled or past its deadline) is dropped: no
   event and no `Result`. A run cut short by it records nothing in the
