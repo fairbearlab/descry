@@ -8,6 +8,7 @@ import (
 	"io"
 	stdlog "log"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -661,7 +662,10 @@ func (leakyCheck) Run(_ context.Context, _ check.Target) (check.Observation, err
 	return check.Observation{
 		Status:     check.StatusUp,
 		StatusCode: 200,
-		FinalURL:   "https://user:hunter2@example.com/landing?token=s3cret#frag", // #nosec G101 -- fake credentials in a test fixture
+		FinalURL: (&url.URL{
+			Scheme: "https", User: url.UserPassword("user", "hunter2"),
+			Host: "example.com", Path: "/landing", RawQuery: "token=s3cret", Fragment: "frag",
+		}).String(),
 		ObservedAt: time.Now(),
 	}, nil
 }

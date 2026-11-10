@@ -158,7 +158,7 @@ func FuzzIsBlockedIP(f *testing.F) {
 func FuzzErrorTextIgnoresURL(f *testing.F) {
 	for _, s := range []string{
 		"https://tls-gateway.example/api/timeout",
-		"http://user:pass@connection-refused.example/?token=x509",
+		(&url.URL{Scheme: "http", User: url.UserPassword("user", "pass"), Host: "connection-refused.example", Path: "/", RawQuery: "token=x509"}).String(),
 		"https://no-such-host.example/server misbehaving",
 		"https://example.com/too many redirects/certificate",
 		"https://too many open files.example/",

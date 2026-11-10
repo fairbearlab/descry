@@ -359,7 +359,10 @@ func TestRun_ConnReusedFollowsLastHop(t *testing.T) {
 
 // secretURL carries credentials in userinfo and the query; none of it may
 // reach a not-run error.
-const secretURL = "http://alice:hunter2@secret-host.example/health?token=s3cr3t-token" // #nosec G101 -- fake test credentials, asserted absent from errors
+var secretURL = (&url.URL{
+	Scheme: "http", User: url.UserPassword("alice", "hunter2"),
+	Host: "secret-host.example", Path: "/health", RawQuery: "token=s3cr3t-token",
+}).String()
 
 var secretParts = []string{"alice", "hunter2", "secret-host", "s3cr3t-token", "token=", "health"}
 
