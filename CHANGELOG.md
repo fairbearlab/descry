@@ -43,9 +43,11 @@ Pre-1.0, the minor version carries breaking changes.
 
 - **Shutdown no longer publishes a false `down`.** A run that returns after
   `Run`'s context is done (cancelled or past its deadline) is dropped: no
-  event, no `Result`, and nothing
-  recorded by the metrics decorator (which also ignores any run whose context
-  was cancelled). A rollout or drain used to publish one `down` event per
+  event and no `Result`. A run cut short by it records nothing in the
+  metrics decorator either (which ignores any run whose context was
+  cancelled); one that finished in the moment between `Run`'s context ending
+  and its checks' context being cancelled is a real observation and may still
+  be recorded. A rollout or drain used to publish one `down` event per
   target that was mid-check. Under `WithShutdownGrace`, only a run whose check
   returned before the cancel can still publish after `Run` returns.
 
