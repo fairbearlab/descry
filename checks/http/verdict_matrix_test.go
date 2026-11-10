@@ -898,10 +898,14 @@ func matrixRlimitLookup(t *testing.T) {
 	_ = ln.Close()
 	_, _ = net.DefaultResolver.LookupHost(context.Background(), "localhost")
 
-	if err := lowerNoFileLimit(); err != nil {
+	restore, err := lowerNoFileLimit()
+	if err != nil {
 		t.Skipf("cannot lower RLIMIT_NOFILE: %v", err)
 	}
 	obs, err := New(2*time.Second).Run(context.Background(), check.Target{URL: secretURL})
+	if rerr := restore(); rerr != nil {
+		t.Fatalf("restore RLIMIT_NOFILE: %v", rerr)
+	}
 	expect(t, "lookup under RLIMIT_NOFILE", obs, err, outcome{ev: evNotRun})
 	assertNotRun(t, err, syscall.EMFILE, metrics.NotRunEMFILE, "check not run: lookup: "+syscall.EMFILE.Error())
 	if !t.Failed() {

@@ -6,4 +6,4 @@ import "errors"
 
 const rlimitSupported = false
 
-func lowerNoFileLimit() error { return errors.New("RLIMIT_NOFILE needs unix") }
+func lowerNoFileLimit() (func() error, error) { return nil, errors.New("RLIMIT_NOFILE needs unix") }
