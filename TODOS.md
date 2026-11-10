@@ -250,8 +250,10 @@ day of work. Writing the trigger down avoids re-deriving it in a repin PR.
 that raises a shared dependency (for example golang.org/x/sys or protobuf) because of a
 require such as prometheus/client_golang (which now arrives via the root `metrics/`
 package, and which `cmd/descry` also imports directly to serve `--listen`) or a future
-CLI-only OTel/grpc. Precedent: the root go.mod already carries
-`tool golang.org/x/vuln/cmd/govulncheck`. The move: `cmd/descry/go.mod` requiring the
+CLI-only OTel/grpc. The trigger has already fired once: x/vuln 1.9.0
+(via the root `tool` directive) held `golang.org/x/sys` at v0.49.0 for importers. It was
+fixed by moving the directive into `tools/go.mod`, not by this split. The remaining
+trigger is a CLI-only or `metrics/` require that raises a shared floor. The move: `cmd/descry/go.mod` requiring the
 root at a tagged version, `cmd/descry/vX.Y.Z` tags, and a ci.yml step (or job) that
 builds and tests the nested module; no lockstep or go.sum precompute is needed because the CLI pins a published
 root tag.

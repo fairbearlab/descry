@@ -68,6 +68,10 @@ Pre-1.0, the minor version carries breaking changes.
   stalled handshake now releases its socket and goroutines when the check
   times out, and a handshake longer than 10s succeeds inside a longer
   timeout.
+- **govulncheck moved out of the root module.** The `tool golang.org/x/vuln/cmd/govulncheck`
+  directive now lives in a separate `tools/` module (`go tool -modfile=tools/go.mod
+  govulncheck ./...`), so importers no longer inherit the scanner's dependency
+  floor (it held `golang.org/x/sys` at v0.49.0; the root now requires v0.48.0).
 - **`descry_check_up` is removed after three checks in a row that could not
   run**, and recreated by the next completed run, so verdict alerts do not
   keep firing on evidence nobody refreshed. `last_run` and the other

@@ -97,7 +97,7 @@ No code generation, no external services needed to build or run the tests.
 golangci-lint and goreleaser pins in `go.mod`, `.tool-versions` and the
 workflows agree, that your local Go and golangci-lint match them, that the
 module cache already has every module the tests and the `govulncheck` tool
-need (the scan itself still downloads the vulnerability database), that the
+(`tools/go.mod`) need (the scan itself still downloads the vulnerability database), that the
 files CI needs are present, and that you are working in a git worktree
 (`git worktree add ../descry-<topic> -b <branch> origin/main`) rather than the
 main checkout. It is a thin wrapper around the shared `loops env-check` engine
@@ -123,10 +123,11 @@ go vet ./...
 go mod tidy -diff
 go test -race ./...
 golangci-lint run ./...
-go tool govulncheck ./...
+go tool -modfile=tools/go.mod govulncheck ./...
 ```
 
-`go mod tidy -diff` fails on any go.mod/go.sum drift, so commit a tidy module
+`go mod tidy -diff` (and `go -C tools mod tidy -diff` for the `tools/` module that
+holds govulncheck) fails on any go.mod/go.sum drift, so commit a tidy module
 file set. CI also runs a `release-check` job that validates `.goreleaser.yaml`
 (`goreleaser check`) and does a snapshot build with publishing and signing
 skipped, so a broken release config fails the PR instead of the tag. The job

@@ -15,7 +15,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go tool govulncheck ./...
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - run: go tool -modfile=tools/go.mod govulncheck ./...
   # GitHub auto-disables scheduled workflows after 60 days of repo inactivity;
   # re-enabling on every scheduled run keeps the cron alive without relying on
   # someone noticing it stopped. Separate job so `actions: write` never reaches

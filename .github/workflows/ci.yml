@@ -15,6 +15,7 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go mod tidy -diff
+      - run: go -C tools mod tidy -diff
       # The engine packages stay dependency-light for embedders: prometheus may
       # appear only in metrics/ and cmd/. Every other package in the module is
       # engine, so a new package is checked without editing this step, and the
