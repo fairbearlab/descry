@@ -45,10 +45,6 @@ Things to know before you adapt it:
   before the new one starts. Outside a rollout a Deployment does not promise
   at most one pod: after an eviction, or while a node is unreachable, the
   replacement can probe alongside the old pod for a while.
-- **A restart can log a false `down`.** On SIGTERM descry cancels the checks
-  in flight, and a cancelled check is still published as a `down` event, so a
-  rollout, eviction or drain can leave one such event per target that was
-  mid-check.
 - **Only ports 80 and 443.** The guard also refuses any other port in a target
   URL, with the same `ssrf_blocked` class, so `https://host:8443/` is reported
   down without being dialled.
@@ -121,7 +117,7 @@ NetworkPolicy. kind's default CNI does enforce it.
 ## Try it on a kind cluster
 
 The release workflow publishes `ghcr.io/fairbearlab/descry` from v0.5.0 on,
-and `kustomization.yaml` pins v0.5.0, so running that release takes only
+and `kustomization.yaml` pins v0.5.1, so running that release takes only
 `kubectl apply -k examples/kubernetes` (see the note after step 3). The steps
 below build an image from this checkout instead and load it straight into
 kind, so they run your own changes. You need Docker,

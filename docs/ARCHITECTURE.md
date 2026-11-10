@@ -61,6 +61,11 @@ A genuinely *generic* HTTP output (one any HTTP monitor would emit) may become a
 typed field — that's not a leak. The test is "generic to HTTP monitoring," not
 "needed by my consumer."
 
+A generic sentinel error is allowed on the same terms: an exported `error`
+value, tested with `errors.Is`, that names an engine-level condition any
+check can hit and carries no consumer vocabulary. `check.ErrNotRun` ("the
+check could not run, so there is no verdict") is one.
+
 ### It governs *vocabulary*, not *surface*
 
 Read the "zero changes to exported types" clause as the anti-leak rule it was
@@ -96,7 +101,7 @@ consumer vocabulary, and it is additive. It changes surface, not vocabulary. ✅
 | The up/down boundary `[200, 400)` | A sane default codified numerically; not negotiable per consumer. |
 | CloudEvent `id` (ULID) | **Authoritative.** Consumers do not mint their own id; any `(time, id)` cursor a consumer builds uses the engine's id directly. |
 | `time` = `Observation.ObservedAt` | The authoritative timestamp a cursor orders on. |
-| Best-effort produce semantics | Bounded retry, then log + continue; never blocks the scheduler, never silently drops. |
+| Best-effort produce semantics | Bounded retry, then log + continue; never blocks the scheduler, never silently drops (a run cut short by shutdown is not an observation and is dropped by design; see [OPERATIONS.md](OPERATIONS.md#shutdown)). |
 | Cadence and skip semantics | Per-target interval, wall-clock-anchored phase, and "a target is never run concurrently with itself." A missed slot is reported as `ErrSkipped` / `ErrSkippedQueued`, never swallowed; what to *do* about one is the consumer's call. See [OPERATIONS.md](OPERATIONS.md). |
 | The CloudEvents 1.0 envelope shape | Pinned and snapshot-tested. |
 | SSRF guard (best-effort) | App-layer guard, explicitly **not** a security boundary — see the README Security section. |

@@ -14,7 +14,7 @@
 // with Options.DisablePerTarget, which the CLI's --metrics-per-target=false
 // sets):
 //
-//	descry_check_up                           gauge    {url}         1 when the last run was check.StatusUp, else 0
+//	descry_check_up                           gauge    {url}         1 when the last completed run was check.StatusUp, else 0; removed after 3 not-runs in a row
 //	descry_check_status_code                  gauge    {url}         last HTTP status code; 0 with no response or a Run error
 //	descry_check_latency_seconds              gauge    {url}         last run's latency (the last value, not a histogram)
 //	descry_check_last_run_timestamp_seconds   gauge    {url}         Observation.ObservedAt, unix seconds
@@ -30,7 +30,29 @@
 //	descry_runner_result_errors_total    counter           Options.ResultErrors(), non-skip errors, best-effort
 //	descry_runner_skips_observed_total   counter  {kind}   skips seen on Results(), best-effort
 //	descry_runner_targets                gauge             SetTargetCount
+//	descry_checks_not_run_total          counter  {reason} runs that returned check.ErrNotRun, by NotRunReason
+//	descry_checks_not_run_last_timestamp_seconds  gauge    unix time of the last such run; 0 until one
 //	descry_build_info                    gauge    {version,commit}  constant 1
+//
+// # Runs that record no verdict
+//
+// A run is evidence about its target only if the check actually ran. Two
+// kinds of run record no verdict (see Collector.Check for the details):
+//
+//   - A run whose ctx was cancelled by the time the check returned, as the
+//     runner's in-flight runs are at shutdown, records nothing at all. A
+//     per-call deadline is not a cancellation and is recorded as usual.
+//   - A Run error wrapping check.ErrNotRun means the check could not run
+//     (for a reason local to the prober). It counts in
+//     descry_checks_not_run_total{reason}, with every reason label exported
+//     at 0 from startup, and sets descry_checks_not_run_last_timestamp_seconds.
+//     The target's other series are left as they were, so last_run goes
+//     stale; descry_check_up is removed on the third not-run in a row and
+//     comes back with the next completed run. A target with no completed run
+//     gets no per-target series from a not-run.
+//
+// An absent descry_check_up therefore means "no current evidence", not "up"
+// and not "down".
 //
 // Target.Labels and Observation.Labels are never exported: they are opaque
 // consumer data with unbounded cardinality and may carry values that must not

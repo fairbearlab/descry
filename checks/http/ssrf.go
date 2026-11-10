@@ -85,8 +85,27 @@ func controlContext(_ context.Context, _, address string, _ syscall.RawConn) err
 	return nil
 }
 
-// newSafeTransport clones http.DefaultTransport (preserving its timeouts,
-// connection pooling, and HTTP/2 settings) and swaps in a dialer whose
+// HTTP/2 health checks. A check's timeout resets only its own stream, so without
+// these a connection that silently stopped delivering stays pooled and every
+// later check of that host times out on it until the kernel gives up.
+//
+// A connection is pinged after h2SendPingTimeout without a received frame and
+// closed if the ping goes unanswered for h2PingTimeout, so a dead connection
+// leaves the pool at most 30s after it dies. Counting a check already in flight
+// at that moment, at most about ceil((30s + timeout) / interval) checks fail per
+// connection, given that a new connection works: one at a 60s interval with a
+// 10s timeout.
+//
+// h2PingTimeout is the stdlib default. It meets that bound while tolerating a
+// slow path, which matters because an unanswered ping also fails any check in
+// flight on the connection.
+const (
+	h2SendPingTimeout = 15 * time.Second
+	h2PingTimeout     = 15 * time.Second
+)
+
+// newSafeTransport clones http.DefaultTransport (preserving its timeouts and
+// connection pooling), enables HTTP/2 health checks, and swaps in a dialer whose
 // ControlContext enforces the Layer 2 SSRF guard. ForceAttemptHTTP2 (set on
 // DefaultTransport) keeps HTTP/2 working despite the custom DialContext.
 //
@@ -96,6 +115,10 @@ func controlContext(_ context.Context, _, address string, _ syscall.RawConn) err
 func newSafeTransport() *nethttp.Transport {
 	t := nethttp.DefaultTransport.(*nethttp.Transport).Clone()
 	t.Proxy = nil
+	t.HTTP2 = &nethttp.HTTP2Config{
+		SendPingTimeout: h2SendPingTimeout,
+		PingTimeout:     h2PingTimeout,
+	}
 	d := &net.Dialer{
 		Timeout:        30 * time.Second,
 		KeepAlive:      30 * time.Second,

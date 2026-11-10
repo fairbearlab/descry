@@ -46,6 +46,10 @@ func WithUserAgent(ua string) Option {
 
 // New creates a new HTTP Check with the given timeout. If timeout <= 0,
 // defaultTimeout (10s) is used. Options are applied after the defaults.
+//
+// Checks reuse connections, and HTTP/2 connections receive a PING after 15s
+// without a received frame, so one that silently died is replaced within 30s.
+// See docs/OPERATIONS.md for what that means for false failures.
 func New(timeout time.Duration, opts ...Option) *Check {
 	if timeout <= 0 {
 		timeout = defaultTimeout
