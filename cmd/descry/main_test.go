@@ -160,7 +160,7 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 
 	var out bytes.Buffer
 	var failures atomic.Int64
-	drainResults(ch, &out, 30*time.Second, now, &failures, nil)
+	drainResults(ch, &out, 30*time.Second, now, &failures, nil, 4, 1)
 	if got := failures.Load(); got != 1 {
 		t.Fatalf("failures = %d, want 1", got)
 	}
@@ -191,7 +191,7 @@ func TestDrainResults_RateLimitsSkipsPerTarget(t *testing.T) {
 		}
 		return clock
 	}
-	drainResults(ch2, &out, 30*time.Second, tick, new(atomic.Int64), nil)
+	drainResults(ch2, &out, 30*time.Second, tick, new(atomic.Int64), nil, 4, 1)
 	s = out.String()
 	if n := strings.Count(s, "check skipped:"); n != 2 {
 		t.Fatalf("skip lines across an interval boundary = %d, want 2:\n%s", n, s)
@@ -211,7 +211,7 @@ func TestDrainResults_FailureCountVisibleLive(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		drainResults(ch, io.Discard, 30*time.Second, time.Now, &failures, nil)
+		drainResults(ch, io.Discard, 30*time.Second, time.Now, &failures, nil, 4, 1)
 	}()
 
 	tgt := check.Target{URL: "https://a.example/"}
@@ -263,7 +263,7 @@ func TestDrainResults_SkipWindowUsesTargetInterval(t *testing.T) {
 	ch <- runner.Result{Target: dflt, Err: runner.ErrSkipped} // t=6s: suppressed (30s window)
 	close(ch)
 	var out bytes.Buffer
-	drainResults(ch, &out, 30*time.Second, now, new(atomic.Int64), nil)
+	drainResults(ch, &out, 30*time.Second, now, new(atomic.Int64), nil, 4, 1)
 
 	s := out.String()
 	if n := strings.Count(s, "check skipped: https://fast.example/"); n != 2 {

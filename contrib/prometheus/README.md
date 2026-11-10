@@ -1,7 +1,7 @@
 # Prometheus alerting rules
 
 `descry-rules.yaml` is a [Prometheus Operator](https://prometheus-operator.dev/)
-`PrometheusRule` with one group, `descry`, and six alerts over the series that
+`PrometheusRule` with one group, `descry`, and seven alerts over the series that
 `descry --listen` serves (or that a program embedding the `metrics` package
 exports):
 
@@ -13,6 +13,7 @@ exports):
 | `DescrySkipsClimbing` | the exact `descry_runner_skipped_slots_total` rose at least once in every 10m window for 15m | warning |
 | `DescryResultsDropped` | `descry_runner_dropped_results_total` rose in the last 10m (a dropped `Result` can hide a failed check or publish; its diagnostics and the counts fed from `Results()` are lost) | warning |
 | `DescryPublishErrors` | `descry_runner_result_errors_total` rose in the last 10m (best-effort series) | warning |
+| `DescryChecksNotRun` | a check could not run in the last 10m (`descry_checks_not_run_last_timestamp_seconds`); verdict alerts are unreliable while it fires | warning |
 
 The skip alert reads the exact total, not `descry_runner_skips_observed_total`,
 which is for triage only. The series and their limits are in
@@ -27,15 +28,20 @@ firing: remove that target first, or expect the alert.
 A program that embeds the `metrics` package gets these alerts only for what it
 wires up: `DescryTargetDown` and `DescryChecksStale` need its check wrapped
 with `Collector.Check`, `DescrySkipsClimbing` and `DescryResultsDropped` need
-`SetRunner`, and `DescryPublishErrors` needs `Options.ResultErrors`. Without
+`SetRunner`, `DescryPublishErrors` needs `Options.ResultErrors`, and
+`DescryChecksNotRun` needs a check that returns `check.ErrNotRun` wrapped
+with `Collector.Check`. Without
 that wiring the series still exist but stay at 0 (or are never written), so
 the alert can never fire.
 
 ## The stale-check budget
 
 `DescryChecksStale` catches a prober that is up and serving `/metrics` but no
-longer completing checks. `descry_check_up` keeps its last value (a target
-that was up stays up) and `descry_build_info` is still scraped. A wedged sink
+longer completing checks. A wedged run leaves `descry_check_up` at its last
+value (a target that was up stays up) and `descry_build_info` is still
+scraped. Checks that cannot run (`check.ErrNotRun`) remove `descry_check_up`
+after three in a row but leave the timestamp frozen, so this rule covers them
+too, after `DescryChecksNotRun` has fired. A wedged sink
 keeps its runs in flight, so their slots are skipped and `DescrySkipsClimbing`
 fires as well, but that alert points at the concurrency or the interval;
 `DescryChecksStale` is the one that names the real symptom. A wedged scheduler
@@ -106,10 +112,19 @@ of it, and a counter step inside the gap never fires the alert.
   Prometheus scrapes several).
 
 - **One failed run of a slow target is enough.** `descry_check_up` holds its
-  value until the next run, so the 5m wait on `DescryTargetDown` is about 5m
+  value until the next completed run, so the 5m wait on `DescryTargetDown` is about 5m
   divided by the target's interval in consecutive failures. A target with an
   interval of 5m or more pages after a single failed run. Raise `for` if slow
   targets need more than one chance.
+- **A check that cannot run resolves `DescryTargetDown`.** A run that returns
+  `check.ErrNotRun` is no evidence about the target, so after three in a row
+  descry removes that target's `descry_check_up`, and a target that was down
+  stops alerting until a completed run brings the series back.
+  `DescryChecksNotRun` fires meanwhile, and `DescryChecksStale` once the
+  15-minute budget passes, for a target that has completed a run. A target
+  that has never completed one (checks not running since start) has no
+  per-target series, so `DescryChecksNotRun` is its only alert. See
+  [Checks that could not run](../../docs/OPERATIONS.md#checks-that-could-not-run).
 - **The skip alert is not "skipping for 15 minutes straight".** It fires when
   every 10-minute window over 15 minutes holds at least one skip: skipping that
   lasts about 8 minutes or more, or single skips less than 10 minutes apart.

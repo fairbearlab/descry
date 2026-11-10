@@ -8,6 +8,49 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`check.ErrNotRun`: a check can say it could not run.** A `Check` returns an
+  error wrapping `check.ErrNotRun` when it could not run for a reason local to
+  the prober (out of file descriptors or ephemeral ports, say), so it has no
+  verdict. The metrics decorator records no verdict for it and counts it in
+  the new `descry_checks_not_run_total{reason}` (`EMFILE`, `ENFILE`,
+  `EADDRNOTAVAIL`, `ENOBUFS`, `ENOMEM`, `other`) and
+  `descry_checks_not_run_last_timestamp_seconds`; `metrics.NotRunReason` gives
+  the reason. The `descry` CLI prints a rate-limited `check not run:` line
+  with the reason and an action instead of `check failed:`, and does not count
+  it in `descry_runner_result_errors_total`. The bundled HTTP check does not
+  return it yet.
+- `contrib/prometheus`: `DescryChecksNotRun` (warning, no wait) fires for 10
+  minutes after a check could not run, with a runbook in
+  `docs/OPERATIONS.md`.
+
+### Changed
+
+- **`descry_check_up` is removed after three checks in a row that could not
+  run**, and recreated by the next completed run, so verdict alerts do not
+  keep firing on evidence nobody refreshed. `last_run` and the other
+  per-target series keep their values, so `DescryChecksStale` still fires
+  for a target that has completed a run. A URL that has never completed but
+  shares its `url` label with one that has counts toward that label's streak.
+- **Checks run on a context that `Runner.Run`'s context cancels.** It carries
+  `Run`'s context values but not its deadline, and ends as
+  `context.Canceled` whether `Run`'s context was cancelled or hit its
+  deadline, so a run cut short at shutdown never reads as a timeout of the
+  target.
+
+### Fixed
+
+- **Shutdown no longer publishes a false `down`.** A run that returns after
+  `Run`'s context is done (cancelled or past its deadline) is dropped: no
+  event and no `Result`. A run cut short by it records nothing in the
+  metrics decorator either (which ignores any run whose context was
+  cancelled); one that finished in the moment between `Run`'s context ending
+  and its checks' context being cancelled is a real observation and may still
+  be recorded. A rollout or drain used to publish one `down` event per
+  target that was mid-check. Under `WithShutdownGrace`, only a run whose check
+  returned before the cancel can still publish after `Run` returns.
+
 ## [0.5.1] — 2026-11-08
 
 ### Added

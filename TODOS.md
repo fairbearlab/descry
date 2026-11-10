@@ -80,30 +80,31 @@ CONTRIBUTING.md.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
-### A check cancelled at shutdown is published as a `down` event
+### The benchstat gate can fail on `BenchmarkSkipPath` from runner noise
 
-**What:** When `Run`'s context is cancelled, a check that is already in flight
-should not produce an event (or a failed-run metric) for the target. Either
-`runOne` drops the observation when `ctx.Err() != nil` after the check returns,
-or the outcome is marked as cancelled so the sink and the collector can skip it.
+**What:** Make the `benchstat` job in `.github/workflows/perf.yml` stop failing
+on noise in sub-100 ns benchmarks, `BenchmarkSkipPath` in particular.
 
-**Why:** On SIGTERM the runner hands the cancelled context to the in-flight
-check. The bundled `httpcheck` returns the cancelled request as an
-`Observation` with status `down` (class `unknown` in most cases) and a nil
-error, the collector records a failed run, and a sink that ignores its context
-(the stdout sink does) still publishes it. Every rollout, eviction, node drain
-or liveness kill that catches a check mid-run therefore emits a false `down`
-event for that target, which downstream alerting cannot tell from a real
-outage.
+**Why:** The job benchmarks the merge-base and then the head, each
+`-count=10` in one block, on the same runner, and fails on a ≥ +10% ns/op
+change with p < 0.05. Running all base samples before all head samples means
+any slowdown of the runner during the job lands on the head side every time,
+and benchstat reads that consistent offset as significant. A ~40 ns benchmark
+needs only a 4 ns shift to cross the bar. The check is not required for
+merge, but a red check on an unrelated PR costs a rerun and an investigation.
 
-**Context:** 2026-10-12 — found while documenting the Kubernetes example, whose
-README now warns about it ("A restart can log a false `down`"; drop that bullet
-with the fix). Start at `runner.runOne` and `httpcheck.Run`; the fix must keep
-the shutdown invariant that no `Publish` happens after `Run` returns, and
-decide whether a custom check's own ctx error should still reach `Results()`.
+**Context:** 2026-11-10, PR #49 at `6e40701`: `SkipPath-4` 39.05n → 42.96n,
++10.00% (p=0.000), failed the gate; the rerun passed at +5.54% (p=0.000). The
+PR does not touch `Runner.skip` or `reportResult`. An interleaved local A/B
+(20 samples each, alternating base and head) gave 17.63 vs 17.59 ns/op. Across
+runners the benchmark has measured 39–70 ns, with base and head within 1% on
+earlier PRs. Options: interleave the samples (alternate base and head runs
+with `-count=1` in a loop) so drift spreads across both sides; or require an
+absolute floor as well as the 10% (for example ≥ +10% and ≥ 10 ns) for
+benchmarks under 100 ns. Interleaving fixes the cause and keeps the gate
+sensitive, so prefer it.
 
-**Effort:** S · **Priority:** P2 · **Depends on:** nothing
-
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
 ## Event
 
@@ -619,6 +620,38 @@ someone bumps it by hand, including after distroless publishes a fix.
 **Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
 ## Completed
+
+### A check cancelled at shutdown is published as a `down` event
+
+**What:** When `Run`'s context is cancelled, a check that is already in flight
+should not produce an event (or a failed-run metric) for the target. Either
+`runOne` drops the observation when `ctx.Err() != nil` after the check returns,
+or the outcome is marked as cancelled so the sink and the collector can skip it.
+
+**Why:** On SIGTERM the runner hands the cancelled context to the in-flight
+check. The bundled `httpcheck` returns the cancelled request as an
+`Observation` with status `down` (class `unknown` in most cases) and a nil
+error, the collector records a failed run, and a sink that ignores its context
+(the stdout sink does) still publishes it. Every rollout, eviction, node drain
+or liveness kill that catches a check mid-run therefore emits a false `down`
+event for that target, which downstream alerting cannot tell from a real
+outage.
+
+**Context:** 2026-10-12 — found while documenting the Kubernetes example, whose
+README now warns about it ("A restart can log a false `down`"; drop that bullet
+with the fix). Start at `runner.runOne` and `httpcheck.Run`; the fix must keep
+the shutdown invariant that no `Publish` happens after `Run` returns, and
+decide whether a custom check's own ctx error should still reach `Results()`.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
+**Completed:** 2026-11-09 — `runner.runOne` drops whatever a run returns once
+the run context is done (event, `Result{Err}`, and a custom check's own ctx
+error alike), and the metrics decorator records nothing for a run whose ctx
+was cancelled, so shutdown publishes no `down` and counts no failed run. The
+"no `Publish` after `Run` returns" invariant holds; under `WithShutdownGrace`
+only a run whose check returned before the cancel (a sink already blocked in
+`Publish`) can still publish late. The Kubernetes README bullet is gone.
 
 ### Protect release tags with a ruleset
 

@@ -138,9 +138,10 @@ tests:
               description: >-
                 The last completed run of https://wedged.example/ is more than
                 15 minutes old, but descry is still being scraped. Its
-                per-target series, descry_check_up included, are frozen at
-                their last values. Check descry's stderr and the sink, and
-                restart descry if it is wedged.
+                per-target series are frozen at their last values
+                (descry_check_up is removed instead if its checks could not
+                run). Check descry's stderr and the sink, and restart descry
+                if it is wedged.
 
   - name: checks stale does not fire while the timestamp advances
     interval: 1m
@@ -403,4 +404,88 @@ tests:
     alert_rule_test:
       - eval_time: 15m
         alertname: DescryPublishErrors
+        exp_alerts: []
+
+  # --- DescryChecksNotRun -------------------------------------------------
+  # As for DescryChecksStale, the timestamp holds unix seconds and promtool's
+  # time() at an eval_time is that many seconds since 0.
+  - name: checks not run fires on the first sample, already set, with no wait
+    interval: 1m
+    input_series:
+      # A new instance whose first scrape (at 3m) already carries a not-run
+      # from 3m: there is no earlier sample to compare against, which is the
+      # case a counter's increase() would miss.
+      - series: 'descry_checks_not_run_last_timestamp_seconds{instance="new"}'
+        values: '_ _ _ 180+0x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DescryChecksNotRun
+        exp_alerts: []
+      # Value: protects=DescryChecksNotRun fires on its first sample with no
+      # wait; fails_when=the rule reads a counter's increase() or gains a
+      # `for`; why_new=no other rule fires on a not-run before a second
+      # scrape; seam=none; no_claim=real scrape timing (synthetic 1m samples)
+      - eval_time: 3m
+        alertname: DescryChecksNotRun
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: new
+            exp_annotations: &notRunAnnotations
+              summary: descry could not run some checks
+              description: >-
+                At least one check could not run in the last 10 minutes
+                because the prober itself failed (file descriptors, ephemeral
+                ports, socket buffers or memory), so nothing was observed of
+                its target. Verdict alerts (DescryTargetDown,
+                DescryChecksStale) are unreliable while this fires: an
+                affected target keeps its last verdict for two runs and then
+                has no descry_check_up at all.
+                descry_checks_not_run_total{reason} names the resource, and
+                descry's stderr has a "check not run" line per target with an
+                action.
+              runbook_url: https://github.com/fairbearlab/descry/blob/main/docs/OPERATIONS.md#checks-that-could-not-run
+      # 9m after the not-run it still fires; at exactly 10m it does not
+      # (strictly under 600s), so the pair pins the window and the <.
+      - eval_time: 12m
+        alertname: DescryChecksNotRun
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: new
+            exp_annotations: *notRunAnnotations
+      - eval_time: 13m
+        alertname: DescryChecksNotRun
+        exp_alerts: []
+
+  - name: checks not run follows the latest not-run and resolves 10m after it
+    interval: 1m
+    input_series:
+      # Not-runs at 1m and again at 8m, then none.
+      - series: 'descry_checks_not_run_last_timestamp_seconds'
+        values: '0 60 60 60 60 60 60 60 480+0x20'
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: DescryChecksNotRun
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations: *notRunAnnotations
+      - eval_time: 18m
+        alertname: DescryChecksNotRun
+        exp_alerts: []
+
+  - name: checks not run does not fire before any not-run
+    interval: 1m
+    input_series:
+      # 0 until a not-run happens. Real time() is far past 600s, so 0 never
+      # fires; in promtool's clock it only stops firing from 10m on.
+      - series: 'descry_checks_not_run_last_timestamp_seconds'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: DescryChecksNotRun
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: DescryChecksNotRun
         exp_alerts: []
