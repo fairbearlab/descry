@@ -12,6 +12,18 @@ an `EventSink` (stdout / file in v1); tenancy and routing ride along as an opaqu
 `Labels` map the engine never interprets, so it owes no particular consumer
 anything. It runs in production in my homelab, watching real endpoints.
 
+A verdict is a claim about the target, observed from this host. `up` means the
+target gave an acceptable response (a final status of 200-399, decided from
+the headers) within the timeout and, by default, that a new connection to it
+could be made, because every check opens its own
+([connection reuse](docs/OPERATIONS.md#reused-connections-and-false-failures)
+is opt-in and weakens that).
+`down` means this check tried and observed a failure from this host, and descry found no sign that its own state caused it.
+A check that could not run at all, because this host ran out of file
+descriptors or ports, is neither: it publishes no event. The contract, class
+by class, with the local causes descry cannot see, is in
+[Verdict contract](docs/OPERATIONS.md#verdict-contract).
+
 The part that is more than table stakes is the SSRF guard: two layers, the second
 of which checks the already-resolved socket address inside
 `net.Dialer.ControlContext`, so a rebound DNS answer is blocked before `connect(2)`
@@ -123,6 +135,16 @@ targets:
 
 Intervals below 1ms (`config.MinInterval`) are rejected at load: at that
 cadence the scheduler can only spin.
+
+Every check opens a fresh TCP and TLS connection, so `up` proves a new
+connection works. The top-level `connection_reuse: true` (default `false`)
+keeps connections open between checks instead: cheaper, but a healthy pooled
+connection can keep answering while new connections fail, and DNS or
+certificate changes go unseen until a new one is dialled. Results then carry
+`extra.conn_reused`, and descry logs a warning at startup. See
+[Reused connections and false failures](docs/OPERATIONS.md#reused-connections-and-false-failures).
+With fresh connections, size `concurrency` from the cold-connection check
+time ([Sizing `concurrency`](docs/OPERATIONS.md#sizing-concurrency)).
 
 If a target's interval is not longer than the check `timeout`, descry
 logs one startup warning naming it; a slow response on that target will then
@@ -237,6 +259,37 @@ c := httpcheck.New(10*time.Second, httpcheck.WithUserAgent("MyMonitor/1.0 (+http
 
 `WithUserAgent("")` (or omitting the option) leaves the stdlib default in place —
 the engine never impersonates a browser unless the caller explicitly opts in.
+
+Each check, and each redirect hop in it, opens a new connection. The TCP dial
+and the TLS handshake are each capped at the check timeout. To keep
+connections open between checks (what 0.5.1 and earlier always did), pass
+`WithConnectionReuse()`; results then carry `Extra["conn_reused"]`, and `up`
+no longer proves a new connection can be made:
+
+```go
+c := httpcheck.New(10*time.Second, httpcheck.WithConnectionReuse())
+```
+
+A down target is an `Observation`, not an error. The check returns an error
+only when it could not run because this host ran out of a local resource
+(`EMFILE`, `ENFILE`, `EADDRNOTAVAIL`, `ENOBUFS`, `ENOMEM`). That error wraps
+`check.ErrNotRun`, so a program draining `Results()` tells it apart from a
+failure:
+
+```go
+for res := range r.Results() {
+    switch {
+    case errors.Is(res.Err, check.ErrNotRun):
+        // no verdict: this host, not the target; retries next interval
+    case res.Err != nil:
+        // a skip, a check error, or a publish failure
+    }
+}
+```
+
+The `runner` package's `Example_absenceIsUnknown` is a compiled version that
+also expires stale verdicts; see
+[Consuming events: absence is unknown](docs/OPERATIONS.md#consuming-events-absence-is-unknown).
 
 ## Security
 

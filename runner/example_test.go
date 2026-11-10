@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
@@ -76,9 +77,11 @@ func ExampleNew_perTargetIntervals() {
 
 // verdictBook is an event consumer that treats the absence of a fresh event
 // as unknown: it keeps each subject's last verdict with the event's time and
-// stops trusting it once it is older than the subject's expected cadence.
+// stops trusting it once it is older than the subject's expected cadence. The
+// runner calls Publish from several goroutines, so mu guards last.
 type verdictBook struct {
 	maxAge time.Duration // e.g. 2 × interval + timeout
+	mu     sync.Mutex
 	last   map[string]lastVerdict
 }
 
@@ -95,6 +98,8 @@ func (b *verdictBook) Publish(_ context.Context, e cloudevents.Event) error {
 	if err := e.DataAs(&data); err != nil {
 		return err
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.last[e.Subject()] = lastVerdict{data.Status, e.Time()}
 	return nil
 }
@@ -102,7 +107,9 @@ func (b *verdictBook) Publish(_ context.Context, e cloudevents.Event) error {
 // verdict is the subject's status at now: its last verdict while fresh, else
 // "unknown". It never returns a verdict it has no current evidence for.
 func (b *verdictBook) verdict(subject string, now time.Time) string {
+	b.mu.Lock()
 	v, ok := b.last[subject]
+	b.mu.Unlock()
 	if !ok || now.Sub(v.at) > b.maxAge {
 		return "unknown"
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	stdlog "log"
 	"log/slog"
@@ -645,6 +646,131 @@ func TestRun_WarnsMetricsPerTargetWithoutListen(t *testing.T) {
 			}
 			if n := strings.Count(logs.String(), msg); n != tc.want {
 				t.Errorf("warnings = %d, want %d:\n%s", n, tc.want, logs.String())
+			}
+		})
+	}
+}
+
+// leakyCheck reports a final URL that carries userinfo and a query, as
+// net/http's resp.Request.URL does after a redirect.
+type leakyCheck struct{}
+
+func (leakyCheck) Name() string { return "leaky" }
+
+func (leakyCheck) Run(_ context.Context, _ check.Target) (check.Observation, error) {
+	return check.Observation{
+		Status:     check.StatusUp,
+		StatusCode: 200,
+		FinalURL:   "https://user:hunter2@example.com/landing?token=s3cret#frag", // #nosec G101 -- fake credentials in a test fixture
+		ObservedAt: time.Now(),
+	}, nil
+}
+
+// Value: protects=run() wraps the production check in sanitizedCheck, on the plain and the --listen path, so userinfo and the query never reach data.final_url
+// Value: fails_when=run() hands the unwrapped check to the runner (or to the collector) and the final URL reaches the sink with credentials or a token
+// Value: why_new=closes the TODOS gap: loopback targets never produce a FinalURL, so only a substituted inner check can prove the wrapping
+func TestRun_WrapsProductionCheckInSanitizedCheck(t *testing.T) {
+	origCheck, origNotify := newHTTPCheck, notifyContext
+	t.Cleanup(func() { newHTTPCheck, notifyContext = origCheck, origNotify })
+	newHTTPCheck = func(config.Config) check.Check { return leakyCheck{} }
+
+	for _, tc := range []struct {
+		name  string
+		extra []string
+	}{
+		{"plain", nil},
+		{"listen", []string{"--listen", "127.0.0.1:0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "descry.yaml")
+			yaml := "source: https://example.com/descry\ninterval: 1s\ntimeout: 500ms\ntargets:\n  - url: https://example.com/\n"
+			if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			outFile := filepath.Join(dir, "events.jsonl")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+				return ctx, func() {}
+			}
+			var stderr lockedBuffer
+			done := make(chan int, 1)
+			args := append([]string{"--config", cfgPath, "--sink", "file", "--file", outFile}, tc.extra...)
+			go func() { done <- run(args, io.Discard, &stderr) }()
+
+			deadline := time.Now().Add(10 * time.Second)
+			var body []byte
+			for {
+				body, _ = os.ReadFile(outFile)
+				if bytes.Contains(body, []byte("final_url")) {
+					break
+				}
+				if time.Now().After(deadline) {
+					cancel()
+					t.Fatalf("no event with final_url after 10s; stderr:\n%s", stderr.String())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			cancel()
+			select {
+			case code := <-done:
+				if code != 0 {
+					t.Fatalf("exit code = %d; stderr:\n%s", code, stderr.String())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("run did not return")
+			}
+			body, _ = os.ReadFile(outFile)
+			for _, secret := range []string{"hunter2", "s3cret", "frag", "user:"} {
+				if bytes.Contains(body, []byte(secret)) {
+					t.Errorf("event contains %q; run() is not wrapping the check in sanitizedCheck:\n%s", secret, body)
+				}
+			}
+			if !bytes.Contains(body, []byte(`"final_url":"https://example.com/landing"`)) {
+				t.Errorf("event lacks the sanitized final_url:\n%s", body)
+			}
+		})
+	}
+}
+
+// Value: protects=connection_reuse is logged at startup, and a warning says up no longer proves a new connection when it is on
+// Value: fails_when=the startup line is missing or the warning fires with reuse off
+// Value: why_new=X7: operators must see the mode they run in
+func TestRun_LogsConnectionReuse(t *testing.T) {
+	origNotify := notifyContext
+	t.Cleanup(func() { notifyContext = origNotify })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	}
+	for _, tc := range []struct {
+		name, line string
+		warn       bool
+	}{
+		{"default", "", false},
+		{"false", "connection_reuse: false\n", false},
+		{"true", "connection_reuse: true\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "descry.yaml")
+			yaml := "source: https://example.com/descry\n" + tc.line + "targets:\n  - url: https://example.com/\n"
+			if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			logs := captureDefaultLog(t)
+			var stderr lockedBuffer
+			if code := run([]string{"--config", cfgPath}, io.Discard, &stderr); code != 0 {
+				t.Fatalf("exit code = %d; stderr:\n%s", code, stderr.String())
+			}
+			out := logs.String()
+			want := fmt.Sprintf("connection_reuse=%v", tc.warn)
+			if !strings.Contains(out, want) {
+				t.Errorf("log lacks %q:\n%s", want, out)
+			}
+			if got := strings.Contains(out, "up no longer proves a new connection"); got != tc.warn {
+				t.Errorf("warning present = %v, want %v:\n%s", got, tc.warn, out)
 			}
 		})
 	}

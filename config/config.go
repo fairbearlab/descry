@@ -38,14 +38,17 @@ type rawTarget struct {
 
 // rawConfig is the on-disk shape; duration fields come in as strings.
 type rawConfig struct {
-	Source      string            `yaml:"source"`
-	Sink        string            `yaml:"sink"`      // "stdout" | "file"
-	FilePath    string            `yaml:"file_path"` // required when sink == "file"
-	Interval    string            `yaml:"interval"`
-	Timeout     string            `yaml:"timeout"`
-	Concurrency int               `yaml:"concurrency"`
-	Targets     []rawTarget       `yaml:"targets"`
-	Labels      map[string]string `yaml:"labels"` // global labels (unused in v1, reserved)
+	Source      string `yaml:"source"`
+	Sink        string `yaml:"sink"`      // "stdout" | "file"
+	FilePath    string `yaml:"file_path"` // required when sink == "file"
+	Interval    string `yaml:"interval"`
+	Timeout     string `yaml:"timeout"`
+	Concurrency int    `yaml:"concurrency"`
+	// ConnectionReuse is a pointer-free bool: absent means false (fresh
+	// connections); a non-bool value fails the strict decode.
+	ConnectionReuse bool              `yaml:"connection_reuse"`
+	Targets         []rawTarget       `yaml:"targets"`
+	Labels          map[string]string `yaml:"labels"` // global labels (unused in v1, reserved)
 }
 
 // Config is the parsed, validated config.
@@ -56,7 +59,11 @@ type Config struct {
 	Interval    time.Duration
 	Timeout     time.Duration
 	Concurrency int
-	Targets     []Target
+	// ConnectionReuse opts the HTTP check back into pooled connections
+	// (top-level YAML key connection_reuse, default false). Off, every check
+	// opens a fresh connection, so up proves a new TCP+TLS connection works.
+	ConnectionReuse bool
+	Targets         []Target
 }
 
 // ValidateSink checks the sink/file_path invariant. It is exported so callers
@@ -106,6 +113,8 @@ func Load(path string) (cfg Config, err error) {
 		Sink:        raw.Sink,
 		FilePath:    raw.FilePath,
 		Concurrency: raw.Concurrency,
+
+		ConnectionReuse: raw.ConnectionReuse,
 	}
 
 	// Parse duration strings; fall back to defaults on empty.

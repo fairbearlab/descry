@@ -96,8 +96,8 @@ target (see [Shutdown](#shutdown)).
 | Signal | Type | Means | What to do |
 |---|---|---|---|
 | `Result{Err: nil}` | channel | Check ran, event published | nothing |
-| `Result{Err: <wraps check.ErrNotRun>}` | channel | The check could not run at all, for a reason local to the prober (out of file descriptors or ephemeral ports, say), so nothing was observed of the target and no event was published. Test with `errors.Is(err, check.ErrNotRun)` before treating the error as a failure. Only a custom `Check` returns it today; the bundled `httpcheck` does not yet | the prober host — see [Checks that could not run](#checks-that-could-not-run); **not** the target |
-| `Result{Err: <check, mapping, or publish error>}` | channel | The check itself returned an error (only possible with a custom `Check` implementation — the bundled `httpcheck` never returns one), or the observation could not be delivered: the event could not be encoded (a payload that will not marshal — an `Extra` value such as a channel or NaN), or the sink rejected it up to 3 times (fewer if the context was cancelled mid-retry) | your check, your `Extra` payload, or your sink — **not** the target |
+| `Result{Err: <wraps check.ErrNotRun>}` | channel | The check could not run at all, for a reason local to the prober (out of file descriptors or ephemeral ports, say), so nothing was observed of the target and no event was published. Test with `errors.Is(err, check.ErrNotRun)` before treating the error as a failure. The bundled `httpcheck` returns it when the request fails at any stage (the dial, the DNS lookup, or a socket read or write) with `EMFILE`, `ENFILE`, `EADDRNOTAVAIL`, `ENOBUFS` or `ENOMEM` | the prober host — see [Checks that could not run](#checks-that-could-not-run); **not** the target |
+| `Result{Err: <check, mapping, or publish error>}` | channel | The check itself returned an error (from a custom `Check` implementation; the only error the bundled `httpcheck` returns is the not-run one in the row above), or the observation could not be delivered: the event could not be encoded (a payload that will not marshal — an `Extra` value such as a channel or NaN), or the sink rejected it up to 3 times (fewer if the context was cancelled mid-retry) | your check, your `Extra` payload, or your sink — **not** the target |
 | `Run` returns `runner: event config: ...` | error | The event config (`Source`, `Type`) is invalid. The runner validates it once in `New` and `Run` refuses to start: `Results()` is closed with no `Result` and no check runs. The `descry` CLI checks the same config before opening the sink and exits 2 (config error) with `error: invalid event config`; the `source` in that message is printed through `check.RedactURL`, so one that does not parse shows as `<unparseable>` | fix `source` / the event config; this is a startup error, never a per-event one |
 | `Result{Err: runner.ErrSkipped}` | channel | Slot skipped: the prior run **had started** and was still running. The check is slower than the target's interval | lengthen that target's interval, or shorten `timeout` |
 | `Result{Err: runner.ErrSkippedQueued}` | channel | Slot skipped: the prior run was still **queued** behind a saturated worker pool and had not started. The pool is too small | raise `concurrency` (see sizing below) |
@@ -110,8 +110,10 @@ A target that times out, refuses the connection, returns a 500, or is blocked by
 the SSRF guard is a **successful check of a down target**: the bundled
 `checks/http` reports it as `Observation.Status = down` with an `ErrorClass`
 (`timeout`, `connection_refused`, `dns_failure`, `http_error`, `ssrf_blocked`, …)
-on the published event, and returns no error. `httpcheck.Check.Run` never returns
-a non-nil error.
+on the published event, and returns no error. The one error
+`httpcheck.Check.Run` returns is for a check that could not run because this
+host ran out of a local resource; it wraps `check.ErrNotRun` (see
+[Checks that could not run](#checks-that-could-not-run)).
 
 So `Result.Err` is a narrow channel by design — it carries skips, checks that
 could not run and other check errors (from a custom `Check`), mapping failures,
@@ -119,12 +121,113 @@ and publish failures, and nothing about target health. **Uptime alarms
 belong on the events, not on `Results()`.** `Results()` is where you watch the
 *engine*.
 
+### Verdict contract
+
+A verdict is a claim about the target, observed from this host at the event's
+`time`. The README states it in one line; this is the detail.
+
+**`up`** means the target gave an acceptable response within `timeout`: from
+this host, the hostname resolved, a TCP connection opened, TLS completed for
+`https`, and the response's status line and headers arrived. By default each
+check, and each redirect hop in it, dials its own connection, so `up` also
+says a new connection could be made at that moment. With `connection_reuse:
+true` it says less: see
+[Reused connections and false failures](#reused-connections-and-false-failures).
+
+- **Acceptable response:** a final status of 200-399, after at most 4 followed
+  redirects. The 5th redirect is refused and the check is `down` with class
+  `http_error`. A 3xx that is not followed (one with no `Location`, say) is the
+  final status. The decision is made from the status line and headers; the
+  body is not read for `up`.
+- **Reached the target** means reached whatever terminated TLS for that
+  hostname. A CDN or load balancer that answers 200 while the origin behind it
+  is dead is `up`. Point the target at a path the origin itself serves if you
+  need the origin.
+- **Under heavy concurrency too**, each check runs on a connection it dialed
+  itself: every check gets its own transport, closed when the check returns,
+  so it never picks up a connection another check opened (none in 3,382
+  checks of the capacity run, up to 500 concurrent targets; see
+  [Sizing `concurrency`](#sizing-concurrency)).
+
+**`down`** means this check tried and observed a failure from this host, and
+descry found no sign that its own state caused it. The class says what was
+observed:
+
+| `error_class` | Observed from this host | Does not prove |
+|---|---|---|
+| `timeout` | no response headers within `timeout`, at any stage: lookup, connect, TLS handshake or request | that the target is slow for everyone: a slow path from this host, or a starved descry process, looks the same |
+| `connection_refused` | the TCP connect was refused, or the connection was reset | that the service is gone: a firewall or load balancer in front of it can refuse or reset |
+| `dns_failure` | the hostname did not resolve from this host | that the name is broken: this host's resolver may be the one failing |
+| `tls_error` | certificate verification failed (unknown authority, expired or not yet valid, wrong name) or the handshake failed | that the certificate is wrong for other clients: a stale CA bundle or a skewed clock on this host fails the same way |
+| `http_error` | the target answered with a final status outside 200-399, or sent a 5th redirect; `extra.body` holds the first 4 KiB of the body | that the application is broken: a CDN challenge page, a WAF block or rate limiting (403, 429, 503) is classed the same |
+| `ssrf_blocked` | descry's own policy refused the target (scheme, port, or an address in a blocked range, checked on the URL, on each redirect and at dial time) | anything about the target: this is descry's policy refusal, and nothing was sent to the address it refused |
+| `unknown` | a failure that matched none of the above: commonly a connection closed before the response headers | which layer failed; the event carries no error text |
+
+Known local causes descry does not detect, so they reach you as `down` on the
+target:
+
+- a resolver outage on this host: `dns_failure`
+- clock skew: `tls_error` (a valid certificate read as expired or not yet
+  valid)
+- a broken or stale CA bundle: `tls_error`
+- local network errors (a host firewall, a dead route, a full conntrack
+  table): `timeout` or `connection_refused`
+- CPU starvation (throttling, a busy node): `timeout`, and inflated latency
+
+The same class on many unrelated targets at once points at this host, not at
+the targets.
+
+**Not run** is neither: the check returned an error wrapping
+`check.ErrNotRun`, there is no verdict and no event. The bundled check returns
+it only when the request fails at any stage (the dial, the DNS lookup, or a
+socket read or write) with `EMFILE`, `ENFILE`, `EADDRNOTAVAIL`, `ENOBUFS` or
+`ENOMEM`. Its text is
+`check not run: <op>: <errno text>` (for example
+`check not run: dial: too many open files`) and never contains the URL. See
+[Checks that could not run](#checks-that-could-not-run). Every other failure,
+including the local causes above, is `down`, because the check cannot tell
+them from the target.
+
+**No event** is not a verdict either: see
+[Consuming events: absence is unknown](#consuming-events-absence-is-unknown).
+
 ### Reused connections and false failures
 
-The bundled HTTP check reuses connections. A check inside the 90s idle window can
-run on a connection that is already open, so a passing check does not re-prove
-DNS, TCP or TLS for that target. A target checked less often than every 90s gets
-a new connection each time.
+By default the bundled HTTP check opens a new connection for every check and
+every redirect hop, so nothing in this section happens. It applies only with
+`connection_reuse: true` in the config file, or `httpcheck.WithConnectionReuse()`
+in Go. At startup the CLI logs `connection_reuse=<bool>`, and warns when it is
+on.
+
+Reuse mode keeps connections open between checks. A check inside the 90s idle
+window can run on a connection that is already open, so a passing check does
+not re-prove DNS, TCP or TLS for that target: `up` says the target answered on
+a connection, not that a new one can be made. A target checked less often than
+every 90s gets a new connection each time.
+
+Every reuse-mode result carries `extra.conn_reused`: `true` when the check's
+last request hop ran on a pooled connection, `false` when that hop opened a new
+one (a redirect to another host included), and absent when it got no
+connection (refused, a DNS failure, a dial error, or a target the SSRF guard
+refused before any request). A redirect the guard refuses is never attempted,
+so the previous hop's value stands. Default-mode results never carry the key.
+
+What reuse hides until a new connection is needed (each is a case in
+`checks/http/verdict_matrix_test.go`):
+
+- **DNS changes.** A name that stops resolving stays `up` on the pooled
+  connection; `dns_failure` appears when a new connection is dialled.
+- **Certificate changes.** `tls_expiry` comes from the connection's handshake,
+  so a renewed certificate, or one that has since expired, is not seen until a
+  new connection; then an expired one is `tls_error`.
+- **A connection that answers pings while its requests stall.** `down` with
+  `timeout` repeats on that connection, with `conn_reused: true`, until it
+  idles out or dies. In the default mode the next check succeeds on a new
+  connection.
+
+A server's concurrent-stream limit is not one of these: with
+`MaxConcurrentStreams` 1 and that stream held, Go's client opens a second
+connection and the check stays `up`.
 
 An HTTP/2 connection is pinged after 15s without a received frame, which on a
 healthy connection happens only between checks more than 15s apart, until the
@@ -149,7 +252,16 @@ would have finished inside its deadline; a longer `timeout` widens that exposure
 **What to do:** after a known network change or path blackhole, a bounded number
 of failures needs no action, because the next check dials a new connection.
 Investigate repeated failures as usual. A connection that keeps answering pings
-while its requests stall is not replaced by this mechanism.
+while its requests stall is not replaced by this mechanism; if
+`extra.conn_reused` is `true` on a run of timeouts, turn reuse off.
+
+**Turning reuse off, or upgrading from 0.5.1** (where reuse was the only mode):
+targets checked more often than the 90s idle window used to run on a warm
+connection, so their measured latency rises once, to include DNS, TCP and TLS
+on every check. Targets checked less often already paid that. No
+`contrib/prometheus` rule reads latency; re-baseline any latency threshold of
+your own, and re-check `concurrency` (below), since every check now holds a
+worker for its full cold duration.
 
 ### Classifying skips
 
@@ -163,11 +275,17 @@ for res := range r.Results() {
         // pool too small — a capacity signal
     case errors.Is(res.Err, runner.ErrSkipped):
         // check too slow for its interval — a per-target signal
+    case errors.Is(res.Err, check.ErrNotRun):
+        // this host ran out of a local resource; no verdict, not the target
     case res.Err != nil:
         // a mapping or publish failure — your pipeline, not the target
     }
 }
 ```
+
+The `check.ErrNotRun` case matters with the bundled HTTP check too: it is the
+one error that check returns (see
+[Checks that could not run](#checks-that-could-not-run)).
 
 The distinction is the point: both look like "a missing observation" from the
 outside, but one is fixed by adding workers and the other by changing that
@@ -202,6 +320,15 @@ run, so I have no verdict": the prober ran out of something locally (file
 descriptors, ephemeral ports, socket buffers, memory), and the target was
 never asked. No event is published for it. It is not a down target and must
 not be treated as one, and it is not an up target either.
+
+The bundled HTTP check returns one when the request fails at any stage (the
+dial, the DNS lookup before it, or a socket read or write during the handshake
+or request) with `EMFILE`, `ENFILE`, `EADDRNOTAVAIL`, `ENOBUFS` or `ENOMEM`,
+in both connection modes. The error wraps `check.ErrNotRun` and the
+`syscall.Errno`, and its text is `check not run: <op>: <errno text>`, where
+`<op>` is the failed socket operation (`dial`, `read`, `write`, and so on),
+`lookup` for the DNS lookup, or `request` when neither is known; it never
+contains the target URL.
 
 What each output does with one:
 
@@ -331,10 +458,10 @@ interval after start (see
 waits for a free worker, and can then run for up to `timeout`. That first run
 creates both `runs_total` values, the one that did not fire at 0, so a target
 whose first run fails makes `status="down"` appear at 1, which `increase()`
-does not count. A "check that returned an error" is only possible with a
-custom `Check`; the bundled HTTP check reports a down target as a down
-Observation and never returns one. A check that could not run creates no
-per-target series for a target that has none yet.
+does not count. The bundled HTTP check reports a down target as a down
+Observation; the only error it returns is a check that could not run, which
+counts as neither and creates no per-target series for a target that has none
+yet.
 
 No series records a run whose context was cancelled by the time the check
 returned (the runner cancels in-flight runs at shutdown): it is no evidence
@@ -439,11 +566,68 @@ Work arriving per unit time, in worker-seconds per second:
 load = Σ over targets ( p99 check duration / that target's interval )
 ```
 
-For a uniform fleet that is just **N × p99 / interval**. Set `concurrency` above
-that with headroom — the p99 is not the tail, and one slow target holds a worker
+For a uniform fleet that is just **N × p99 / interval**. Set `concurrency` to at
+least twice that: the p99 widens under load, and one slow target holds a worker
 for the full `timeout`.
 
-Worked examples, both measured:
+**Use the cold p99.** By default every check opens a new connection, so its
+duration is DNS lookup, TCP connect, TLS handshake and request, every time. A
+figure taken from a reused connection understates it, by several round trips
+on a distant target. Measure it from the descry host:
+
+```
+curl -so /dev/null -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}\n' https://example.com/
+```
+
+or read `descry_check_duration_seconds` once the fleet has run for a while.
+
+Cold-connection runs, with the real runner and transport and the dial delayed
+by a fixed 50ms or 200ms to stand in for the network
+(`DESCRY_CAPACITY=1 go test -run TestColdConnectionCapacity -v -timeout 15m ./checks/http/`,
+about 2.5 minutes). `concurrency` was set to `ceil(2 × N × p99 / interval)`
+from a calibration p99:
+
+| Fleet | dial delay | calibration p99 | load | `concurrency` | check p50 / p99 | Result |
+|---|---|---|---|---|---|---|
+| 44 targets, 60s | 50ms | 58ms | 0.04 | 1 | 53 / 57 ms | zero skips |
+| 44 targets, 60s | 200ms | 208ms | 0.15 | 1 | 203 / 208 ms | zero skips |
+| 500 targets, 10s | 50ms | 58ms | 2.9 | 6 | 52 / 54 ms | zero skips |
+| 500 targets, 10s | 200ms | 207ms | 10.4 | 21 | 202 / 204 ms | zero skips |
+
+Every run also had `Dropped() == 0`, no not-runs, no `down`, exactly one dial
+per check, no check on a connection it did not dial, and no leaked goroutines
+or descriptors. On this host the p99 under the fleet's own load matched the
+calibration p99; on a busier host, or with slow targets holding workers, it
+need not, which is why the headroom is 2x. This is loopback evidence on one machine (Apple
+M5 Max, macOS, the four runs sharing its CPU) with latency injected on the
+dial only; real targets with high-RTT
+paths or TLS 1.2 cost more than one round trip, so measure your own.
+
+Per check, a fresh connection costs about 25x the wall time and 20x the CPU
+of a reused one on loopback (about 1.2ms and 1,100 allocations against 48µs
+and 81; `go test -run '^$' -bench BenchmarkCheckRun -benchmem ./checks/http/`).
+At 500 targets every 10s that is about 7% of one core, server side included,
+so a large fleet does not make descry CPU-bound.
+
+**Connections and ports.** Without reuse, descry closes each connection
+itself, so every check leaves one socket in `TIME_WAIT` on the descry host
+(60s on Linux). Steady state is about
+`checks per second × 60` sockets, plus one per redirect hop: the capacity run
+measured exactly one dial per check. At 500 targets every 10s that is about
+3,000, against a Linux
+default ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999) of
+about 28,000. The range is per destination address and port, so targets
+behind one load balancer address share it: about 470 checks per second to one
+address before ports run out. Widen the range, or add source addresses, if a
+fleet approaches that; the symptom is `EADDRNOTAVAIL`, reported as a
+[check that could not run](#checks-that-could-not-run). The Linux figures are
+arithmetic, not measurement: macOS recycles loopback `TIME_WAIT` sockets much
+sooner. Each in-flight check also holds one descriptor, so a file descriptor
+limit a few hundred above `concurrency` plus the admin server's 64
+connections is enough.
+
+Warm-connection examples, measured before fresh connections were the default
+(they hold for `connection_reuse: true`):
 
 | Fleet | load | `concurrency` | Result |
 |---|---|---|---|
@@ -497,7 +681,9 @@ Fix it by raising that target's `interval` above `timeout`, or by lowering
 |---|---|---|
 | DEBUG | `skipping slot; prior run in flight` | one per skipped slot. Debug on purpose — `Results()` is the signal; the log would be a flood under saturation |
 | INFO | `clock stepped back; re-anchored schedule` | once per backward wall-clock step |
+| INFO | `connection_reuse` | startup, always: attribute `connection_reuse` is the configured value, `true` or `false` |
 | INFO | `admin server listening` | `--listen` only: the server is up; `addr` is the bound address |
+| WARN | `connection_reuse is on: up no longer proves a new connection can be made; …` | startup, only when `connection_reuse` is `true`; see [Reused connections and false failures](#reused-connections-and-false-failures) |
 | WARN | `check timeout exceeds interval; …` | startup, once per offending target |
 | WARN | `duplicate target URL; each entry is probed independently` | startup, once per URL listed more than once; only when not serving per-target metrics (otherwise it is an exit 2) |
 | WARN | `targets share an event subject; set a distinct url label to tell them apart` | startup, once per subject shared by targets with different URLs: URLs that render the same (differing only in userinfo, query, fragment or the normalisation described under [Which event fields are clean](#which-event-fields-are-clean), such as `https://h` and `https://h/`), more than one `<unparseable>` URL with no `url` label, or two targets given the same `url` label. `subject` is printed through `check.RedactURL` |
@@ -648,6 +834,9 @@ forcibly with a WARN; that does not change the exit code.
 | `Dropped() > 0` | consumer not draining `Results()` | fix the consumer loop; nothing else drops |
 | `check not run: …` on stderr, or `DescryChecksNotRun` firing | the prober ran out of a local resource; `reason` names it | see [Checks that could not run](#checks-that-could-not-run); verdict alerts are unreliable meanwhile |
 | a target's `descry_check_up` series is gone, other series still there | three checks in a row could not run | expected; it returns with the next completed run |
+| `reason=EADDRNOTAVAIL` with many targets behind one address | ephemeral ports held in `TIME_WAIT` by fresh connections | see "Connections and ports" under [Sizing `concurrency`](#sizing-concurrency) |
+| `down` with the same class on many unrelated targets at once | this host: its resolver, clock, CA bundle, network or CPU | see [Verdict contract](#verdict-contract) |
+| a run of `timeout` with `extra.conn_reused: true` | reuse mode, a pooled connection that answers pings but stalls requests | turn `connection_reuse` off; see [Reused connections](#reused-connections-and-false-failures) |
 | One gap of ~2 intervals after a deploy | restart across a slot boundary | expected; the slot is not made up |
 | All targets late by exactly one interval, once | wall-clock step | look for the INFO re-anchor line |
 | Goroutines growing with target count | not this runner | it is O(concurrency); look at `net/http` connections |
