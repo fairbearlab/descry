@@ -91,6 +91,49 @@ func TestLoad_Errors(t *testing.T) {
 	}
 }
 
+// TestLoad_ConnectionReuse pins the connection_reuse key: absent is false (the
+// fresh-connection default), a YAML bool sets it, and a non-bool or a misspelt
+// key is a load error rather than a silent default. yaml.v3 also decodes
+// yes/on/no/off into a bool field for YAML 1.1 compatibility; that is accepted
+// on purpose, so a config written that way keeps loading.
+func TestLoad_ConnectionReuse(t *testing.T) {
+	const tail = "targets:\n  - url: https://x.com\n"
+	for name, tc := range map[string]struct {
+		key  string // the connection_reuse line, "" for none
+		want bool
+	}{
+		"absent": {"", false},
+		"true":   {"connection_reuse: true\n", true},
+		"false":  {"connection_reuse: false\n", false},
+		"yes":    {"connection_reuse: yes\n", true},
+		"on":     {"connection_reuse: on\n", true},
+		"off":    {"connection_reuse: off\n", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, "source: s\n"+tc.key+tail))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ConnectionReuse != tc.want {
+				t.Errorf("ConnectionReuse = %v, want %v", cfg.ConnectionReuse, tc.want)
+			}
+		})
+	}
+	for name, line := range map[string]string{
+		"quoted string": "connection_reuse: \"true\"\n",
+		"integer":       "connection_reuse: 1\n",
+		"list":          "connection_reuse: [x]\n",
+		"map":           "connection_reuse: {a: b}\n",
+		"misspelt key":  "connection_resue: true\n",
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, "source: s\n"+line+tail)); err == nil {
+				t.Fatal("expected a load error, got nil")
+			}
+		})
+	}
+}
+
 // TestLoad_CadenceFloor: an effective interval below MinInterval would spin
 // the scheduler, so Load rejects it and names the floor; exactly MinInterval
 // loads, and a per-target zero still inherits the top-level interval.

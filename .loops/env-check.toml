@@ -29,7 +29,7 @@ local = "off"
 
 [harness]
 tools = ["git", "go", "golangci-lint"]
-files = ["go.mod", "go.sum", ".tool-versions", ".golangci.yml", ".goreleaser.yaml", ".github/workflows/ci.yml", ".github/workflows/release.yml"]
+files = ["go.mod", "go.sum", "tools/go.mod", "tools/go.sum", ".tool-versions", ".golangci.yml", ".goreleaser.yaml", ".github/workflows/ci.yml", ".github/workflows/release.yml"]
 entrypoints = ["bin/env-check", ".loops/checks/modcache.sh", ".loops/checks/govulncheck.sh"]
 tracked = true
 sparse = "warn"

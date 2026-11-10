@@ -3,9 +3,14 @@ package http
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"net/url"
+	"os"
+	"syscall"
 	"testing"
+
+	"github.com/fairbearlab/descry/check"
 )
 
 // The SSRF guard is a best-effort guard, not a security boundary (see ssrf.go).
@@ -139,6 +144,37 @@ func FuzzIsBlockedIP(f *testing.F) {
 			if p.Contains(bare) && !got {
 				t.Fatalf("isBlockedIP(%s)=false but it is inside %s", ip, p)
 			}
+		}
+	})
+}
+
+// FuzzErrorTextIgnoresURL checks that the target URL, which an operator or a
+// redirecting server controls, cannot steer how a failure is reported:
+//
+//  1. classifyError of a *url.Error depends only on its cause, never on the
+//     URL text it carries.
+//  2. A not-run error from localFailure has fixed text, so the URL and any
+//     credentials in it never reach logs or the not-run line.
+func FuzzErrorTextIgnoresURL(f *testing.F) {
+	for _, s := range []string{
+		"https://tls-gateway.example/api/timeout",
+		(&url.URL{Scheme: "http", User: url.UserPassword("user", "pass"), Host: "connection-refused.example", Path: "/", RawQuery: "token=x509"}).String(),
+		"https://no-such-host.example/server misbehaving",
+		"https://example.com/too many redirects/certificate",
+		"https://too many open files.example/",
+		"",
+	} {
+		f.Add(s)
+	}
+	cause := errors.New("something weird")
+	errno := &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "socket", Err: syscall.EMFILE}}
+	f.Fuzz(func(t *testing.T, u string) {
+		if got := classifyError(&url.Error{Op: "Get", URL: u, Err: cause}); got != check.ErrUnknown {
+			t.Fatalf("classifyError with URL %q = %v, want %v from the cause alone", u, got, check.ErrUnknown)
+		}
+		err := localFailure(&url.Error{Op: "Get", URL: u, Err: errno})
+		if err == nil || err.Error() != "check not run: dial: "+syscall.EMFILE.Error() {
+			t.Fatalf("localFailure with URL %q = %v, want the fixed not-run text", u, err)
 		}
 	})
 }

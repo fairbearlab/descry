@@ -3,6 +3,11 @@ sink: stdout
 interval: 10s
 timeout: 5s
 concurrency: 4
+# Optional, default false. Every check opens a fresh TCP+TLS connection, so
+# "up" proves a new connection can be made. true reuses pooled connections:
+# cheaper, but a healthy pooled connection can mask a target that no longer
+# accepts new ones, and results carry data.extra.conn_reused.
+connection_reuse: false
 targets:
   - url: https://example.com
     labels:

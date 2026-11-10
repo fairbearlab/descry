@@ -65,6 +65,14 @@ Things to know before you adapt it:
   dial guard sees the real target address. Targets need direct egress; where
   the cluster only reaches the internet through a proxy, the `example.com`
   target reports down.
+- **Every check opens a new connection.** Each check dials its own TCP and
+  TLS connection, so egress, NAT and conntrack see one new connection per
+  target per interval, and the pod holds one `TIME_WAIT` socket per check for
+  about a minute. That is nothing at this example's size; for a large fleet see
+  [Sizing `concurrency`](../../docs/OPERATIONS.md#sizing-concurrency).
+  `connection_reuse: true` in the ConfigMap keeps connections open instead, at
+  the cost described in
+  [Reused connections and false failures](../../docs/OPERATIONS.md#reused-connections-and-false-failures).
 - **Config changes need a restart.** The ConfigMap is read at startup:
   after editing it and applying, run `kubectl rollout restart deployment/descry`.
 

@@ -10,6 +10,74 @@ consumer-side `EventSink`/`Check` implementation, never in the engine's exported
 types. PRs that widen the engine surface without a Premise #4 justification will
 be asked to rework before review continues.
 
+## Transport and check changes
+
+Standing rule: a new check type, or a change to a check's transport (dialer,
+TLS, keep-alives, HTTP/2, timeouts, redirects, error classification), adds its
+fault cases to `checks/<dir>/verdict_matrix_test.go`, or it does not merge. A
+fault case states what the check reports when the target, the path or this
+host fails in that way: the verdict, the error class, and whether it is a
+verdict on the target, a check that could not run (`check.ErrNotRun`), or a
+run that is dropped. Where the connection mode changes the outcome, the case
+runs in both modes with its own expectation. The table is the contract in
+[docs/OPERATIONS.md § Verdict contract](docs/OPERATIONS.md#verdict-contract);
+a change that moves a row changes the contract, and the docs move with it.
+
+What the tests enforce, and what they do not:
+
+- `TestEveryCheckHasVerdictMatrix` (`checks/standing_rule_test.go`) fails if a
+  directory under `checks/` that holds non-test Go files has no
+  `verdict_matrix_test.go`, or that file has no `func TestVerdictMatrix`. It
+  names the directory and the file to create.
+- `TestSafeTransportWiring` (`checks/http`) asserts the transport fields the
+  verdicts depend on, by name, in fresh and reuse mode: `DisableKeepAlives`,
+  `Proxy`, `TLSHandshakeTimeout`, `HTTP2`, the dialer's `Timeout`, the SSRF
+  refusal in `DialContext`, and no `ClientSessionCache`. New stdlib fields do
+  not break it; a changed value does, and its failure points here.
+- Neither test knows whether the fault case for *your* change exists. Adding
+  it is a review duty: a reviewer asks which row covers the change, and the PR
+  waits until one does.
+
+A skeleton for a new check's `verdict_matrix_test.go`:
+
+```go
+// TestVerdictMatrix is the fault table for this check; see the standing rule
+// in CONTRIBUTING.md#transport-and-check-changes.
+func TestVerdictMatrix(t *testing.T) {
+	t.Run("target_refuses_connection", func(t *testing.T) {
+		t.Parallel()
+		for _, reuse := range []bool{false, true} {
+			t.Run(map[bool]string{false: "fresh", true: "reuse"}[reuse], func(t *testing.T) {
+				t.Parallel()
+				addr := closedPort(t) // a listener opened, then closed
+				obs, err := newCheck(reuse).Run(context.Background(), check.Target{URL: addr})
+				if err != nil {
+					t.Fatalf("err = %v, want a verdict on the target", err)
+				}
+				if obs.Status != check.StatusDown || obs.ErrorClass != check.ErrConnectionRefused {
+					t.Fatalf("got %s/%s, want down/connection_refused", obs.Status, obs.ErrorClass)
+				}
+			})
+		}
+	})
+}
+```
+
+`checks/http/verdict_matrix_test.go` is the full example, including real-time
+cases (keep those `t.Parallel()`) and the shared fixtures in
+`checks/http/deadconn_test.go`.
+
+A transport change that alters what a check costs (connections, handshakes,
+timeouts) also reruns the cold-connection capacity harness, which is outside
+the default `go test` run, and updates
+[Sizing `concurrency`](docs/OPERATIONS.md#sizing-concurrency) if the numbers
+move:
+
+```
+DESCRY_CAPACITY=1 go test -run TestColdConnectionCapacity -v -timeout 15m ./checks/http/
+go test -run '^$' -bench BenchmarkCheckRun -benchmem ./checks/http/
+```
+
 ## Dev setup
 
 Toolchain versions are pinned in `.tool-versions`; `asdf install` or
@@ -29,7 +97,7 @@ No code generation, no external services needed to build or run the tests.
 golangci-lint and goreleaser pins in `go.mod`, `.tool-versions` and the
 workflows agree, that your local Go and golangci-lint match them, that the
 module cache already has every module the tests and the `govulncheck` tool
-need (the scan itself still downloads the vulnerability database), that the
+(`tools/go.mod`) need (the scan itself still downloads the vulnerability database), that the
 files CI needs are present, and that you are working in a git worktree
 (`git worktree add ../descry-<topic> -b <branch> origin/main`) rather than the
 main checkout. It is a thin wrapper around the shared `loops env-check` engine
@@ -55,10 +123,11 @@ go vet ./...
 go mod tidy -diff
 go test -race ./...
 golangci-lint run ./...
-go tool govulncheck ./...
+go tool -modfile=tools/go.mod govulncheck ./...
 ```
 
-`go mod tidy -diff` fails on any go.mod/go.sum drift, so commit a tidy module
+`go mod tidy -diff` (and `go -C tools mod tidy -diff` for the `tools/` module that
+holds govulncheck) fails on any go.mod/go.sum drift, so commit a tidy module
 file set. CI also runs a `release-check` job that validates `.goreleaser.yaml`
 (`goreleaser check`) and does a snapshot build with publishing and signing
 skipped, so a broken release config fails the PR instead of the tag. The job

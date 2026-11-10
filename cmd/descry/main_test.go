@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	stdlog "log"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,6 +22,7 @@ import (
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 
 	"github.com/fairbearlab/descry/check"
+	httpcheck "github.com/fairbearlab/descry/checks/http"
 	"github.com/fairbearlab/descry/config"
 	"github.com/fairbearlab/descry/runner"
 	"github.com/fairbearlab/descry/sink"
@@ -645,6 +648,168 @@ func TestRun_WarnsMetricsPerTargetWithoutListen(t *testing.T) {
 			}
 			if n := strings.Count(logs.String(), msg); n != tc.want {
 				t.Errorf("warnings = %d, want %d:\n%s", n, tc.want, logs.String())
+			}
+		})
+	}
+}
+
+// leakyCheck reports a final URL that carries userinfo and a query, as
+// net/http's resp.Request.URL does after a redirect.
+type leakyCheck struct{}
+
+func (leakyCheck) Name() string { return "leaky" }
+
+func (leakyCheck) Run(_ context.Context, _ check.Target) (check.Observation, error) {
+	return check.Observation{
+		Status:     check.StatusUp,
+		StatusCode: 200,
+		FinalURL: (&url.URL{
+			Scheme: "https", User: url.UserPassword("user", "hunter2"),
+			Host: "example.com", Path: "/landing", RawQuery: "token=s3cret", Fragment: "frag",
+		}).String(),
+		ObservedAt: time.Now(),
+	}, nil
+}
+
+// Value: protects=run() wraps the production check in sanitizedCheck, on the plain and the --listen path, so userinfo and the query never reach data.final_url
+// Value: fails_when=run() hands the unwrapped check to the runner (or to the collector) and the final URL reaches the sink with credentials or a token
+// Value: why_new=closes the TODOS gap: loopback targets never produce a FinalURL, so only a substituted inner check can prove the wrapping
+func TestRun_WrapsProductionCheckInSanitizedCheck(t *testing.T) {
+	origCheck, origNotify := newHTTPCheck, notifyContext
+	t.Cleanup(func() { newHTTPCheck, notifyContext = origCheck, origNotify })
+	newHTTPCheck = func(config.Config) check.Check { return leakyCheck{} }
+
+	for _, tc := range []struct {
+		name  string
+		extra []string
+	}{
+		{"plain", nil},
+		{"listen", []string{"--listen", "127.0.0.1:0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfgPath := filepath.Join(dir, "descry.yaml")
+			yaml := "source: https://example.com/descry\ninterval: 1s\ntimeout: 500ms\ntargets:\n  - url: https://example.com/\n"
+			if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			outFile := filepath.Join(dir, "events.jsonl")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+				return ctx, func() {}
+			}
+			var stderr lockedBuffer
+			done := make(chan int, 1)
+			args := append([]string{"--config", cfgPath, "--sink", "file", "--file", outFile}, tc.extra...)
+			go func() { done <- run(args, io.Discard, &stderr) }()
+
+			deadline := time.Now().Add(10 * time.Second)
+			var body []byte
+			for {
+				body, _ = os.ReadFile(outFile)
+				if bytes.Contains(body, []byte("final_url")) {
+					break
+				}
+				if time.Now().After(deadline) {
+					cancel()
+					t.Fatalf("no event with final_url after 10s; stderr:\n%s", stderr.String())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			cancel()
+			select {
+			case code := <-done:
+				if code != 0 {
+					t.Fatalf("exit code = %d; stderr:\n%s", code, stderr.String())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("run did not return")
+			}
+			body, _ = os.ReadFile(outFile)
+			for _, secret := range []string{"hunter2", "s3cret", "frag", "user:"} {
+				if bytes.Contains(body, []byte(secret)) {
+					t.Errorf("event contains %q; run() is not wrapping the check in sanitizedCheck:\n%s", secret, body)
+				}
+			}
+			if !bytes.Contains(body, []byte(`"final_url":"https://example.com/landing"`)) {
+				t.Errorf("event lacks the sanitized final_url:\n%s", body)
+			}
+		})
+	}
+}
+
+// Value: protects=connection_reuse is logged at startup, and a warning says up no longer proves a new connection when it is on
+// Value: fails_when=the startup line is missing or the warning fires with reuse off
+// Value: why_new=X7: operators must see the mode they run in
+func TestRun_LogsConnectionReuse(t *testing.T) {
+	origNotify := notifyContext
+	t.Cleanup(func() { notifyContext = origNotify })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	notifyContext = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return ctx, func() {}
+	}
+	for _, tc := range []struct {
+		name, line string
+		warn       bool
+	}{
+		{"default", "", false},
+		{"false", "connection_reuse: false\n", false},
+		{"true", "connection_reuse: true\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath := filepath.Join(t.TempDir(), "descry.yaml")
+			yaml := "source: https://example.com/descry\n" + tc.line + "targets:\n  - url: https://example.com/\n"
+			if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			logs := captureDefaultLog(t)
+			var stderr lockedBuffer
+			if code := run([]string{"--config", cfgPath}, io.Discard, &stderr); code != 0 {
+				t.Fatalf("exit code = %d; stderr:\n%s", code, stderr.String())
+			}
+			out := logs.String()
+			want := fmt.Sprintf("connection_reuse=%v", tc.warn)
+			if !strings.Contains(out, want) {
+				t.Errorf("log lacks %q:\n%s", want, out)
+			}
+			if got := strings.Contains(out, "up no longer proves a new connection"); got != tc.warn {
+				t.Errorf("warning present = %v, want %v:\n%s", got, tc.warn, out)
+			}
+		})
+	}
+}
+
+// Generated by /ship Step 7 coverage audit.
+// Value: protects=newHTTPCheck builds the production HTTP check with cfg.Timeout and, only when connection_reuse is true, WithConnectionReuse
+// Value: fails_when=newHTTPCheck drops the option or the timeout, so connection_reuse is logged as on while every check still runs fresh
+// Value: why_new=TestRun_LogsConnectionReuse checks only the log line and TestRun_WrapsProductionCheckInSanitizedCheck replaces newHTTPCheck
+// Value: seam=none
+// Value: no_claim=reads httpcheck.Check's unexported reuse and timeout fields via reflect; pooled behavior itself is proven in checks/http
+func TestNewHTTPCheck_HonorsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reuse bool
+	}{
+		{"fresh by default", false},
+		{"connection_reuse true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chk, ok := newHTTPCheck(config.Config{Timeout: 3 * time.Second, ConnectionReuse: tc.reuse}).(*httpcheck.Check)
+			if !ok {
+				t.Fatalf("newHTTPCheck returned %T, want *httpcheck.Check", chk)
+			}
+			v := reflect.ValueOf(chk).Elem()
+			reuse, timeout := v.FieldByName("reuse"), v.FieldByName("timeout")
+			if !reuse.IsValid() || !timeout.IsValid() {
+				t.Fatal("httpcheck.Check has no reuse or timeout field; update this test to the new field names")
+			}
+			if reuse.Bool() != tc.reuse {
+				t.Errorf("reuse = %v, want %v from cfg.ConnectionReuse", reuse.Bool(), tc.reuse)
+			}
+			if got := time.Duration(timeout.Int()); got != 3*time.Second {
+				t.Errorf("timeout = %v, want cfg.Timeout 3s", got)
 			}
 		})
 	}

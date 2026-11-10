@@ -230,6 +230,10 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 		s = fsink
 	}
 
+	slog.Default().Info("connection_reuse", "connection_reuse", cfg.ConnectionReuse)
+	if cfg.ConnectionReuse {
+		slog.Default().Warn("connection_reuse is on: up no longer proves a new connection can be made; a pooled connection can keep answering while new ones fail")
+	}
 	targets := buildTargets(cfg, slog.Default())
 
 	sigCtx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -242,7 +246,7 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 	// same clean form as the subject. Order: the collector decorates the
 	// check, the runner takes the decorated check, then the collector is
 	// pointed at the runner.
-	chk := check.Check(sanitizedCheck{inner: httpcheck.New(cfg.Timeout)})
+	chk := check.Check(sanitizedCheck{inner: newHTTPCheck(cfg)})
 	if col != nil {
 		chk = col.Check(chk)
 	}
@@ -530,6 +534,17 @@ func eventURL(raw string) string {
 		return ""
 	}
 	return metrics.TargetLabel(raw)
+}
+
+// newHTTPCheck builds the production check run() wraps in sanitizedCheck. It is
+// a package variable so a test can substitute the inner check and prove the
+// wrapping; nothing else assigns it.
+var newHTTPCheck = func(cfg config.Config) check.Check {
+	var opts []httpcheck.Option
+	if cfg.ConnectionReuse {
+		opts = append(opts, httpcheck.WithConnectionReuse())
+	}
+	return httpcheck.New(cfg.Timeout, opts...)
 }
 
 // sanitizedCheck rewrites Observation.FinalURL with eventURL before the runner

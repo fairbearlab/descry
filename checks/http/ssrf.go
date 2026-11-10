@@ -85,7 +85,11 @@ func controlContext(_ context.Context, _, address string, _ syscall.RawConn) err
 	return nil
 }
 
-// HTTP/2 health checks. A check's timeout resets only its own stream, so without
+// HTTP/2 health checks, used in connection-reuse mode only (see
+// WithConnectionReuse). In the default fresh-connection mode no connection
+// outlives a check, so there is nothing to health-check and HTTP2 is nil.
+//
+// In reuse mode, a check's timeout resets only its own stream, so without
 // these a connection that silently stopped delivering stays pooled and every
 // later check of that host times out on it until the kernel gives up.
 //
@@ -104,26 +108,61 @@ const (
 	h2PingTimeout     = 15 * time.Second
 )
 
-// newSafeTransport clones http.DefaultTransport (preserving its timeouts and
-// connection pooling), enables HTTP/2 health checks, and swaps in a dialer whose
-// ControlContext enforces the Layer 2 SSRF guard. ForceAttemptHTTP2 (set on
-// DefaultTransport) keeps HTTP/2 working despite the custom DialContext.
+// dialKeepAlive is the TCP keep-alive period of the dialer. It only matters in
+// reuse mode, where a connection can outlive a check.
+const dialKeepAlive = 30 * time.Second
+
+// newSafeDialer returns the dialer newSafeTransport uses: its ControlContext
+// enforces the Layer 2 SSRF guard, and its Timeout caps the TCP connect at the
+// check's timeout. The cap matters because net/http dials on a context
+// detached from the request's deadline, so an uncapped dial to a stalled
+// target outlives the check that started it, holding a file descriptor and
+// goroutines.
+func newSafeDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{
+		Timeout:        timeout,
+		KeepAlive:      dialKeepAlive,
+		ControlContext: controlContext,
+	}
+}
+
+// newSafeTransport clones http.DefaultTransport and swaps in newSafeDialer,
+// whose ControlContext enforces the Layer 2 SSRF guard. ForceAttemptHTTP2 (set
+// on DefaultTransport) keeps HTTP/2 working despite the custom DialContext.
+//
+// With reuse false (the default for New), DisableKeepAlives is set and Run
+// gives each check its own clone of this transport, closed when the check
+// returns, so every check, and every redirect hop within it, dials and
+// handshakes a new connection and never takes one dialed for another check;
+// no HTTP/2 health-check config is needed. With reuse true,
+// connections are pooled and HTTP/2 connections are health-checked with PINGs
+// (h2SendPingTimeout, h2PingTimeout).
+//
+// In both modes the TCP dial and the TLS handshake are each capped at timeout,
+// because net/http runs them on a context detached from the request deadline;
+// the request context still fires first, so a stalled handshake is classified
+// as a timeout.
 //
 // Proxy support is explicitly disabled: a proxy resolves the target host itself,
 // so our dial-time guard would only see the proxy's address and the Layer 2 guard
 // would be bypassed (a private rebinding result never reaches this process).
-func newSafeTransport() *nethttp.Transport {
+//
+// TestSafeTransportWiring asserts these fields by name; see the standing rule in
+// CONTRIBUTING.md#transport-and-check-changes before changing any of them.
+func newSafeTransport(reuse bool, timeout time.Duration) *nethttp.Transport {
 	t := nethttp.DefaultTransport.(*nethttp.Transport).Clone()
 	t.Proxy = nil
-	t.HTTP2 = &nethttp.HTTP2Config{
-		SendPingTimeout: h2SendPingTimeout,
-		PingTimeout:     h2PingTimeout,
+	t.TLSHandshakeTimeout = timeout
+	if reuse {
+		t.DisableKeepAlives = false
+		t.HTTP2 = &nethttp.HTTP2Config{
+			SendPingTimeout: h2SendPingTimeout,
+			PingTimeout:     h2PingTimeout,
+		}
+	} else {
+		t.DisableKeepAlives = true
+		t.HTTP2 = nil
 	}
-	d := &net.Dialer{
-		Timeout:        30 * time.Second,
-		KeepAlive:      30 * time.Second,
-		ControlContext: controlContext,
-	}
-	t.DialContext = d.DialContext
+	t.DialContext = newSafeDialer(timeout).DialContext
 	return t
 }

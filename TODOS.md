@@ -106,6 +106,25 @@ sensitive, so prefer it.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
+### Expire a target's verdict across skipped slots
+
+**What:** Decide whether the engine should mark a target's verdict stale when its slots
+keep being skipped (`ErrSkipped`/`ErrSkippedQueued`), the way three not-runs in a row
+remove `descry_check_up`.
+
+**Why:** A skipped slot publishes nothing and moves no verdict series, so a target
+whose every slot is skipped keeps its last `up` or `down` in `descry_check_up` until
+`DescryChecksStale` fires 15 minutes later. Event consumers are told to expire
+verdicts themselves ("Consuming events: absence is unknown"), but the metrics side has
+no equivalent short of staleness.
+
+**Context:** 2026-11-10 — deferred from the v0.6.0 plan, which did this for not-runs
+only. Start at the not-run streak in `metrics/metrics.go`; a skip is a capacity
+signal, so the threshold and whether skips and not-runs share one streak need a
+decision first.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 ## Event
 
 ### Encoder docs cite `regexp.MustCompile`; should be `regexp.Compile`
@@ -122,6 +141,22 @@ deferred so the ship would not hit the three-fix-cycle cap. Pure wording.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** none
 
+
+### A not-run event
+
+**What:** Publish an event when a check could not run (`check.ErrNotRun`), so an
+event-only consumer sees "no verdict, this host" rather than silence.
+
+**Why:** Today a not-run produces a `Result`, a metric and a CLI line, but no event, so
+a consumer that reads only the sink cannot tell a starved prober from a quiet one
+until its own expiry runs out.
+
+**Context:** 2026-11-10 — deferred from v0.6.0 because it changes the event schema
+(a new `type`, or a status that is neither `up` nor `down`), which is a minor version
+and needs every consumer to handle it. Start at `event.ToCloudEvent` and the runner's
+not-run path.
+
+**Effort:** M · **Priority:** P3 · **Depends on:** a consumer that asks
 
 ## Sink
 
@@ -215,33 +250,105 @@ day of work. Writing the trigger down avoids re-deriving it in a repin PR.
 that raises a shared dependency (for example golang.org/x/sys or protobuf) because of a
 require such as prometheus/client_golang (which now arrives via the root `metrics/`
 package, and which `cmd/descry` also imports directly to serve `--listen`) or a future
-CLI-only OTel/grpc. Precedent: the root go.mod already carries
-`tool golang.org/x/vuln/cmd/govulncheck`. The move: `cmd/descry/go.mod` requiring the
+CLI-only OTel/grpc. The trigger has already fired once: x/vuln 1.9.0
+(via the root `tool` directive) held `golang.org/x/sys` at v0.49.0 for importers. It was
+fixed by moving the directive into `tools/go.mod`, not by this split. The remaining
+trigger is a CLI-only or `metrics/` require that raises a shared floor. The move: `cmd/descry/go.mod` requiring the
 root at a tagged version, `cmd/descry/vX.Y.Z` tags, and a ci.yml step (or job) that
 builds and tests the nested module; no lockstep or go.sum precompute is needed because the CLI pins a published
 root tag.
 
 **Effort:** M · **Priority:** P4 · **Depends on:** a repin PR that exhibits the trigger
 
-### No test proves `run()` wraps the production check in `sanitizedCheck`
+## Check
 
-**What:** Add a run-level test that fails if `run()` stops wrapping `httpcheck.New`
-in `sanitizedCheck`, on both the plain and the `--listen` path (where the
-collector decorates the wrapped check).
+### `EADDRNOTAVAIL` from the target's address family reads as not-run
 
-**Why:** The wrapper is what keeps userinfo and the query out of `data.final_url`.
-Its tests build the wrapper (and, for the redirect case, the runner) themselves,
-and the run-level tests only use loopback targets, which the SSRF guard refuses
-before any response, so `FinalURL` is never set. Dropping the wrapper in `run()`
-leaves the suite green and reopens the leak.
+**What:** Decide whether an `EADDRNOTAVAIL` dial error caused by the target's
+address family (for example an AAAA-only target checked from a host or
+container with no IPv6 address) should stay a not-run (`check.ErrNotRun`) or be
+reported as `down`, and narrow the local-failure mapping if it should be `down`.
 
-**Context:** 2026-10-11 — proving it needs a way to get a real `FinalURL` through
-`run()`: a seam for the inner check (deliberately not added with `--listen`, to
-keep `run()` free of a check seam) or a probe the guard lets through.
+**Why:** `localFailure` in `checks/http/http.go` treats every `EADDRNOTAVAIL` as
+local port exhaustion. When it is really "this host cannot reach that address
+family", the target gets no event and no verdict instead of a `down`, which a
+consumer of events sees as silence. `DescryChecksNotRun` and `DescryChecksStale`
+still fire, so it is not silent to an operator, but the not-run line's advice
+(widen the ephemeral port range) is wrong for it.
+
+**Context:** 2026-11-10, raised by the v0.6.0 PR-B adversarial review. Options:
+only treat `EADDRNOTAVAIL` as not-run when an IPv4 or same-family dial also
+fails, or when the error came from `bind` rather than `connect`; or keep it and
+document the case in OPERATIONS. Owner decision.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** owner decision
+
+### Response-parsing errors can still steer the HTTP error class
+
+**What:** Classify as `unknown` any `client.Do` cause that comes from parsing the
+target's response, or from an HTTP/2 stream or connection error, before
+`classifyError`'s keyword fallback, instead of the current denylist of
+`malformed http`, `malformed mime header` and `goaway`.
+
+**Why:** net/http quotes target-sent bytes in more errors than the denylist
+covers. A `Content-Length: timeout` or `Transfer-Encoding: tls-timeout` header, an
+unparseable `Location`, invalid trailer keys, and an HTTP/2 `StreamError` for an
+invalid header field name or value all reach the substring switch, so a target
+can choose the `error_class` (and the `descry_check_errors_total{class}` series)
+it is reported under. The verdict is `down` in every case; only the label is wrong.
+
+**Context:** 2026-11-10, found by the v0.6.0 PR-B pre-landing review (pass 2)
+after the denylist landed. Start at `targetTextErrors` in `checks/http/http.go`.
+Prefer a structural test (the typed error, or "the request was written and the
+failure came while reading the response") over more strings. Add matrix rows
+in `checks/http/verdict_matrix_test.go` for each case, including an HTTP/2 one
+(the GOAWAY row has no HTTP/2 test today), and narrow the CHANGELOG wording.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
+### Per-check timing breakdown in `Extra`
+
+**What:** Record DNS, connect, TLS and time-to-first-byte durations for each check in
+`Extra` (for example `Extra["timing"]`), from the `httptrace.ClientTrace` the check
+already installs in reuse mode.
+
+**Why:** With fresh connections by default, `latency_ms` mixes the handshake cost with
+the target's response time, so a latency rise cannot be placed. The sizing docs need
+the cold p99; a breakdown would give it per stage.
+
+**Context:** 2026-11-10 — deferred from v0.6.0. The trace is reuse-only today; doing
+this means installing it in both modes. A new `Extra` key is additive, but keep the
+encoder's allocation guards green.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
-## Check
+### Classify CDN challenge pages
+
+**What:** Tell a CDN or WAF challenge page (a 403 or 503 with a challenge body or
+header) apart from the application's own failure, either as its own class or as an
+`Extra` hint on `http_error`.
+
+**Why:** The verdict contract says `http_error` includes challenge pages, so a target
+fronted by a CDN that starts challenging the prober reads as an application outage.
+
+**Context:** 2026-11-10 — kept out of the `classifyError` fix on purpose. A new
+`ErrorClass` widens a closed engine enum, so it needs a Premise #4 look; an `Extra`
+hint does not. Needs real samples from more than one CDN first.
+
+**Effort:** M · **Priority:** P3 · **Depends on:** samples of real challenge responses
+
+### Reset accumulation fixture for reuse mode (`pendingResets`)
+
+**What:** Add a verdict-matrix case for HTTP/2 stream resets that accumulate on a
+pooled connection (Go's `pendingResets` handling) until the connection is unusable.
+
+**Why:** It is a reuse-mode failure the matrix does not cover. It needs frame-level
+control of the server (an HTTP/2 framer, not `httptest`), so it did not fit v0.6.0.
+
+**Context:** 2026-11-10 — deferred from the v0.6.0 matrix. Only reuse mode can hit
+it: a fresh connection never lives long enough to accumulate resets.
+
+**Effort:** M · **Priority:** P4 · **Depends on:** a reuse-mode user, or a report of it
 
 ### `check.RedactURL` leaves passwords in misparsed URLs
 
@@ -272,67 +379,32 @@ then; drop that caveat with the fix.
 
 **Effort:** S · **Priority:** P1 · **Depends on:** nothing
 
-### HTTP error class can follow the target URL's text
+### Cap connection age in reuse mode
 
-**What:** Make `classifyError` in `checks/http/http.go` match its substring
-fallback against the underlying error, not the full `err.Error()`, which for a
-`*url.Error` includes the request URL.
+**What:** In the opt-in reuse mode (`connection_reuse: true`,
+`httpcheck.WithConnectionReuse()`), bound how long a reused connection can live.
 
-**Why:** When no typed check matches, the fallback lower-cases the whole
-message and looks for `timeout`, `tls`, `certificate`, `no such host` and so
-on. The message starts with `Get "<url>":`, so a target whose host or path
-contains one of those words (`https://tls-gateway.example/`,
-`/api/timeout`) can be counted under the wrong
-`descry_check_errors_total{class}` and carry the wrong error class in its
-event.
-
-**Context:** 2026-10-13 — found during the v0.5.0 docs review. Unwrap
-`*url.Error` (its `Err` field) before the substring switch, and add table
-rows with misleading URLs to the classifier tests. This is an engine change
-(`checks/http`), so it ships as its own PR with the embedding consumer's repin
-check.
-
-**Effort:** S · **Priority:** P2 · **Depends on:** nothing
-
-### Report connection reuse on failed checks
-
-**What:** Set `Extra["conn_reused"]` (bool) on down results, for the last attempted
-request of the run. Use `httptrace.GotConn`, with per-run state in the request context,
-reset on each allowed hop in `CheckRedirect` in both `New` and `newForTest` through a
-shared helper unless `GetConn` proves simpler. Omit the key when that hop obtained no connection.
-
-**Why:** Nothing in a result says whether a failing check ran on a reused connection,
-so the next stale-connection incident starts with no evidence.
-
-**Context:** 2026-11-08 — split out of the HTTP/2 ping fix. A last-write `GotConn` alone
-keeps an earlier hop's value when a later hop fails to connect. `GetConn` fires on pooled
-HTTP/2 too, so a reset there may replace the `CheckRedirect` helper; check it first. Test a first hop that connects
-with a second hop refused (key omitted), and the redirect limit (key kept). A new event
-field means a minor version.
-
-**Effort:** S · **Priority:** P1 · **Depends on:** nothing
-
-### Cap connection age and decide what a check proves
-
-**What:** Decide whether a check should prove a fresh connection, and bound how long a
-reused connection can live.
-
-**Why:** A target checked more often than the 90s idle window can keep one connection
-indefinitely. `TLSExpiry` comes from `resp.TLS`, the original handshake, so a renewed
+**Why:** In reuse mode, a target checked more often than the 90s idle window can keep
+one connection indefinitely. `TLSExpiry` comes from `resp.TLS`, the original handshake, so a renewed
 certificate may go unobserved, and DNS, TCP and TLS failures stay hidden while the old
 connection works. A connection that answers PING while its streams stall is also never
 replaced.
 
-**Context:** 2026-11-08 — found while reviewing the HTTP/2 ping fix. Options: a periodic
-`CloseIdleConnections`, or a fresh-connection probe mode. See `checks/http/http.go`
-where `TLSExpiry` is read.
+**Context:** 2026-11-08 — found while reviewing the HTTP/2 ping fix. 2026-11-10 — the
+"what a check proves" half is decided: fresh connections are the default, so `up`
+proves a new connection unless reuse is opted into, and the matrix pins what reuse
+hides (DNS, certificate, ping-responsive stalls). An age cap was considered and
+rejected as the default fix, because an aged connection still yields an `up` with no
+new-connection evidence; it is only worth having for reuse-mode users. Options: a
+periodic `CloseIdleConnections`, or a per-connection age checked at `GotConn`. See
+`checks/http/http.go` where `TLSExpiry` is read.
 
-**Effort:** M · **Priority:** P2 · **Depends on:** nothing
+**Effort:** M · **Priority:** P3 · **Depends on:** a reuse-mode user who asks
 
 ### Public option for the HTTP/2 ping timeouts
 
-**What:** Let embedders tune or disable the health-check pings; it must not be able to
-touch `Proxy` or `ControlContext`.
+**What:** Let embedders tune or disable the health-check pings, which only run in the
+opt-in reuse mode; it must not be able to touch `Proxy` or `ControlContext`.
 
 **Why:** The timeouts are constants, and the only override today is a fork.
 
@@ -619,7 +691,121 @@ someone bumps it by hand, including after distroless publishes a fix.
 
 **Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
+## Docs
+
+### Five-minute walkthrough in a clean environment
+
+**What:** Time a new user from `git clone` (or the release binary) to a first event and
+a first `/metrics` scrape on a machine with nothing installed, and fix whatever the
+README makes them guess.
+
+**Why:** The README's demos were written by someone who already had the toolchain, the
+config and the context.
+
+**Context:** 2026-11-10 — deferred from the v0.6.0 DX review. Use a fresh container or
+VM; record where the time goes.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
+### Compile checks for README and OPERATIONS snippets
+
+**What:** Make the Go snippets in `README.md` and `docs/OPERATIONS.md` compile in CI,
+either by moving each into a compiled `Example` and quoting it, or by a test that
+extracts and builds the fenced `go` blocks.
+
+**Why:** The snippets (the `Results()` drain with `check.ErrNotRun`, the HTTP check
+options) are hand-checked only, so an API rename leaves them stale with the suite
+green. `Example_absenceIsUnknown` in `runner/` is the only compiled one.
+
+**Context:** 2026-11-10 — deferred from the v0.6.0 DX review. Extraction needs a way
+to mark fragments that are not whole programs.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 ## Completed
+
+### Report connection reuse on failed checks
+
+**What:** Set `Extra["conn_reused"]` (bool) on down results, for the last attempted
+request of the run. Use `httptrace.GotConn`, with per-run state in the request context,
+reset on each allowed hop in `CheckRedirect` in both `New` and `newForTest` through a
+shared helper unless `GetConn` proves simpler. Omit the key when that hop obtained no connection.
+
+**Why:** Nothing in a result says whether a failing check ran on a reused connection,
+so the next stale-connection incident starts with no evidence.
+
+**Context:** 2026-11-08 — split out of the HTTP/2 ping fix. A last-write `GotConn` alone
+keeps an earlier hop's value when a later hop fails to connect. `GetConn` fires on pooled
+HTTP/2 too, so a reset there may replace the `CheckRedirect` helper; check it first. Test a first hop that connects
+with a second hop refused (key omitted), and the redirect limit (key kept). A new event
+field means a minor version.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+**Completed:** 2026-11-10 — fresh connections became the default, so the key
+only means something in the opt-in reuse mode (`httpcheck.WithConnectionReuse()`,
+YAML `connection_reuse: true`). There every result, up and down, carries
+`Extra["conn_reused"]` for the last attempted hop: per-run state is reset at
+`GetConn` and set at `GotConn` through an `httptrace.ClientTrace`, so no
+`CheckRedirect` helper was needed. The key is omitted when that hop got no
+connection, and a redirect the SSRF policy refuses keeps the previous hop's
+value. Default-mode results never carry it. Tests: `TestRun_ConnReused`,
+`TestRun_ConnReusedFollowsLastHop`, and the `conn_reused_key` matrix case.
+
+### HTTP error class can follow the target URL's text
+
+**What:** Make `classifyError` in `checks/http/http.go` match its substring
+fallback against the underlying error, not the full `err.Error()`, which for a
+`*url.Error` includes the request URL.
+
+**Why:** When no typed check matches, the fallback lower-cases the whole
+message and looks for `timeout`, `tls`, `certificate`, `no such host` and so
+on. The message starts with `Get "<url>":`, so a target whose host or path
+contains one of those words (`https://tls-gateway.example/`,
+`/api/timeout`) can be counted under the wrong
+`descry_check_errors_total{class}` and carry the wrong error class in its
+event.
+
+**Context:** 2026-10-13 — found during the v0.5.0 docs review. Unwrap
+`*url.Error` (its `Err` field) before the substring switch, and add table
+rows with misleading URLs to the classifier tests. This is an engine change
+(`checks/http`), so it ships as its own PR with the embedding consumer's repin
+check.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
+**Completed:** 2026-11-10 — `classifyError` unwraps `*url.Error` (in a loop; a
+nil cause is `unknown`) before the substring fallback, so the request URL can
+no longer steer the class. `TestClassifyError` has misleading-URL rows (a host
+or path containing `timeout`, `tls`, `no such host` and the like), and
+`FuzzErrorTextIgnoresURL` checks that no URL text changes the class. A
+connection closed before the response headers stays `unknown`.
+
+### No test proves `run()` wraps the production check in `sanitizedCheck`
+
+**What:** Add a run-level test that fails if `run()` stops wrapping `httpcheck.New`
+in `sanitizedCheck`, on both the plain and the `--listen` path (where the
+collector decorates the wrapped check).
+
+**Why:** The wrapper is what keeps userinfo and the query out of `data.final_url`.
+Its tests build the wrapper (and, for the redirect case, the runner) themselves,
+and the run-level tests only use loopback targets, which the SSRF guard refuses
+before any response, so `FinalURL` is never set. Dropping the wrapper in `run()`
+leaves the suite green and reopens the leak.
+
+**Context:** 2026-10-11 — proving it needs a way to get a real `FinalURL` through
+`run()`: a seam for the inner check (deliberately not added with `--listen`, to
+keep `run()` free of a check seam) or a probe the guard lets through.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
+**Completed:** 2026-11-10 — `run()` now builds its inner check through an
+unexported package variable, `newHTTPCheck`, and still wraps the result in
+`sanitizedCheck` itself, so the seam cannot bypass the wrapper.
+`TestRun_WrapsProductionCheckInSanitizedCheck` swaps in a check that returns a
+`FinalURL` with userinfo, query and fragment, runs `run()` on the plain and the
+`--listen` paths, and asserts the file-sink event's `final_url` carries none
+of them. Removing the wrapper fails it on both paths.
 
 ### A check cancelled at shutdown is published as a `down` event
 

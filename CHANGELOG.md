@@ -19,14 +19,59 @@ Pre-1.0, the minor version carries breaking changes.
   `descry_checks_not_run_last_timestamp_seconds`; `metrics.NotRunReason` gives
   the reason. The `descry` CLI prints a rate-limited `check not run:` line
   with the reason and an action instead of `check failed:`, and does not count
-  it in `descry_runner_result_errors_total`. The bundled HTTP check does not
-  return it yet.
+  it in `descry_runner_result_errors_total`.
+- **The bundled HTTP check returns `check.ErrNotRun` when this host runs out of
+  a local resource.** A request that fails at any stage (the dial, the DNS
+  lookup, or a socket read or write) with `EMFILE`, `ENFILE`,
+  `EADDRNOTAVAIL`, `ENOBUFS` or `ENOMEM` is no longer a `down` target: `Run`
+  returns an error wrapping `check.ErrNotRun` and the `syscall.Errno`, with
+  the text `check not run: <op>: <errno text>`, which never contains the URL.
+  Before, `httpcheck.Check.Run` never returned an error; a program draining
+  `Results()` should test `errors.Is(res.Err, check.ErrNotRun)` before
+  treating an error as a failure. Exhaustion during lookup used to read as
+  `dns_failure`.
+- **`httpcheck.WithConnectionReuse()` and the top-level YAML key
+  `connection_reuse: true`** keep connections open between checks, as 0.5.1
+  did. Reuse-mode results carry `Extra["conn_reused"]` (bool): whether the
+  check's last request hop ran on a pooled connection, omitted when that hop
+  got no connection. The CLI logs `connection_reuse=<bool>` at startup and
+  warns when it is on.
+- `docs/OPERATIONS.md`: a verdict contract (what `up` and each `down` class
+  observed and do not prove, the local causes descry cannot see), and
+  cold-connection sizing for `concurrency` with measured runs and
+  `TIME_WAIT` guidance. The README states the contract in one line.
+- `checks/http/verdict_matrix_test.go`: the HTTP check's fault table, run in
+  both connection modes. A standing rule in CONTRIBUTING.md, enforced by a
+  test for the file's presence, requires a new check or transport change to
+  add its fault cases there.
 - `contrib/prometheus`: `DescryChecksNotRun` (warning, no wait) fires for 10
   minutes after a check could not run, with a runbook in
   `docs/OPERATIONS.md`.
 
 ### Changed
 
+- **The HTTP check opens a fresh connection for every check and every
+  redirect hop**, so `up` proves a new connection to the target can be made.
+  Before, connections were reused within the 90s idle window, which could hide
+  DNS, TCP, TLS and certificate changes behind a working pooled connection.
+  Targets checked more often than every 90s now see a one-time rise in
+  measured latency, which includes DNS, TCP and TLS on every check; targets
+  checked less often already paid it. No `contrib/prometheus` rule reads
+  latency, so no rule changes; re-baseline any latency threshold of your own,
+  and re-check `concurrency` against the cold-connection check time. Each
+  check also leaves a `TIME_WAIT` socket on the descry host. Embedders
+  calling `httpcheck.New` get this with no code change;
+  `httpcheck.WithConnectionReuse()` is the way back.
+- **The HTTP check's TCP dial and TLS handshake are each capped at the check
+  timeout**, in both modes (the handshake was a fixed 10s and the dial 30s).
+  Go runs both on a context detached from the request's deadline, so a
+  stalled handshake now releases its socket and goroutines when the check
+  times out, and a handshake longer than 10s succeeds inside a longer
+  timeout.
+- **govulncheck moved out of the root module.** The `tool golang.org/x/vuln/cmd/govulncheck`
+  directive now lives in a separate `tools/` module (`go tool -modfile=tools/go.mod
+  govulncheck ./...`), so importers no longer inherit the scanner's dependency
+  floor (it held `golang.org/x/sys` at v0.49.0; the root now requires v0.48.0).
 - **`descry_check_up` is removed after three checks in a row that could not
   run**, and recreated by the next completed run, so verdict alerts do not
   keep firing on evidence nobody refreshed. `last_run` and the other
@@ -41,6 +86,16 @@ Pre-1.0, the minor version carries breaking changes.
 
 ### Fixed
 
+- **`checks/http`: the error class no longer follows the target URL's text.**
+  The classifier's text fallback matched the whole error message, which
+  includes the request URL, so a target such as `https://tls-gateway.example/`
+  or `/api/timeout` could be counted under the wrong class. It now matches
+  only the underlying cause, and a malformed status line, a malformed header
+  line or an HTTP/2 GOAWAY, whose error text quotes what the target sent, is
+  `unknown`. Some other response-parsing errors (a bad `Content-Length`,
+  `Transfer-Encoding` or `Location` value, an invalid HTTP/2 header field)
+  still quote target bytes and can still steer the class; the verdict is
+  `down` either way. See TODOS.md.
 - **Shutdown no longer publishes a false `down`.** A run that returns after
   `Run`'s context is done (cancelled or past its deadline) is dropped: no
   event and no `Result`. A run cut short by it records nothing in the

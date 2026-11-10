@@ -71,9 +71,11 @@ not one target:
 ```
 
 The histogram records completed observations only. A check that returns an
-error from `Run` is not recorded there, so in a program that embeds descry
-with such a check, a prober whose every run errors looks stalled to this
-rule. The CLI's HTTP check never returns one.
+error from `Run` is not recorded there, so a prober whose every run errors
+looks stalled to this rule. The CLI's HTTP check returns an error only when
+the prober itself ran out of a local resource (file descriptors, ephemeral
+ports, socket buffers or memory; the error wraps `check.ErrNotRun`); see
+`DescryChecksNotRun`.
 
 A program that embeds descry and stops checking a URL keeps that URL's series,
 frozen at their last values, until it restarts, so `DescryChecksStale` fires
