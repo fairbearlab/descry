@@ -1,0 +1,113 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/fairbearlab/descry/check"
+	"github.com/fairbearlab/descry/metrics"
+	"github.com/fairbearlab/descry/runner"
+)
+
+// TestDrainResults_NotRun: a check.ErrNotRun Result prints the not-run line
+// with reason, action, concurrency and target count; it is not a failure and
+// not a skip; the target is printed without userinfo or query; and the line is
+// rate-limited per target, separately from skips.
+func TestDrainResults_NotRun(t *testing.T) {
+	pw := "hunter2" // joined at runtime: no literal basic-auth URL in source
+	secret := check.Target{URL: "https://user:" + pw + "@a.example/health?token=abc#frag"}
+	other := check.Target{URL: "https://b.example/"}
+	notRun := func(errno syscall.Errno) error { return fmt.Errorf("%w: dial: %w", check.ErrNotRun, errno) }
+
+	ch := make(chan runner.Result, 16)
+	ch <- runner.Result{Target: secret, Err: notRun(syscall.EMFILE)}              // printed
+	ch <- runner.Result{Target: secret, Err: notRun(syscall.EMFILE)}              // suppressed (same interval)
+	ch <- runner.Result{Target: secret, Err: runner.ErrSkipped}                   // printed: skips have their own limit
+	ch <- runner.Result{Target: other, Err: notRun(syscall.EADDRNOTAVAIL)}        // printed (different target)
+	ch <- runner.Result{Target: other, Err: fmt.Errorf("x: %w", check.ErrNotRun)} // suppressed
+	close(ch)
+
+	clock := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	var out bytes.Buffer
+	var failures atomic.Int64
+	var skips []metrics.SkipKind
+	drainResults(ch, &out, 30*time.Second, func() time.Time { return clock }, &failures,
+		func(k metrics.SkipKind) { skips = append(skips, k) }, 7, 44)
+
+	if got := failures.Load(); got != 0 {
+		t.Errorf("failures = %d, want 0 (a not-run is not a check failure)", got)
+	}
+	if len(skips) != 1 {
+		t.Errorf("observed skips = %v, want only the real skip", skips)
+	}
+	s := out.String()
+	if strings.Contains(s, "check failed") {
+		t.Errorf("a not-run printed a failure line:\n%s", s)
+	}
+	// Only the not-run lines promise the event form; the skip line keeps
+	// check.RedactURL, which leaves the query.
+	for line := range strings.Lines(s) {
+		if !strings.HasPrefix(line, "check not run:") {
+			continue
+		}
+		for _, bad := range []string{pw, "user", "token", "abc", "frag"} {
+			if strings.Contains(line, bad) {
+				t.Errorf("not-run line contains %q: %s", bad, line)
+			}
+		}
+	}
+	wantLine := `check not run: https://a.example/health reason=EMFILE action="raise the file descriptor limit or lower concurrency" concurrency=7 targets=44; retries at the next interval, no side effects` + "\n"
+	if !strings.Contains(s, wantLine) {
+		t.Errorf("missing not-run line\nwant %q\nin   %q", wantLine, s)
+	}
+	if !strings.Contains(s, `check not run: https://b.example/ reason=EADDRNOTAVAIL action="widen the ephemeral port range or lengthen intervals"`) {
+		t.Errorf("missing EADDRNOTAVAIL line:\n%s", s)
+	}
+	if n := strings.Count(s, "check not run:"); n != 2 {
+		t.Errorf("not-run lines = %d, want 2 (rate-limited per target):\n%s", n, s)
+	}
+	if n := strings.Count(s, "check skipped:"); n != 1 {
+		t.Errorf("skip lines = %d, want 1:\n%s", n, s)
+	}
+
+	// After the window, the next not-run prints with the suppressed count.
+	out.Reset()
+	ch3 := make(chan runner.Result, 3)
+	ch3 <- runner.Result{Target: other, Err: notRun(syscall.ENOMEM)}
+	ch3 <- runner.Result{Target: other, Err: notRun(syscall.ENOMEM)}
+	ch3 <- runner.Result{Target: other, Err: notRun(syscall.ENOBUFS)}
+	close(ch3)
+	calls := 0
+	tick := func() time.Time {
+		calls++
+		if calls == 3 {
+			clock = clock.Add(31 * time.Second)
+		}
+		return clock
+	}
+	drainResults(ch3, &out, 30*time.Second, tick, new(atomic.Int64), nil, 7, 44)
+	s = out.String()
+	if n := strings.Count(s, "check not run:"); n != 2 {
+		t.Fatalf("not-run lines across a window = %d, want 2:\n%s", n, s)
+	}
+	if !strings.Contains(s, `reason=ENOBUFS action="reduce load on this host"`) ||
+		!strings.Contains(s, "no side effects (1 more not-runs for this target since the last line)\n") {
+		t.Errorf("second line lacks the reason or the suppressed count:\n%s", s)
+	}
+}
+
+// TestNotRunAction covers every reason, so a new reason cannot ship without
+// an action.
+func TestNotRunAction(t *testing.T) {
+	for _, r := range []string{metrics.NotRunEMFILE, metrics.NotRunENFILE, metrics.NotRunEADDRNOTAVAIL,
+		metrics.NotRunENOBUFS, metrics.NotRunENOMEM, metrics.NotRunOther} {
+		if notRunAction(r) == "" {
+			t.Errorf("notRunAction(%q) is empty", r)
+		}
+	}
+}

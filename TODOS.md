@@ -80,31 +80,6 @@ CONTRIBUTING.md.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
-### A check cancelled at shutdown is published as a `down` event
-
-**What:** When `Run`'s context is cancelled, a check that is already in flight
-should not produce an event (or a failed-run metric) for the target. Either
-`runOne` drops the observation when `ctx.Err() != nil` after the check returns,
-or the outcome is marked as cancelled so the sink and the collector can skip it.
-
-**Why:** On SIGTERM the runner hands the cancelled context to the in-flight
-check. The bundled `httpcheck` returns the cancelled request as an
-`Observation` with status `down` (class `unknown` in most cases) and a nil
-error, the collector records a failed run, and a sink that ignores its context
-(the stdout sink does) still publishes it. Every rollout, eviction, node drain
-or liveness kill that catches a check mid-run therefore emits a false `down`
-event for that target, which downstream alerting cannot tell from a real
-outage.
-
-**Context:** 2026-10-12 — found while documenting the Kubernetes example, whose
-README now warns about it ("A restart can log a false `down`"; drop that bullet
-with the fix). Start at `runner.runOne` and `httpcheck.Run`; the fix must keep
-the shutdown invariant that no `Publish` happens after `Run` returns, and
-decide whether a custom check's own ctx error should still reach `Results()`.
-
-**Effort:** S · **Priority:** P2 · **Depends on:** nothing
-
-
 ## Event
 
 ### Encoder docs cite `regexp.MustCompile`; should be `regexp.Compile`
@@ -619,6 +594,38 @@ someone bumps it by hand, including after distroless publishes a fix.
 **Effort:** S · **Priority:** P2 · **Depends on:** nothing
 
 ## Completed
+
+### A check cancelled at shutdown is published as a `down` event
+
+**What:** When `Run`'s context is cancelled, a check that is already in flight
+should not produce an event (or a failed-run metric) for the target. Either
+`runOne` drops the observation when `ctx.Err() != nil` after the check returns,
+or the outcome is marked as cancelled so the sink and the collector can skip it.
+
+**Why:** On SIGTERM the runner hands the cancelled context to the in-flight
+check. The bundled `httpcheck` returns the cancelled request as an
+`Observation` with status `down` (class `unknown` in most cases) and a nil
+error, the collector records a failed run, and a sink that ignores its context
+(the stdout sink does) still publishes it. Every rollout, eviction, node drain
+or liveness kill that catches a check mid-run therefore emits a false `down`
+event for that target, which downstream alerting cannot tell from a real
+outage.
+
+**Context:** 2026-10-12 — found while documenting the Kubernetes example, whose
+README now warns about it ("A restart can log a false `down`"; drop that bullet
+with the fix). Start at `runner.runOne` and `httpcheck.Run`; the fix must keep
+the shutdown invariant that no `Publish` happens after `Run` returns, and
+decide whether a custom check's own ctx error should still reach `Results()`.
+
+**Effort:** S · **Priority:** P2 · **Depends on:** nothing
+
+**Completed:** 2026-11-09 — `runner.runOne` drops whatever a run returns once
+the run context is done (event, `Result{Err}`, and a custom check's own ctx
+error alike), and the metrics decorator records nothing for a run whose ctx
+was cancelled, so shutdown publishes no `down` and counts no failed run. The
+"no `Publish` after `Run` returns" invariant holds; under `WithShutdownGrace`
+only a run whose check returned before the cancel (a sink already blocked in
+`Publish`) can still publish late. The Kubernetes README bullet is gone.
 
 ### Protect release tags with a ruleset
 

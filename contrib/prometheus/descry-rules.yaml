@@ -42,12 +42,18 @@ spec:
         # descry_check_up and this rule never fires; alert on the fleet-wide
         # descry_check_errors_total instead.
         #
-        # descry_check_up holds its value until the target's next run, so the
-        # 5m wait is about 5m / interval consecutive failed runs: a target
-        # checked every 30s must fail about ten runs in a row, but a target
-        # with an interval of 5m or more fires after a single failed run.
-        # Raise `for` (or split the rule by url) if slow targets should get
-        # more than one chance.
+        # descry_check_up holds its value until the target's next completed
+        # run, so the 5m wait is about 5m / interval consecutive failed runs: a
+        # target checked every 30s must fail about ten runs in a row, but a
+        # target with an interval of 5m or more fires after a single failed
+        # run. Raise `for` (or split the rule by url) if slow targets should
+        # get more than one chance.
+        #
+        # A run that could not run (DescryChecksNotRun) is no evidence, so it
+        # does not hold the value up: the series keeps its value through two
+        # such runs in a row and is removed on the third, which resolves this
+        # alert for a target that was really down, until a completed run
+        # brings the series back. The `for` window starts again then.
         - alert: DescryTargetDown
           expr: descry_check_up == 0
           for: 5m
@@ -60,8 +66,11 @@ spec:
               that way for 5 minutes.
 
         # Catches a prober that is up and serving /metrics but no longer
-        # completing checks. descry_check_up keeps its last value, so a target
-        # that was up stays up, and build_info is still there. A wedged sink
+        # completing checks. A wedged run leaves descry_check_up at its last
+        # value, so a target that was up stays up, and build_info is still
+        # there; checks that cannot run (DescryChecksNotRun) remove
+        # descry_check_up after three in a row, but leave this timestamp
+        # frozen, so this alert covers them too. A wedged sink
         # keeps its runs in flight, so their slots are skipped and
         # DescrySkipsClimbing fires too, but that one points at the
         # concurrency or the interval; this alert names the real symptom. A
@@ -99,9 +108,9 @@ spec:
             description: >-
               The last completed run of {{ $labels.url }} is more than 15
               minutes old, but descry is still being scraped. Its per-target
-              series, descry_check_up included, are frozen at their last
-              values. Check descry's stderr and the sink, and restart descry if
-              it is wedged.
+              series are frozen at their last values (descry_check_up is
+              removed instead if its checks could not run). Check descry's
+              stderr and the sink, and restart descry if it is wedged.
 
         # Reads the exact total, not descry_runner_skips_observed_total{kind}:
         # that one is fed from the results channel, undercounts whenever
@@ -182,3 +191,39 @@ spec:
               after retries, or could not be built. Check the sink (disk space,
               permissions, the receiving end) and descry's stderr for the
               "check failed" lines.
+
+        # A check that could not run (it returned check.ErrNotRun: the prober
+        # ran out of file descriptors, ephemeral ports, socket buffers or
+        # memory) observed nothing about its target, so no verdict series
+        # moved for it. This reads the fleet-wide timestamp of the last such
+        # run, not descry_checks_not_run_total{reason}: a counter whose first
+        # scrape is already above 0 shows no increase(), and a not-run burst
+        # often comes right after a start, while a timestamp is usable on its
+        # first sample. Before any not-run the timestamp is 0, which is never
+        # within the window. Fires while a not-run happened in the last 10
+        # minutes; no wait, because the cause is local and each one is worth
+        # a look. Warning, not critical: a sustained failure also freezes
+        # last_run, so DescryChecksStale is the critical signal for it.
+        #
+        # At real fd exhaustion the /metrics scrape itself can fail first (the
+        # server cannot accept), so a failed scrape of a descry instance is
+        # worth reading alongside this. The CLI does not count not-runs in
+        # descry_runner_result_errors_total, so DescryPublishErrors stays
+        # about delivery.
+        - alert: DescryChecksNotRun
+          expr: time() - descry_checks_not_run_last_timestamp_seconds < 600
+          labels:
+            severity: warning
+          annotations:
+            summary: descry could not run some checks
+            description: >-
+              At least one check could not run in the last 10 minutes because
+              the prober itself failed (file descriptors, ephemeral ports,
+              socket buffers or memory), so nothing was observed of its target.
+              Verdict alerts (DescryTargetDown, DescryChecksStale) are
+              unreliable while this fires: an affected target keeps its last
+              verdict for two runs and then has no descry_check_up at all.
+              descry_checks_not_run_total{reason} names the resource, and
+              descry's stderr has a "check not run" line per target with an
+              action.
+            runbook_url: https://github.com/fairbearlab/descry/blob/main/docs/OPERATIONS.md#checks-that-could-not-run

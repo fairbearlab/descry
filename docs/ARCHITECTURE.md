@@ -61,6 +61,11 @@ A genuinely *generic* HTTP output (one any HTTP monitor would emit) may become a
 typed field — that's not a leak. The test is "generic to HTTP monitoring," not
 "needed by my consumer."
 
+A generic sentinel error is allowed on the same terms: an exported `error`
+value, tested with `errors.Is`, that names an engine-level condition any
+check can hit and carries no consumer vocabulary. `check.ErrNotRun` ("the
+check could not run, so there is no verdict") is one.
+
 ### It governs *vocabulary*, not *surface*
 
 Read the "zero changes to exported types" clause as the anti-leak rule it was

@@ -105,6 +105,15 @@
 // returning. Because every worker has returned by then, no Publish happens
 // after Run returns, which is what makes a deferred sink Close safe.
 //
+// A run that returns once ctx is done is dropped: no event is published and
+// no Result is reported, whatever the check returned (a down Observation, a
+// Result error, or the check's own ctx error). A run cut short by shutdown is
+// no evidence about its target, so publishing it would invent a down; a
+// genuine result that races the cancel is lost too, which is the accepted
+// cost. A run whose check returned before the cancel is past this point: its
+// event may still be in Publish when ctx is cancelled, and is delivered or
+// fails as Publish decides.
+//
 // By default that wait is unbounded: a Check or sink that ignores its ctx
 // holds Run until it returns. WithShutdownGrace(d) bounds it. If runs are
 // still in flight d after the scheduler stops, Run logs how many workers are
@@ -121,7 +130,11 @@
 //     channel closing.
 //
 // The straggling workers are not killed (Go cannot); they exit when their
-// Check or Publish returns.
+// Check or Publish returns. A straggler whose check returns after the cancel
+// is dropped like any other such run, so it never publishes and never
+// reports; the late Publish and the late Result above come only from a run
+// whose check had returned before the cancel, such as one whose sink is
+// blocked in Publish.
 package runner
 
 import (
@@ -338,7 +351,9 @@ func slotAfter(now time.Time, interval, phase time.Duration) time.Time {
 
 // Results returns the results channel. Callers should drain it: every
 // completed run and every skipped slot produces one Result, and a full channel
-// drops (see Dropped).
+// drops (see Dropped). A run that returns after Run's ctx is done produces no
+// Result (and no event): at shutdown the runs in flight are dropped, not
+// reported, so a consumer sees nothing for them rather than a cancellation.
 func (r *Runner) Results() <-chan Result { return r.results }
 
 // Skipped returns the number of slots skipped because the target's prior run
@@ -566,9 +581,13 @@ func (r *Runner) worker(ctx context.Context, work <-chan *entry, done chan<- *en
 
 // runOne executes a single check, maps it to a CloudEvent, and publishes it
 // with bounded retry. Errors are reported on the results channel but never
-// block the scheduler.
+// block the scheduler. A run that returns once ctx is done is dropped before
+// any of that (see the package doc's Shutdown section).
 func (r *Runner) runOne(ctx context.Context, t check.Target) {
 	obs, err := r.chk.Run(ctx, t)
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil {
 		r.reportResult(Result{Target: t, Err: err})
 		return

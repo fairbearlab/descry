@@ -6,9 +6,22 @@ package check
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"time"
 )
+
+// ErrNotRun reports that a check could not run at all, so it has no evidence
+// about the target either way: the failure was local to the prober (running
+// out of file descriptors or ephemeral ports, say), not an observation of the
+// target. A Check returns it, wrapped with the cause, as Run's error instead
+// of a down Observation. Test with errors.Is.
+//
+// The runner reports it on Results like any other Run error, and publishes no
+// event. The metrics decorator records no verdict for it: up, runs_total,
+// errors_total, latency and last_run are left alone, and the not-run series
+// count it instead (see package metrics).
+var ErrNotRun = errors.New("check not run")
 
 // RedactURL masks any userinfo (credentials) in a target URL so it is safe to
 // log: a password becomes "xxxxx" (the username stays, as in url.URL.Redacted),
@@ -88,6 +101,14 @@ type Observation struct {
 }
 
 // Check produces an Observation for a Target.
+//
+// Run reports what it observed of the target as an Observation with a nil
+// error, a down target included: a timeout, a refused connection or a 500 is
+// a successful check of a down target. A non-nil error means the run produced
+// no Observation. Wrap ErrNotRun in it when the check itself could not run
+// for a reason local to the prober, so the error is not read as a verdict; a
+// run abandoned because ctx was cancelled may return ctx's error, and the
+// runner drops whatever a run returns once its context is done.
 type Check interface {
 	Name() string
 	Run(ctx context.Context, target Target) (Observation, error)

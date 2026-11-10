@@ -746,8 +746,10 @@ func startWedged(t *testing.T, opts ...Option) (tr *testRunner, release func()) 
 // TestShutdown_GraceBoundsWedgedRun: with WithShutdownGrace, a check that
 // ignores ctx no longer holds Run. Run returns ctx.Err() joined with
 // ErrShutdownTimeout after the grace, warns with the in-flight worker count,
-// and leaves Results() open — the straggler still reports on it when it
-// finally returns (a send on a closed channel would panic).
+// and leaves Results() open (a straggler that had already reached Publish
+// could still report on it; see TestShutdown_GraceBlockedPublishStillReports).
+// This straggler's check returns after the cancel, so it is dropped: no
+// Result, even once it returns.
 func TestShutdown_GraceBoundsWedgedRun(t *testing.T) {
 	const grace = 50 * time.Millisecond
 	logs := captureLogs(t, slog.LevelWarn)
@@ -782,8 +784,11 @@ func TestShutdown_GraceBoundsWedgedRun(t *testing.T) {
 	}
 
 	release()
-	if res := recv(t, tr.Results()); res.Err != nil || res.Target.URL != "http://wedged" {
-		t.Fatalf("straggler Result = %+v, want the wedged target's completion", res)
+	tr.awaitAck(t) // the straggler has returned from runOne
+	select {
+	case res, ok := <-tr.Results():
+		t.Fatalf("Results() yielded (%+v, open=%v) for a run that returned after the cancel; want it dropped", res, ok)
+	default:
 	}
 }
 

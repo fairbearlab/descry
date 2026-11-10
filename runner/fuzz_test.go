@@ -236,10 +236,11 @@ type fuzzCheck struct {
 	gate chan struct{}
 	slow map[string]bool // URLs whose Run blocks until the gate is released
 
-	mu       sync.Mutex
-	calls    map[string]int
-	inflight map[string]int
-	overlap  int
+	mu        sync.Mutex
+	calls     map[string]int
+	inflight  map[string]int
+	overlap   int
+	cancelled int // runs that returned with ctx already done; the runner drops their Result
 }
 
 func (c *fuzzCheck) Name() string { return "fuzz" }
@@ -256,6 +257,9 @@ func (c *fuzzCheck) Run(ctx context.Context, t check.Target) (check.Observation,
 	defer func() {
 		c.mu.Lock()
 		c.inflight[t.URL]--
+		if ctx.Err() != nil {
+			c.cancelled++
+		}
 		c.mu.Unlock()
 	}()
 
@@ -274,14 +278,14 @@ func (c *fuzzCheck) Run(ctx context.Context, t check.Target) (check.Observation,
 }
 
 // snapshot copies the counters once the workers are quiescent.
-func (c *fuzzCheck) snapshot() (calls map[string]int, overlap int) {
+func (c *fuzzCheck) snapshot() (calls map[string]int, overlap, cancelled int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	calls = make(map[string]int, len(c.calls))
 	for k, v := range c.calls {
 		calls[k] = v
 	}
-	return calls, c.overlap
+	return calls, c.overlap, c.cancelled
 }
 
 // --- seed corpus ---
@@ -577,7 +581,7 @@ func runFuzzScheduler(t *testing.T, data []byte) {
 		take(res)
 	}
 
-	calls, overlap := chk.snapshot()
+	calls, overlap, cancelled := chk.snapshot()
 	totalCalls, totalSkipResults := 0, 0
 	for _, c := range calls {
 		totalCalls += c
@@ -610,10 +614,14 @@ func runFuzzScheduler(t *testing.T, data []byte) {
 	}
 
 	// (b2) every run and every skip reports exactly one Result, on the channel or
-	// on the drop counter.
-	if int64(received)+dropped != int64(totalCalls)+skipped {
-		t.Errorf("results: received(%d) + dropped(%d) != calls(%d) + skipped(%d)",
-			received, dropped, totalCalls, skipped)
+	// on the drop counter, except a run that returned with the run context
+	// already done: the runner drops that one by design (a run cut short by
+	// shutdown is no evidence). Settle waits for every ack before stopping, so
+	// cancelled is 0 here today; the allowance keeps the identity exact if a
+	// script ever stops with a run in flight.
+	if int64(received)+dropped+int64(cancelled) != int64(totalCalls)+skipped {
+		t.Errorf("results: received(%d) + dropped(%d) + cancelled(%d) != calls(%d) + skipped(%d)",
+			received, dropped, cancelled, totalCalls, skipped)
 	}
 
 	// (e) Skipped() is consistent with what the consumer could observe.

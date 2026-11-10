@@ -87,11 +87,15 @@ never accumulates.
 ## Signals
 
 Everything the runner knows shows up in exactly two places: the `Results()`
-channel and two counters. Nothing is silent.
+channel and two counters. Nothing is silent, with one deliberate exception: a
+run that returns after `Run`'s context is cancelled is dropped, with no event
+and no `Result`, because a run cut short by shutdown says nothing about its
+target (see [Shutdown](#shutdown)).
 
 | Signal | Type | Means | What to do |
 |---|---|---|---|
 | `Result{Err: nil}` | channel | Check ran, event published | nothing |
+| `Result{Err: <wraps check.ErrNotRun>}` | channel | The check could not run at all, for a reason local to the prober (out of file descriptors or ephemeral ports, say), so nothing was observed of the target and no event was published. Test with `errors.Is(err, check.ErrNotRun)` before treating the error as a failure. Only a custom `Check` returns it today; the bundled `httpcheck` does not yet | the prober host — see [Checks that could not run](#checks-that-could-not-run); **not** the target |
 | `Result{Err: <check, mapping, or publish error>}` | channel | The check itself returned an error (only possible with a custom `Check` implementation — the bundled `httpcheck` never returns one), or the observation could not be delivered: the event could not be encoded (a payload that will not marshal — an `Extra` value such as a channel or NaN), or the sink rejected it up to 3 times (fewer if the context was cancelled mid-retry) | your check, your `Extra` payload, or your sink — **not** the target |
 | `Run` returns `runner: event config: ...` | error | The event config (`Source`, `Type`) is invalid. The runner validates it once in `New` and `Run` refuses to start: `Results()` is closed with no `Result` and no check runs. The `descry` CLI checks the same config before opening the sink and exits 2 (config error) with `error: invalid event config`; the `source` in that message is printed through `check.RedactURL`, so one that does not parse shows as `<unparseable>` | fix `source` / the event config; this is a startup error, never a per-event one |
 | `Result{Err: runner.ErrSkipped}` | channel | Slot skipped: the prior run **had started** and was still running. The check is slower than the target's interval | lengthen that target's interval, or shorten `timeout` |
@@ -108,9 +112,9 @@ the SSRF guard is a **successful check of a down target**: the bundled
 on the published event, and returns no error. `httpcheck.Check.Run` never returns
 a non-nil error.
 
-So `Result.Err` is a narrow channel by design — it carries skips, check errors
-(from a custom `Check`), mapping failures, and publish failures, and nothing
-about target health. **Uptime alarms
+So `Result.Err` is a narrow channel by design — it carries skips, checks that
+could not run and other check errors (from a custom `Check`), mapping failures,
+and publish failures, and nothing about target health. **Uptime alarms
 belong on the events, not on `Results()`.** `Results()` is where you watch the
 *engine*.
 
@@ -190,6 +194,75 @@ scheduler processed, per target, while `Dropped() == 0`; a dropped `Result` take
 its target with it, so with drops only the fleet-wide sum `+ dropped` is
 checkable. If you are exporting one number, make it that identity.
 
+### Checks that could not run
+
+A check that returns an error wrapping `check.ErrNotRun` is saying "I could not
+run, so I have no verdict": the prober ran out of something locally (file
+descriptors, ephemeral ports, socket buffers, memory), and the target was
+never asked. No event is published for it. It is not a down target and must
+not be treated as one, and it is not an up target either.
+
+What each output does with one:
+
+- **Events:** nothing is published. The last event for the target stays the
+  last event; see [absence is unknown](#consuming-events-absence-is-unknown).
+- **`Results()`:** one `Result` whose `Err` wraps `check.ErrNotRun`, like any
+  other check error, so it can be dropped under saturation like any other.
+- **Metrics (`Collector.Check`):** `descry_checks_not_run_total{reason}`
+  counts one and `descry_checks_not_run_last_timestamp_seconds` is set; no
+  verdict series moves. `descry_check_last_run_timestamp_seconds`,
+  `status_code`, latency, `runs_total`, `errors_total` and the histogram keep
+  their values, so `DescryChecksStale` fires if no run completes for 15
+  minutes. `descry_check_up` keeps its value through two not-runs in a row and
+  is **removed** on the third; the next completed run recreates it. A target
+  with no completed run yet gets no per-target series from a not-run. Three,
+  not one, so that brief pressure does not keep resetting `DescryTargetDown`'s
+  `for` window.
+- **The `descry` CLI:** prints one line per target per interval (later ones
+  are counted on the next line), and does not count it in
+  `descry_runner_result_errors_total`, so `DescryPublishErrors` does not fire:
+
+  ```
+  check not run: https://example.com/health reason=EMFILE action="raise the file descriptor limit or lower concurrency" concurrency=4 targets=44; retries at the next interval, no side effects
+  ```
+
+  The target is printed in its event form (no userinfo, query or fragment).
+
+Runbook, when `DescryChecksNotRun` fires or the line appears:
+
+| `reason` | Means | Do |
+|---|---|---|
+| `EMFILE` | descry's own file descriptor limit is reached | raise the limit (`ulimit -n`, `LimitNOFILE=`, the container runtime's `nofile`), or lower `concurrency` |
+| `ENFILE` | the host's file table is full | find what else holds descriptors on the host; raise `fs.file-max`, or lower `concurrency` |
+| `EADDRNOTAVAIL` | no local port or address is free for a new connection | widen the ephemeral port range (`net.ipv4.ip_local_port_range`), or lengthen intervals so fewer connections are in `TIME_WAIT` |
+| `ENOBUFS`, `ENOMEM` | the kernel is short of socket buffers or memory | reduce load on the host |
+| `other` | the check reported it could not run for another reason | see that check's own logs |
+
+At real descriptor exhaustion the `/metrics` server may be unable to accept
+the scrape, so a failed scrape of the instance can be the first symptom, before
+`DescryChecksNotRun` is seen. While it fires, treat verdict alerts as
+unreliable: a target that was really down has `DescryTargetDown` resolve once
+its `descry_check_up` is removed, and a target that was up keeps reading up for
+up to two runs it never made. Every not-run retries at the target's next slot;
+there is nothing to clean up.
+
+### Consuming events: absence is unknown
+
+An event is a verdict with a timestamp (`time` is when the check observed
+the target). The absence of a newer event is **not** a verdict: descry
+publishes nothing for a check that could not run, for a run cut short by
+shutdown, for a skipped slot, for a failed publish, or while descry is down.
+A consumer that keeps the last event per subject forever will keep reporting
+a verdict nobody re-checked.
+
+So expire verdicts: treat a subject's last event as current only while it is
+younger than the target's expected cadence (for example `2 × interval +
+timeout`), and report "unknown" after that, rather than up or down. The
+`runner` package's `Example_absenceIsUnknown` is a compiled example of a
+consumer that does this and drains `Results()` with an `errors.Is(err,
+check.ErrNotRun)` case. The metrics side follows the same rule: an absent
+`descry_check_up` means "no current evidence", not "up".
+
 ## Metrics and health endpoints
 
 `descry --listen host:port` serves `/metrics`, `/healthz` and `/readyz` on one
@@ -240,12 +313,12 @@ Per-target (labelled `url`; about seven series per target; dropped with
 
 | Series | Type | Meaning |
 |---|---|---|
-| `descry_check_up{url}` | gauge | 1 when the last run was up, else 0 (a check that returned an error counts as 0) |
+| `descry_check_up{url}` | gauge | 1 when the last completed run was up, else 0 (a check that returned an error counts as 0). Removed after three runs in a row that could not run (`check.ErrNotRun`), and recreated by the next completed run, so its absence means "no current evidence" (see [Checks that could not run](#checks-that-could-not-run)) |
 | `descry_check_status_code{url}` | gauge | last HTTP status code; 0 when the request failed (no response, or a redirect refused by the SSRF guard or by the redirect limit: the check follows at most 4 redirects, and a 5th fails the run) or when the check returned an error |
 | `descry_check_latency_seconds{url}` | gauge | last run's latency, millisecond resolution; left as it was when the check returned an error |
 | `descry_check_last_run_timestamp_seconds{url}` | gauge | when the last run was observed (or when the check's error was recorded), unix seconds |
 | `descry_check_tls_expiry_timestamp_seconds{url}` | gauge | expiry of the certificate of the final response after redirects, unix seconds; only for targets whose final response came over TLS (so an `http://` target that redirects to `https://` has it too). Absent until the first run that reports a certificate; after that it keeps its last value when a run reports none: a failed handshake, any other run whose request failed (a timeout, a refused connection, an SSRF block, a 5th redirect), and a successful run whose final response was plain HTTP, such as an `https://` target that redirects to `http://`, which keeps the old expiry while `descry_check_up` is 1. Read it together with `last_run` |
-| `descry_check_runs_total{url,status}` | counter | runs, `status` `up` or `down`; any run that was not up, including a check that returned an error, counts as `down` |
+| `descry_check_runs_total{url,status}` | counter | runs, `status` `up` or `down`; any run that was not up, including a check that returned an error, counts as `down`. A check that could not run, and a run cut short by shutdown, count as neither |
 
 A target's series appear on its first completed run, not at startup, so a
 target has none until its first check finishes: that check starts up to one
@@ -256,7 +329,12 @@ creates both `runs_total` values, the one that did not fire at 0, so a target
 whose first run fails makes `status="down"` appear at 1, which `increase()`
 does not count. A "check that returned an error" is only possible with a
 custom `Check`; the bundled HTTP check reports a down target as a down
-Observation and never returns one.
+Observation and never returns one. A check that could not run creates no
+per-target series for a target that has none yet.
+
+No series records a run whose context was cancelled by the time the check
+returned (the runner cancels in-flight runs at shutdown): it is no evidence
+about the target. A run that hit its own timeout is recorded as usual.
 
 Fleet-wide (always served):
 
@@ -269,6 +347,8 @@ Fleet-wide (always served):
 | `descry_runner_result_errors_total` | counter | non-skip error `Result`s seen by the drain (publish and mapping failures); best-effort |
 | `descry_runner_skips_observed_total{kind}` | counter | skips seen by the drain, `kind` `queued` or `in_flight`; best-effort, triage only |
 | `descry_runner_targets` | gauge | number of configured targets, counting exact duplicates |
+| `descry_checks_not_run_total{reason}` | counter | runs whose check could not run (`check.ErrNotRun`), with no verdict recorded. `reason` is one of `EMFILE`, `ENFILE`, `EADDRNOTAVAIL`, `ENOBUFS`, `ENOMEM` and `other`, all six exported at 0 from startup. Not fed from `Results()`, so it is exact |
+| `descry_checks_not_run_last_timestamp_seconds` | gauge | when the last such run happened, unix seconds; 0 until one does. `DescryChecksNotRun` reads this rather than the counter, because a timestamp is usable on its first scrape |
 | `descry_build_info{version,commit}` | gauge | constant 1. `version` is the release version without the leading `v` (`0.5.0`), `commit` the full git commit; a local `go build` reports `version="dev"`, `commit="none"`. There is no date label |
 
 The best-effort series undercount when the runner drops `Result`s; the exact
@@ -482,7 +562,16 @@ The runner's side is the same for any program: cancel the context passed to
 `Run`. The runner stops dispatching, waits for in-flight runs to finish, then
 closes `Results()` so a draining consumer's loop exits. Targets that were
 queued but not yet started are acked without running, so shutdown produces
-no burst of `context.Canceled` results. No `Publish` happens after `Run`
+no burst of `context.Canceled` results. A run still in flight is handed the
+cancelled context, and whatever it returns once that context is done (a
+`down` Observation, which is what the bundled HTTP check returns for a
+cancelled request, an error, or the check's own `context.Canceled`) is
+dropped: no event, no `Result`, and nothing in the metrics. A rollout,
+eviction or drain therefore no longer publishes a false `down` for each target
+that was mid-check; it loses that one sample instead, including a genuine
+result that happened to return just after the cancel. A run whose check
+returned before the cancel is past that point and is published as usual, even
+if its `Publish` is still running when the cancel arrives. No `Publish` happens after `Run`
 returns — which is what makes a deferred sink `Close()` safe. If that `Close`
 fails (the file sink's final flush or the file close itself), the
 `descry` binary prints `error: closing file sink: …` and exits 1 even though
@@ -511,12 +600,15 @@ level=WARN msg="shutdown grace expired; returning with runs still in flight (Res
 and returns `errors.Join(ctx.Err(), runner.ErrShutdownTimeout)`. That return
 gives up two guarantees of the unbounded path, deliberately:
 
-- **A straggler may still `Publish` after `Run` returns.** Closing the sink
+- **A straggler may still `Publish` after `Run` returns.** Only a run whose
+  check returned before the cancel can do this, such as one whose sink was
+  already blocked in `Publish`; a straggling check that returns after the
+  cancel is dropped like any other, and never publishes. Closing the sink
   right after `Run` can race a late write; either make the sink's `Publish`
   safe after `Close` (the bundled `FileSink` returns an error, which the
   straggler logs), or skip the `Close` and let process exit reclaim it.
-- **`Results()` is not closed**, because a straggler still reports its outcome
-  on it. A consumer draining `Results()` must also stop when `Run` returns —
+- **`Results()` is not closed**, because a straggler that reached `Publish`
+  still reports its outcome on it. A consumer draining `Results()` must also stop when `Run` returns —
   `for range r.Results()` alone would wait forever.
 
 Test for it with `errors.Is(err, runner.ErrShutdownTimeout)`; `errors.Is(err,
@@ -544,6 +636,8 @@ forcibly with a WARN; that does not change the exit code.
 | `ErrSkippedQueued` climbing | `concurrency` below `Σ p99/interval` | raise `concurrency` |
 | `ErrSkipped` on a few specific URLs | those endpoints are slower than their interval | raise their `interval`, or lower `timeout` |
 | `Dropped() > 0` | consumer not draining `Results()` | fix the consumer loop; nothing else drops |
+| `check not run: …` on stderr, or `DescryChecksNotRun` firing | the prober ran out of a local resource; `reason` names it | see [Checks that could not run](#checks-that-could-not-run); verdict alerts are unreliable meanwhile |
+| a target's `descry_check_up` series is gone, other series still there | three checks in a row could not run | expected; it returns with the next completed run |
 | One gap of ~2 intervals after a deploy | restart across a slot boundary | expected; the slot is not made up |
 | All targets late by exactly one interval, once | wall-clock step | look for the INFO re-anchor line |
 | Goroutines growing with target count | not this runner | it is O(concurrency); look at `net/http` connections |
