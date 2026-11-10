@@ -80,6 +80,32 @@ CONTRIBUTING.md.
 
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
+### The benchstat gate can fail on `BenchmarkSkipPath` from runner noise
+
+**What:** Make the `benchstat` job in `.github/workflows/perf.yml` stop failing
+on noise in sub-100 ns benchmarks, `BenchmarkSkipPath` in particular.
+
+**Why:** The job benchmarks the merge-base and then the head, each
+`-count=10` in one block, on the same runner, and fails on a ≥ +10% ns/op
+change with p < 0.05. Running all base samples before all head samples means
+any slowdown of the runner during the job lands on the head side every time,
+and benchstat reads that consistent offset as significant. A ~40 ns benchmark
+needs only a 4 ns shift to cross the bar. The check is not required for
+merge, but a red check on an unrelated PR costs a rerun and an investigation.
+
+**Context:** 2026-11-10, PR #49 at `6e40701`: `SkipPath-4` 39.05n → 42.96n,
++10.00% (p=0.000), failed the gate; the rerun passed at +5.54% (p=0.000). The
+PR does not touch `Runner.skip` or `reportResult`. An interleaved local A/B
+(20 samples each, alternating base and head) gave 17.63 vs 17.59 ns/op. Across
+runners the benchmark has measured 39–70 ns, with base and head within 1% on
+earlier PRs. Options: interleave the samples (alternate base and head runs
+with `-count=1` in a loop) so drift spreads across both sides; or require an
+absolute floor as well as the 10% (for example ≥ +10% and ≥ 10 ns) for
+benchmarks under 100 ns. Interleaving fixes the cause and keeps the gate
+sensitive, so prefer it.
+
+**Effort:** S · **Priority:** P3 · **Depends on:** nothing
+
 ## Event
 
 ### Encoder docs cite `regexp.MustCompile`; should be `regexp.Compile`
