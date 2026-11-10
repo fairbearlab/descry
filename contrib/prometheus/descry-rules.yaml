@@ -202,8 +202,12 @@ spec:
         # first sample. Before any not-run the timestamp is 0, which is never
         # within the window. Fires while a not-run happened in the last 10
         # minutes; no wait, because the cause is local and each one is worth
-        # a look. Warning, not critical: a sustained failure also freezes
-        # last_run, so DescryChecksStale is the critical signal for it.
+        # a look. Warning, not critical: a sustained failure on a target that
+        # has completed a run also freezes last_run, so DescryChecksStale is
+        # the critical signal for it. A target whose checks have not run since
+        # descry started (a file descriptor limit set too low at deploy time,
+        # say) has no last_run series, so DescryChecksStale never covers it
+        # and this warning is the only alert; route it accordingly.
         #
         # At real fd exhaustion the /metrics scrape itself can fail first (the
         # server cannot accept), so a failed scrape of a descry instance is

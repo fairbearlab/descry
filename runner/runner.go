@@ -381,6 +381,10 @@ func (r *Runner) Dropped() int64 { return r.dropped.Load() }
 // errors.Join(ctx.Err(), ErrShutdownTimeout), Results() stays open, and a
 // straggler may still Publish (see the package doc's Shutdown section).
 //
+// Checks receive a context with ctx's values that is cancelled when ctx ends,
+// whether by cancel or by deadline, so a check cut short at shutdown always
+// sees context.Canceled; ctx's deadline is not passed on to them.
+//
 // Run is single-use: a second call on the same Runner returns an error. If New
 // rejected the event config, Run closes Results() and returns that error
 // (wrapped) without starting any check.
@@ -400,6 +404,17 @@ func (r *Runner) Run(ctx context.Context) error {
 	// ack, so at most one ack per entry is ever outstanding.
 	done := make(chan *entry, len(r.entries))
 
+	// Checks run on checkCtx, which carries ctx's values but is cancelled when
+	// ctx ends for any reason. A run cut short at shutdown therefore always
+	// sees context.Canceled, never a deadline of ctx's, so neither the check
+	// nor the metrics decorator (which records nothing for a cancelled run but
+	// does record a run that hit its own deadline) can read the shutdown as a
+	// timeout of the target.
+	checkCtx, cancelChecks := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelChecks()
+	stopChecks := context.AfterFunc(ctx, cancelChecks)
+	defer stopChecks()
+
 	var wg sync.WaitGroup
 	var live atomic.Int64 // workers not yet exited; reported if the grace expires
 	for range r.concurrency {
@@ -408,7 +423,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			defer live.Add(-1)
-			r.worker(ctx, work, done)
+			r.worker(ctx, checkCtx, work, done)
 		}()
 	}
 
@@ -565,12 +580,12 @@ func (r *Runner) finish(e *entry) {
 
 // worker runs entries from work until it is closed. Once ctx is cancelled it
 // acks queued entries without running them, so shutdown produces no burst of
-// context.Canceled Results.
-func (r *Runner) worker(ctx context.Context, work <-chan *entry, done chan<- *entry) {
+// context.Canceled Results. checkCtx is what the check runs on (see Run).
+func (r *Runner) worker(ctx, checkCtx context.Context, work <-chan *entry, done chan<- *entry) {
 	for e := range work {
 		if ctx.Err() == nil {
 			e.started.Store(true)
-			r.runOne(ctx, e.t)
+			r.runOne(ctx, checkCtx, e.t)
 		}
 		done <- e
 		if r.afterDone != nil {
@@ -582,9 +597,10 @@ func (r *Runner) worker(ctx context.Context, work <-chan *entry, done chan<- *en
 // runOne executes a single check, maps it to a CloudEvent, and publishes it
 // with bounded retry. Errors are reported on the results channel but never
 // block the scheduler. A run that returns once ctx is done is dropped before
-// any of that (see the package doc's Shutdown section).
-func (r *Runner) runOne(ctx context.Context, t check.Target) {
-	obs, err := r.chk.Run(ctx, t)
+// any of that (see the package doc's Shutdown section). The check runs on
+// checkCtx; the drop test and Publish use ctx.
+func (r *Runner) runOne(ctx, checkCtx context.Context, t check.Target) {
+	obs, err := r.chk.Run(checkCtx, t)
 	if ctx.Err() != nil {
 		return
 	}

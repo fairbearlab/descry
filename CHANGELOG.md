@@ -30,12 +30,20 @@ Pre-1.0, the minor version carries breaking changes.
 - **`descry_check_up` is removed after three checks in a row that could not
   run**, and recreated by the next completed run, so verdict alerts do not
   keep firing on evidence nobody refreshed. `last_run` and the other
-  per-target series keep their values, so `DescryChecksStale` still fires.
+  per-target series keep their values, so `DescryChecksStale` still fires
+  for a target that has completed a run. A URL that has never completed but
+  shares its `url` label with one that has counts toward that label's streak.
+- **Checks run on a context that `Runner.Run`'s context cancels.** It carries
+  `Run`'s context values but not its deadline, and ends as
+  `context.Canceled` whether `Run`'s context was cancelled or hit its
+  deadline, so a run cut short at shutdown never reads as a timeout of the
+  target.
 
 ### Fixed
 
 - **Shutdown no longer publishes a false `down`.** A run that returns after
-  `Run`'s context is cancelled is dropped: no event, no `Result`, and nothing
+  `Run`'s context is done (cancelled or past its deadline) is dropped: no
+  event, no `Result`, and nothing
   recorded by the metrics decorator (which also ignores any run whose context
   was cancelled). A rollout or drain used to publish one `down` event per
   target that was mid-check. Under `WithShutdownGrace`, only a run whose check

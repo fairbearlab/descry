@@ -12,6 +12,7 @@ import (
 
 	"github.com/fairbearlab/descry/check"
 	"github.com/fairbearlab/descry/event"
+	"github.com/fairbearlab/descry/metrics"
 )
 
 // ctxCheck blocks until ctx is done, then returns obs and err, or ctx.Err()
@@ -178,4 +179,77 @@ func (c *routeCheck) Run(_ context.Context, t check.Target) (check.Observation, 
 	}
 	return check.Observation{Status: check.StatusUp, StatusCode: 200, ObservedAt: time.Now().UTC(),
 		Labels: t.Labels, Extra: map[string]any{}}, nil
+}
+
+// deadlineCtx ends like a context whose deadline passed: once its parent is
+// done, Err reports context.DeadlineExceeded.
+type deadlineCtx struct{ context.Context }
+
+func (c deadlineCtx) Err() error {
+	if c.Context.Err() != nil {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// Value: protects=a Runner.Run ctx that ends by deadline cuts in-flight runs
+// short as cancelled, so the metrics decorator records nothing for them;
+// fails_when=checks run on Run's ctx directly (the decorator then sees
+// DeadlineExceeded and records a false down); why_new=the other shutdown
+// tests cancel Run's ctx, which never produced the deadline shape; seam=none;
+// no_claim=a real deadline timer (deadlineCtx stands in for one)
+func TestShutdown_DeadlineRecordsNoVerdict(t *testing.T) {
+	const iv = 10 * time.Second
+	c, err := metrics.New(metrics.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &ctxCheck{started: make(chan struct{}, 1),
+		obs: check.Observation{Status: check.StatusDown, ErrorClass: check.ErrTimeout, ObservedAt: time.Now().UTC()}}
+	seen := make(chan error, 1)
+	chk := c.Check(observingCheck{Check: inner, seen: seen})
+	s := &countingSink{}
+	fc := newFakeClock(t)
+	r := New(chk, s, event.Config{Source: "test"}, []check.Target{{URL: "http://deadline"}}, iv, 1)
+	r.clock = fc
+	acks := make(chan struct{}, 16)
+	r.afterDone = func() { acks <- struct{}{} }
+	parent, cancel := context.WithCancel(context.Background())
+	ret := make(chan error, 1)
+	go func() { ret <- r.Run(deadlineCtx{parent}) }()
+	fc.waitReset(1)
+	fc.Advance(firstSlot("http://deadline", iv).Sub(fc.Now()))
+	<-inner.started
+
+	cancel() // Run's ctx now reports DeadlineExceeded
+	if err := <-ret; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run returned %v, want context.DeadlineExceeded", err)
+	}
+	if got := <-seen; !errors.Is(got, context.Canceled) {
+		t.Fatalf("check saw ctx.Err() = %v at return, want context.Canceled", got)
+	}
+	if n := s.n.Load(); n != 0 {
+		t.Errorf("%d events published for a run cut short by a deadline; want 0", n)
+	}
+	mfs, err := c.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "descry_check_up" || mf.GetName() == "descry_check_runs_total" {
+			t.Errorf("%s exported %d series for a run cut short by a deadline; want none", mf.GetName(), len(mf.GetMetric()))
+		}
+	}
+}
+
+// observingCheck reports the ctx error its inner check returned under.
+type observingCheck struct {
+	check.Check
+	seen chan<- error
+}
+
+func (o observingCheck) Run(ctx context.Context, t check.Target) (check.Observation, error) {
+	obs, err := o.Check.Run(ctx, t)
+	o.seen <- ctx.Err()
+	return obs, err
 }

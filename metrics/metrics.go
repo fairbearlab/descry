@@ -413,11 +413,23 @@ func (c *Collector) recordNotRun(rawURL string, err error) {
 	}
 	c.mu.RLock()
 	ts := c.byURL[rawURL]
-	c.mu.RUnlock()
-	if ts == nil {
-		return // no completed run yet: create nothing, which would export up=0
+	var up *upState
+	label := ""
+	if ts != nil {
+		up, label = ts.up, ts.label
+	} else {
+		// This raw URL has no completed run, but another one with the same
+		// label may have: its up series is this target's too, so the streak
+		// must count here as well, or a stale verdict would outlive the
+		// not-runs. Rendering the label allocates, but only on this path.
+		label = TargetLabel(rawURL)
+		up = c.ups[label]
 	}
-	ts.up.notRun(c.up, ts.label)
+	c.mu.RUnlock()
+	if up == nil {
+		return // no completed run under this label: create nothing, which would export up=0
+	}
+	up.notRun(c.up, label)
 }
 
 // record updates every series for one run.

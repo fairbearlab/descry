@@ -213,7 +213,10 @@ What each output does with one:
   verdict series moves. `descry_check_last_run_timestamp_seconds`,
   `status_code`, latency, `runs_total`, `errors_total` and the histogram keep
   their values, so `DescryChecksStale` fires if no run completes for 15
-  minutes. `descry_check_up` keeps its value through two not-runs in a row and
+  minutes, for a target that has completed one. A target whose checks have
+  not run since descry started has no per-target series, so only
+  `DescryChecksNotRun` (warning) fires for it: route that alert where it will
+  be seen. `descry_check_up` keeps its value through two not-runs in a row and
   is **removed** on the third; the next completed run recreates it. A target
   with no completed run yet gets no per-target series from a not-run. Three,
   not one, so that brief pressure does not keep resetting `DescryTargetDown`'s

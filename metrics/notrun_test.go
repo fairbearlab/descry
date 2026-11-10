@@ -293,3 +293,94 @@ func TestCheck_NotRunConcurrentScrapes(t *testing.T) {
 	}
 	want(t, got, `descry_checks_not_run_total{reason="EMFILE"}`, targets*cycles*notRunsBeforeRemoval)
 }
+
+// TestCheck_NotRunUncompletedAlias: a raw URL that has never completed, but
+// shares its label with one that has, still counts toward the shared not-run
+// streak, so the old verdict is removed rather than outliving the not-runs.
+// It creates no series of its own.
+//
+// Value: protects=not-runs on a never-completed URL variant remove a shared
+// label's stale descry_check_up; fails_when=recordNotRun returns early for
+// any uncached raw URL; why_new=TestCheck_NotRunSharedLabel completes both
+// URLs first, so the uncached path is never taken; seam=none;
+// no_claim=label collisions the CLI refuses (library only)
+func TestCheck_NotRunUncompletedAlias(t *testing.T) {
+	c := newTestCollector(t, Options{}, fakeNow)
+	f := &fakeCheck{obs: check.Observation{Status: check.StatusUp, StatusCode: 200, ObservedAt: t0}}
+	chk := c.Check(f)
+	ctx := context.Background()
+	const up = `descry_check_up{url="https://h/p"}`
+	if _, err := chk.Run(ctx, check.Target{URL: "https://h/p?a=1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.obs, f.err = check.Observation{}, notRunErr(syscall.EMFILE)
+	for range 2 {
+		_, _ = chk.Run(ctx, check.Target{URL: "https://h/p?b=2"})
+	}
+	want(t, samples(t, c), up, 1)
+	_, _ = chk.Run(ctx, check.Target{URL: "https://h/p?b=2"})
+	got := samples(t, c)
+	absent(t, got, up)
+	want(t, got, `descry_checks_not_run_total{reason="EMFILE"}`, 3)
+
+	// A never-completed URL under a label nobody completed creates nothing.
+	_, _ = chk.Run(ctx, check.Target{URL: "https://other/"})
+	if n := len(perTargetOf(samples(t, c), "https://other/")); n != 0 {
+		t.Errorf("a not-run on an unseen label created %d per-target series; want 0", n)
+	}
+}
+
+// TestCheck_CancelledAfterSeries: a cancelled run leaves an existing target's
+// series exactly as they were, whether descry_check_up is present or already
+// removed by not-runs, and a target's first run that errors creates up at 0.
+//
+// Value: protects=a shutdown-cancelled run never moves (or recreates)
+// descry_check_up once a target has series, and a first-run Run error still
+// exports up=0; fails_when=the cancel test moves after record, or series()
+// stops creating up through upState.set; why_new=TestCheck_CancelledRecordsNothing
+// uses a fresh collector with no series; seam=none; no_claim=none beyond protects
+func TestCheck_CancelledAfterSeries(t *testing.T) {
+	tgt := check.Target{URL: "https://a.example/"}
+	const up = `descry_check_up{url="https://a.example/"}`
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	down := check.Observation{Status: check.StatusDown, ErrorClass: check.ErrUnknown}
+
+	t.Run("present", func(t *testing.T) {
+		c := newTestCollector(t, Options{}, fakeNow)
+		f := &fakeCheck{obs: check.Observation{Status: check.StatusUp, StatusCode: 200, ObservedAt: t0}}
+		chk := c.Check(f)
+		if _, err := chk.Run(context.Background(), tgt); err != nil {
+			t.Fatal(err)
+		}
+		before := samples(t, c)
+		f.obs = down
+		_, _ = chk.Run(cancelled, tgt)
+		got := samples(t, c)
+		want(t, got, up, 1)
+		for k, v := range before {
+			want(t, got, k, v)
+		}
+	})
+	t.Run("removed", func(t *testing.T) {
+		c := newTestCollector(t, Options{}, fakeNow)
+		f := &fakeCheck{obs: check.Observation{Status: check.StatusUp, StatusCode: 200, ObservedAt: t0}}
+		chk := c.Check(f)
+		if _, err := chk.Run(context.Background(), tgt); err != nil {
+			t.Fatal(err)
+		}
+		f.obs, f.err = check.Observation{}, notRunErr(syscall.EMFILE)
+		for range 3 {
+			_, _ = chk.Run(context.Background(), tgt)
+		}
+		absent(t, samples(t, c), up)
+		f.obs, f.err = down, nil
+		_, _ = chk.Run(cancelled, tgt)
+		absent(t, samples(t, c), up)
+	})
+	t.Run("first run error", func(t *testing.T) {
+		c := newTestCollector(t, Options{}, fakeNow)
+		_, _ = c.Check(&fakeCheck{err: errors.New("boom")}).Run(context.Background(), tgt)
+		want(t, samples(t, c), up, 0)
+	})
+}

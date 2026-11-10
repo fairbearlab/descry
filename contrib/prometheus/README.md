@@ -121,7 +121,9 @@ of it, and a counter step inside the gap never fires the alert.
   descry removes that target's `descry_check_up`, and a target that was down
   stops alerting until a completed run brings the series back.
   `DescryChecksNotRun` fires meanwhile, and `DescryChecksStale` once the
-  15-minute budget passes. See
+  15-minute budget passes, for a target that has completed a run. A target
+  that has never completed one (checks not running since start) has no
+  per-target series, so `DescryChecksNotRun` is its only alert. See
   [Checks that could not run](../../docs/OPERATIONS.md#checks-that-could-not-run).
 - **The skip alert is not "skipping for 15 minutes straight".** It fires when
   every 10-minute window over 15 minutes holds at least one skip: skipping that
