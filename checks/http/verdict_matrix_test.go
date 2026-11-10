@@ -75,6 +75,47 @@ func TestVerdictMatrix(t *testing.T) {
 	t.Run("fresh_connection_per_check_and_hop", matrixFreshConnections)
 	t.Run("handshake_finishes_after_deadline", matrixLateHandshake)
 	t.Run("conn_reused_key", matrixConnReusedKey)
+	t.Run("malformed_response_text", matrixMalformedResponse)
+}
+
+// matrixMalformedResponse: a target that answers with a malformed status line
+// or header line is down/unknown, whatever words it puts in them. net/http
+// quotes those bytes in its error, so without this a target could pick its own
+// class (here tls_error, timeout or dns_failure).
+func matrixMalformedResponse(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, reply string }{
+		{"status line", "XTTP/1.1 tls certificate timeout\r\n\r\n"},
+		{"status code", "HTTP/1.1 tls 200 OK\r\n\r\n"},
+		{"header line", "HTTP/1.1 200 OK\r\nno such host timeout tls\r\n\r\n"},
+	} {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+				_, _ = conn.Read(make([]byte, 4096))
+				_, _ = io.WriteString(conn, tc.reply)
+				_ = conn.Close()
+			}
+		}()
+		target := "http://" + ln.Addr().String() + "/"
+		for _, reuse := range []bool{false, true} {
+			t.Run(tc.name+"/"+modeName(reuse), func(t *testing.T) {
+				t.Parallel()
+				c, _ := newMatrixCheck(t, reuse, 2*time.Second, nil, nil)
+				obs, err := runCheck(c, target)
+				expect(t, tc.name, obs, err, down(reusedOr(reuse, keyFalse), check.ErrUnknown))
+			})
+		}
+	}
 }
 
 // --- expectations ---------------------------------------------------------

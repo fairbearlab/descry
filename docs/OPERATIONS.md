@@ -161,7 +161,7 @@ observed:
 | `tls_error` | certificate verification failed (unknown authority, expired or not yet valid, wrong name) or the handshake failed | that the certificate is wrong for other clients: a stale CA bundle or a skewed clock on this host fails the same way |
 | `http_error` | the target answered with a final status outside 200-399, or sent a 5th redirect; `extra.body` holds the first 4 KiB of the body | that the application is broken: a CDN challenge page, a WAF block or rate limiting (403, 429, 503) is classed the same |
 | `ssrf_blocked` | descry's own policy refused the target (scheme, port, or an address in a blocked range, checked on the URL, on each redirect and at dial time) | anything about the target: this is descry's policy refusal, and nothing was sent to the address it refused |
-| `unknown` | a failure that matched none of the above: commonly a connection closed before the response headers | which layer failed; the event carries no error text |
+| `unknown` | a failure that matched none of the above: commonly a connection closed before the response headers, or a malformed response or HTTP/2 GOAWAY from the target | which layer failed; the event carries no error text |
 
 Known local causes descry does not detect, so they reach you as `down` on the
 target:

@@ -348,6 +348,14 @@ func opName(err error) string {
 	return "request"
 }
 
+// targetTextErrors are lower-case fragments of the net/http errors whose text
+// includes bytes the target sent.
+var targetTextErrors = [...]string{
+	"malformed http",        // status line, status code or response
+	"malformed mime header", // header line
+	"goaway",                // HTTP/2 GOAWAY with debug data
+}
+
 // classifyError maps a transport error to the engine's closed ErrorClass enum.
 // It prefers typed-error unwrapping (errors.Is/As) over matching on error text,
 // since stdlib/OS wording is not a stable contract. Substring matching remains a
@@ -396,6 +404,14 @@ func classifyError(err error) check.ErrorClass {
 		}
 	}
 	msg := strings.ToLower(err.Error())
+	// A malformed response or an HTTP/2 GOAWAY carries bytes the target sent
+	// (its status or header line, its GOAWAY debug data). Matching words in
+	// them would let the target pick its own class, so these stay unknown.
+	for _, s := range targetTextErrors {
+		if strings.Contains(msg, s) {
+			return check.ErrUnknown
+		}
+	}
 	switch {
 	case strings.Contains(msg, "timeout"):
 		return check.ErrTimeout

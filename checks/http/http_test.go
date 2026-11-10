@@ -162,6 +162,10 @@ func TestClassifyError(t *testing.T) {
 		{"misleading URL: EOF before headers", &url.Error{Op: "Get", URL: "https://example.com/timeout", Err: io.EOF}, check.ErrUnknown},
 		{"url.Error nil cause", &url.Error{Op: "Get", URL: "https://example.com/timeout"}, check.ErrUnknown},
 		{"url.Error cause still matched", &url.Error{Op: "Get", URL: "https://example.com/", Err: errors.New("too many redirects")}, check.ErrHTTPError},
+		// Text the target sent must not steer the class either.
+		{"target text: malformed status", errors.New(`net/http: HTTP/1.x transport connection broken: malformed HTTP status code "tls"`), check.ErrUnknown},
+		{"target text: malformed header", errors.New("net/http: HTTP/1.x transport connection broken: malformed MIME header line: no such host timeout"), check.ErrUnknown},
+		{"target text: GOAWAY debug", errors.New(`http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR, debug="tls certificate timeout"`), check.ErrUnknown},
 		{"nested url.Error", &url.Error{Op: "Get", URL: "https://timeout.example/", Err: &url.Error{Op: "Get", URL: "https://tls.example/", Err: errors.New("remote error: tls: handshake failure")}}, check.ErrTLSError},
 	}
 	for _, c := range cases {
