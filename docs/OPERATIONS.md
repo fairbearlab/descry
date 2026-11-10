@@ -540,7 +540,7 @@ you set yourself is published verbatim, except that the CloudEvents library
 trims surrounding whitespace and omits a subject left empty, so two labels
 that differ only in surrounding whitespace share a subject, and the
 startup `targets share an event subject` warning does not catch that case. Log lines are a third path, through
-`check.RedactURL`, which can still print a password from a misparsed URL; see
+`check.RedactURL`, which keeps the query string; see
 [Log lines and their levels](#log-lines-and-their-levels).
 
 The `descry` binary applies the same rendering to the events, whether or not
@@ -698,20 +698,20 @@ Lines that print a target URL (`url` above, `subject` when it comes from a
 `url` label you set, and the per-run diagnostics `descry` writes to stderr)
 pass it through `check.RedactURL`. It masks the password (the username
 stays) and a bare username with no password, but leaves the query string as
-it is, so a `?token=` is printed even in a well-formed URL. It masks nothing
-in a URL with no `//` after the scheme (`https:user:pass@host` is printed as
-written), nor in a password with a literal `/`, `?` or `#` whose part before
-that character is empty or all digits: `url.Parse` reads that part as a port,
-which moves the `@` out of the authority (`https://user:12/34@host/p`). Any
-other password of that shape fails to parse, and a URL that fails to parse
-prints as `<unparseable>`. A literal `/`, `?` or `#` in the username, or in a
-bare token with no password (`https://tok/en@host/p`), leaves a valid host
-before it, so that URL parses and is printed in full. This is a known gap, to be fixed in
-`check.RedactURL`. The `skipping slot`, `publish failed` and `dropping
+it is, so a `?token=` is printed even in a well-formed URL. A URL that it
+cannot print safely is printed as `<unparseable>`: one that fails to parse,
+and one with any literal `@` other than the userinfo delimiter, the same rule
+as the metrics `url` label's. That rule catches the two shapes `url.Parse`
+reads as having no userinfo: a URL with no `//` after the scheme
+(`https:user:pass@host`), and a password with a literal `/`, `?` or `#`,
+which can end the authority early (`https://user:12/34@host/p` parses with
+the `@` in its path). A scheme-less `localhost:8080` has no `@` and is
+printed as written. The rule also
+catches a literal `@` in a path, query or fragment (`/users/@me`); escape it
+as `%40` to see the URL in these lines. The `skipping slot`, `publish failed` and `dropping
 results` lines come from the engine, so they reach a program that embeds the
 runner too; the startup warnings and the per-run stderr diagnostics come from
-the `descry` binary. Keep credentials and tokens out of target URLs, or out
-of URLs of those shapes at least.
+the `descry` binary. Keep tokens out of target query strings.
 
 Publishing is best-effort by design: bounded retry, then log and continue. The
 scheduler goroutine is never blocked by a sink — a slow `Publish` holds one
