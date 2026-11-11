@@ -179,11 +179,10 @@ Pre-1.0, the minor version carries breaking changes.
   skipped` lines on stderr, and the engine's `skipping slot`, `publish failed`
   and `dropping results` log lines. It now applies the metrics `url` label's
   rule: a URL with any literal `@` beyond the userinfo delimiter prints as
-  `<unparseable>`; a scheme-less `localhost:8080` still prints as written. A URL with a literal `@` in its path,
-  query or fragment (`/users/@me`) now prints as `<unparseable>` in log lines
-  too; escape it as `%40` to keep it readable. Events and metrics labels were
-  never affected.
-
+  `<unparseable>`; a scheme-less `localhost:8080` still prints as written. A
+  URL with a literal `@` in its path, query or fragment (`/users/@me`) now
+  prints as `<unparseable>` in log lines too; escape it as `%40` to keep it
+  readable. Events and metrics labels were never affected.
 - **`checks/http`: the error class no longer follows the target URL's text.**
   The classifier's text fallback matched the whole error message, which
   includes the request URL, so a target such as `https://tls-gateway.example/`
