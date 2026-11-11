@@ -260,6 +260,32 @@ root tag.
 
 **Effort:** M · **Priority:** P4 · **Depends on:** a repin PR that exhibits the trigger
 
+### Name the target in log lines that print `<unparseable>`
+
+**What:** When `check.RedactURL` returns `<unparseable>`, add something that
+identifies the target to the line: its config position, as the startup
+`target URL cannot be shown safely` warning already does (`target=N`), or a
+redacted operator-set `url` label. The lines are the CLI's `check failed` and
+`check skipped` lines and its duplicate-URL, timeout-exceeds-interval and
+shared-subject warnings, plus the engine's `skipping slot`, `publish failed`
+and `dropping results` lines. The engine lines need an index or label carried
+in `check.Target` or in the runner entry.
+
+**Why:** Since the `RedactURL` `@` rule, a target with a literal `@` in its
+path, query or fragment (`/users/@me`) prints as `<unparseable>` in all of
+these lines. With two or more such targets an operator cannot tell which one a
+line is about. Nothing leaks, and escaping the `@` as `%40` is the documented
+workaround.
+
+**Context:** 2026-11-10, raised by the /ship red-team and adversarial readers
+on the `RedactURL` fix; the owner chose to ship the fix and track this. While
+here, update the comment above the shared-subject warning in
+`cmd/descry/main.go` (it says redaction only matters for a label that carries
+userinfo; a label such as `team@svc` now prints as the placeholder too), and
+the `invalid event config` error, which redacts `source` the same way.
+
+**Effort:** S (CLI lines) to M (engine lines) · **Priority:** P2 · **Depends on:** nothing
+
 ## Check
 
 ### `EADDRNOTAVAIL` from the target's address family reads as not-run
@@ -349,35 +375,6 @@ control of the server (an HTTP/2 framer, not `httptest`), so it did not fit v0.6
 it: a fresh connection never lives long enough to accumulate resets.
 
 **Effort:** M · **Priority:** P4 · **Depends on:** a reuse-mode user, or a report of it
-
-### `check.RedactURL` leaves passwords in misparsed URLs
-
-**What:** Make `check.RedactURL` mask credentials in URLs that `url.Parse`
-misreads: an opaque URL such as `https:user:pass@host` (no `//` after the
-scheme), and a password with a literal `/`, `?` or `#` that moves the `@` out of
-the authority (`https://user:12/34@host/p` parses as host `user:12`, path
-`/34@host/p`). Then have the CLI rely on it.
-
-**Why:** `url.Parse` accepts both without error and finds no `User`, so
-`RedactURL` returns them unchanged and the password is printed. The CLI passes
-target URLs through `RedactURL` in its startup warnings (duplicate URL, interval
-shorter than timeout, and the shared-subject warning, but only for an
-operator-set `url` label of that shape; a derived subject is already safe) and
-in the per-run `check failed` / `check skipped` lines on stderr, so a config
-typo of either shape puts the password in the logs. The metrics label and the
-derived event subject are not affected: `metrics.TargetLabel` renders both
-shapes as `<unparseable>`.
-
-**Context:** 2026-10-12 — found while reviewing the `--listen` work; the
-unparseable-subject warning already names the target by config position only,
-but the older lines still print the URL. Fix it in the engine (`check/check.go`)
-by adopting `metrics.TargetLabel`'s rule: an opaque URL, or any literal `@`
-beyond the single userinfo delimiter `url.Parse` consumed, yields the
-`<unparseable>` placeholder. Keep the function idempotent and add table rows to
-its tests. OPERATIONS.md ("Log lines and their levels") documents the gap until
-then; drop that caveat with the fix.
-
-**Effort:** S · **Priority:** P1 · **Depends on:** nothing
 
 ### Cap connection age in reuse mode
 
@@ -723,6 +720,49 @@ to mark fragments that are not whole programs.
 **Effort:** S · **Priority:** P3 · **Depends on:** nothing
 
 ## Completed
+
+### `check.RedactURL` leaves passwords in misparsed URLs
+
+**What:** Make `check.RedactURL` mask credentials in URLs that `url.Parse`
+misreads: an opaque URL such as `https:user:pass@host` (no `//` after the
+scheme), and a password with a literal `/`, `?` or `#` that moves the `@` out of
+the authority (`https://user:12/34@host/p` parses as host `user:12`, path
+`/34@host/p`). Then have the CLI rely on it.
+
+**Why:** `url.Parse` accepts both without error and finds no `User`, so
+`RedactURL` returns them unchanged and the password is printed. The CLI passes
+target URLs through `RedactURL` in its startup warnings (duplicate URL, interval
+shorter than timeout, and the shared-subject warning, but only for an
+operator-set `url` label of that shape; a derived subject is already safe) and
+in the per-run `check failed` / `check skipped` lines on stderr, so a config
+typo of either shape puts the password in the logs. The metrics label and the
+derived event subject are not affected: `metrics.TargetLabel` renders both
+shapes as `<unparseable>`.
+
+**Context:** 2026-10-12 — found while reviewing the `--listen` work; the
+unparseable-subject warning already names the target by config position only,
+but the older lines still print the URL. Fix it in the engine (`check/check.go`)
+by adopting `metrics.TargetLabel`'s rule: an opaque URL, or any literal `@`
+beyond the single userinfo delimiter `url.Parse` consumed, yields the
+`<unparseable>` placeholder. Keep the function idempotent and add table rows to
+its tests. OPERATIONS.md ("Log lines and their levels") documents the gap until
+then; drop that caveat with the fix.
+
+**Effort:** S · **Priority:** P1 · **Depends on:** nothing
+
+**Completed:** 2026-11-10 — `RedactURL` adopts `metrics.TargetLabel`'s `@`
+rule: any literal `@` beyond the userinfo delimiter `url.Parse` consumed
+yields `<unparseable>`, which covers both misparse shapes (an opaque URL has
+no userinfo, so its `@` counts). Opaque strings with no `@` (a scheme-less
+`localhost:8080`) are still printed, unlike the label, since they hold no
+userinfo and are often the only name a log line has. A rendering that would not redact to
+itself does too, which keeps it idempotent. The cost, as for the label, is
+that a literal `@` in a path, query or fragment prints as the placeholder.
+`TestRedactURL` has rows for both misparse shapes, a bare token with a `/`,
+and literal `@` in path and query; `FuzzRedactURL` now also checks that every
+non-placeholder output parses and has no `@` but its delimiter.
+The OPERATIONS.md caveat is gone. No caller parses the redacted value, and
+event URLs still go through `metrics.TargetLabel`.
 
 ### Report connection reuse on failed checks
 
