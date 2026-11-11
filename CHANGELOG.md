@@ -8,6 +8,90 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-10
+
+### Upgrading from 0.5.1
+
+- **Before upgrading, compare `timeout` to observed cold-connection time on
+  targets checked more often than 90s.** In 0.5.1 those targets ran on a warm
+  pooled connection; from 0.6.0 every check pays DNS, TCP and TLS, so a target
+  whose cold time is close to `timeout` starts failing with class `timeout`.
+  From the descry host (each figure is seconds from the start of the request):
+
+  ```
+  curl -so /dev/null -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}\n' https://example.com/
+  ```
+
+- **Re-check `concurrency`.** Every check now holds a worker for its full cold
+  duration. Size it from the cold p99 as in
+  [Sizing `concurrency`](docs/OPERATIONS.md#sizing-concurrency): at least
+  `2 × N × p99 / interval`. The published runs, with the dial delayed 50ms or
+  200ms on loopback, had zero skips at 44 targets every 60s with
+  `concurrency` 1, and at 500 targets every 10s with `concurrency` 6 (50ms)
+  and 21 (200ms); measure your own targets. Each check also leaves one
+  `TIME_WAIT` socket (about `checks per second × 60` on Linux), so about 470
+  checks per second to one destination address use up the default ephemeral
+  port range; the symptom is `EADDRNOTAVAIL`, reported as a check that could
+  not run.
+- **To keep 0.5.1's pooled connections, opt back into reuse.** In the config
+  file, at the top level:
+
+  ```yaml
+  connection_reuse: true
+  ```
+
+  In Go:
+
+  ```go
+  c := httpcheck.New(timeout, httpcheck.WithConnectionReuse())
+  ```
+
+- **Reuse does not restore 0.5.1 exactly.** In both modes the TCP dial and the
+  TLS handshake are capped at the check `timeout` (0.5.1: 30s and 10s), the
+  check returns `check.ErrNotRun` on local resource exhaustion, the error class
+  no longer follows the URL's text, `descry_check_up` is removed after three
+  not-runs in a row, and shutdown drops in-flight results. Reuse mode adds
+  `extra.conn_reused` to every event that got a connection, and the CLI warns
+  at startup that reuse is on.
+- **A program draining `Results()` must handle `check.ErrNotRun`.** In 0.5.1
+  the bundled HTTP check never returned an error; it now returns one wrapping
+  `check.ErrNotRun` when this host runs out of a local resource. That is no
+  verdict and not the target, so test for it before treating an error as a
+  failure:
+
+  ```go
+  for res := range r.Results() {
+      switch {
+      case errors.Is(res.Err, check.ErrNotRun):
+          // no verdict: this host, not the target; retries next interval
+      case res.Err != nil:
+          // a skip, a check error, or a publish failure
+      }
+  }
+  ```
+
+  The `descry` CLI already does this.
+- **`descry_check_up` can be absent.** After three checks in a row that could
+  not run, a target's `descry_check_up` series is removed, and the next
+  completed run recreates it. While it is gone `DescryTargetDown` resolves even
+  for a target that is really down, so treat an absent series as "no current
+  evidence", not up, and load the new `DescryChecksNotRun` rule from
+  `contrib/prometheus`.
+- **Expect one missing sample per target at each rollout.** Shutdown drops
+  in-flight checks instead of publishing `down` (see Fixed).
+- **Rolling back.** Pin the image to `v0.5.1` (`newTag: v0.5.1` in
+  `examples/kubernetes/kustomization.yaml`, or your own), or for an embedding
+  program:
+
+  ```
+  go get github.com/fairbearlab/descry@v0.5.1
+  ```
+
+  Remove `connection_reuse` from the config file first, because 0.5.1 rejects
+  unknown keys, and remove any use of `check.ErrNotRun`,
+  `httpcheck.WithConnectionReuse` or `metrics.NotRunReason`, which 0.5.1 does
+  not have.
+
 ### Added
 
 - **`check.ErrNotRun`: a check can say it could not run.** A `Check` returns an
@@ -95,11 +179,10 @@ Pre-1.0, the minor version carries breaking changes.
   skipped` lines on stderr, and the engine's `skipping slot`, `publish failed`
   and `dropping results` log lines. It now applies the metrics `url` label's
   rule: a URL with any literal `@` beyond the userinfo delimiter prints as
-  `<unparseable>`; a scheme-less `localhost:8080` still prints as written. A URL with a literal `@` in its path,
-  query or fragment (`/users/@me`) now prints as `<unparseable>` in log lines
-  too; escape it as `%40` to keep it readable. Events and metrics labels were
-  never affected.
-
+  `<unparseable>`; a scheme-less `localhost:8080` still prints as written. A
+  URL with a literal `@` in its path, query or fragment (`/users/@me`) now
+  prints as `<unparseable>` in log lines too; escape it as `%40` to keep it
+  readable. Events and metrics labels were never affected.
 - **`checks/http`: the error class no longer follows the target URL's text.**
   The classifier's text fallback matched the whole error message, which
   includes the request URL, so a target such as `https://tls-gateway.example/`
@@ -515,7 +598,8 @@ two-layer SSRF guard, and the YAML-configured `descry` binary.
 <!-- Entries for 0.1.0–0.2.1 were reconstructed from git history when this file
      was added in 0.3.0; the GitHub release notes are authoritative for those tags. -->
 
-[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/fairbearlab/descry/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/fairbearlab/descry/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fairbearlab/descry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fairbearlab/descry/compare/v0.3.0...v0.4.0
