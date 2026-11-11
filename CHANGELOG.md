@@ -8,6 +8,19 @@ Pre-1.0, the minor version carries breaking changes.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-11-10
+
+### Fixed
+
+- **Go toolchain: `go.mod` now requires go 1.26.11 (was 1.26.10), and the
+  release binaries and image are rebuilt with it.** go1.26.11 carries the fix
+  for GO-2026-6859 (CVE-2026-97054, `net/http`), which `govulncheck` reports
+  against the v0.6.0 builds. The bug lets a client crash an HTTP/1 server
+  whose handler is wrapped in `MaxBytesReader` or `MaxBytesHandler`; descry
+  uses neither, so the `--listen` admin server was not exposed, but scanners
+  flag the v0.6.0 binaries and image. `.tool-versions` and `tools/go.mod`
+  move with it. No other change from 0.6.0.
+
 ## [0.6.0] — 2026-11-10
 
 ### Upgrading from 0.5.1
@@ -598,7 +611,8 @@ two-layer SSRF guard, and the YAML-configured `descry` binary.
 <!-- Entries for 0.1.0–0.2.1 were reconstructed from git history when this file
      was added in 0.3.0; the GitHub release notes are authoritative for those tags. -->
 
-[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/fairbearlab/descry/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/fairbearlab/descry/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/fairbearlab/descry/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/fairbearlab/descry/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fairbearlab/descry/compare/v0.4.0...v0.5.0
