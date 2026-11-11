@@ -42,6 +42,8 @@ func TestRedactURL(t *testing.T) {
 		{"literal @ in the path", "https://example.com/users/" + "@" + "me", "<unparseable>"},
 		{"literal @ in the query", "https://example.com/?to=ops" + "@" + "example.com", "<unparseable>"},
 		{"escaped %40 in the path is kept", "https://example.com/users/%40me", "https://example.com/users/%40me"},
+		// Value: protects=the idempotence fallback in RedactURL (second redact pass rejects the first rendering); fails_when=the redact(once) re-check is removed, so net/url unescapes %40 beside a space and prints a literal "@" (https://example.com/users/@me%20now); why_new=no other row or seed reaches the second-pass reject, every other row is settled on the first pass; seam=none; no_claim=the again!=once-with-ok sub-branch, which a 45s fuzz run could not reach
+		{"%40 beside a space would come back as a literal @", "https://example.com/users/%40me now", "<unparseable>"},
 		{"escaped %40 in the password is masked", "https://user:p%40ss" + "@" + "example.com/", "https://" + masked + "@example.com/"},
 	}
 	for _, c := range cases {

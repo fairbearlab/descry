@@ -137,6 +137,8 @@ func FuzzRedactURLIdempotent(f *testing.F) {
 		"https:user:hunter2@example.com",
 		"https://user:12/34@example.com/p",
 		"https://example.com/a%40b%20c",
+		// Value: protects=RedactURL idempotence when the first rendering turns %40 into a literal "@"; fails_when=the redact(once) re-check is removed (once ends in /@me%20now, twice is <unparseable>); why_new=the fully escaped seed above keeps RawPath and never reaches the re-check reject; seam=none; no_claim=inputs the seed corpus does not hold
+		"https://example.com/users/%40me now",
 		"<unparseable>",
 	} {
 		f.Add(s)
