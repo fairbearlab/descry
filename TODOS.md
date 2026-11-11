@@ -260,6 +260,32 @@ root tag.
 
 **Effort:** M · **Priority:** P4 · **Depends on:** a repin PR that exhibits the trigger
 
+### Name the target in log lines that print `<unparseable>`
+
+**What:** When `check.RedactURL` returns `<unparseable>`, add something that
+identifies the target to the line: its config position, as the startup
+`target URL cannot be shown safely` warning already does (`target=N`), or a
+redacted operator-set `url` label. The lines are the CLI's `check failed` and
+`check skipped` lines and its duplicate-URL, timeout-exceeds-interval and
+shared-subject warnings, plus the engine's `skipping slot`, `publish failed`
+and `dropping results` lines. The engine lines need an index or label carried
+in `check.Target` or in the runner entry.
+
+**Why:** Since the `RedactURL` `@` rule, a target with a literal `@` in its
+path, query or fragment (`/users/@me`) prints as `<unparseable>` in all of
+these lines. With two or more such targets an operator cannot tell which one a
+line is about. Nothing leaks, and escaping the `@` as `%40` is the documented
+workaround.
+
+**Context:** 2026-11-10, raised by the /ship red-team and adversarial readers
+on the `RedactURL` fix; the owner chose to ship the fix and track this. While
+here, update the comment above the shared-subject warning in
+`cmd/descry/main.go` (it says redaction only matters for a label that carries
+userinfo; a label such as `team@svc` now prints as the placeholder too), and
+the `invalid event config` error, which redacts `source` the same way.
+
+**Effort:** S (CLI lines) to M (engine lines) · **Priority:** P2 · **Depends on:** nothing
+
 ## Check
 
 ### `EADDRNOTAVAIL` from the target's address family reads as not-run
