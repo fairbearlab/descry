@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -27,25 +28,67 @@ var ErrNotRun = errors.New("check not run")
 // log: a password becomes "xxxxx" (the username stays, as in url.URL.Redacted),
 // and a bare username with no password — the shape of a token-in-URL such as
 // https://<token>@api.example.com — is masked too, since there it is the secret.
-// Query strings are left alone. On parse failure it returns the fixed
-// placeholder "<unparseable>" rather than echoing input that may still carry
-// credentials; the placeholder itself passes through unchanged, so redacting
-// twice is the same as redacting once.
+// Query strings are left alone.
+//
+// It returns the fixed placeholder "<unparseable>", rather than echoing input
+// that may still carry credentials, for a URL that fails to parse and for a
+// URL with any literal "@" other than the one url.Parse consumed as the
+// userinfo delimiter. That rule is metrics.TargetLabel's, and it covers the
+// two shapes url.Parse accepts but misreads as having no userinfo: an opaque
+// URL with no "//" after the scheme ("https:user:pass@host"), and a password
+// with an unescaped "/", "?" or "#" that ends the authority early, so
+// https://user:12/34@host/p parses as host "user:12" with the "@" in the path.
+// With it, credentials written in userinfo syntax are either masked or not
+// printed. An opaque string with no "@" (a scheme-less "localhost:8080", a
+// "svc:api" label) carries no userinfo and is printed as it is.
+// The cost is that a URL with a literal "@" in its path, query or fragment
+// (/users/@me, an email in a query parameter) also prints as the placeholder;
+// escape it as "%40" to keep it readable.
+//
+// The placeholder itself passes through unchanged, and so does every other
+// result: redacting twice is the same as redacting once.
 func RedactURL(raw string) string {
-	const unparseable = "<unparseable>"
-	if raw == unparseable {
+	if raw == unparseableURL {
 		return raw
 	}
+	once, ok := redact(raw)
+	if !ok {
+		return unparseableURL
+	}
+	// A rendering that would not redact to itself (net/url re-escaping a
+	// path so that a "%40" comes back as "@", say) gets the placeholder too,
+	// which keeps RedactURL idempotent.
+	if again, ok := redact(once); !ok || again != once {
+		return unparseableURL
+	}
+	return once
+}
+
+// unparseableURL is RedactURL's placeholder; metrics.TargetLabel uses the same
+// text, so logs and labels agree on it.
+const unparseableURL = "<unparseable>"
+
+// redact is RedactURL without the idempotence check, reporting false when raw
+// has no safe rendering.
+func redact(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return unparseable
+		return "", false
+	}
+	// An opaque URL has no User, so any "@" in it is caught here.
+	delims := 0
+	if u.User != nil {
+		delims = 1
+	}
+	if strings.Count(raw, "@") > delims {
+		return "", false
 	}
 	if u.User != nil {
 		if _, hasPW := u.User.Password(); !hasPW && u.User.Username() != "" {
 			u.User = url.User("xxxxx")
 		}
 	}
-	return u.Redacted()
+	return u.Redacted(), true
 }
 
 // Status is a closed, engine-owned enum. v1: StatusUp | StatusDown only.

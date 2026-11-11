@@ -98,7 +98,7 @@ target (see [Shutdown](#shutdown)).
 | `Result{Err: nil}` | channel | Check ran, event published | nothing |
 | `Result{Err: <wraps check.ErrNotRun>}` | channel | The check could not run at all, for a reason local to the prober (out of file descriptors or ephemeral ports, say), so nothing was observed of the target and no event was published. Test with `errors.Is(err, check.ErrNotRun)` before treating the error as a failure. The bundled `httpcheck` returns it when the request fails at any stage (the dial, the DNS lookup, or a socket read or write) with `EMFILE`, `ENFILE`, `EADDRNOTAVAIL`, `ENOBUFS` or `ENOMEM` | the prober host — see [Checks that could not run](#checks-that-could-not-run); **not** the target |
 | `Result{Err: <check, mapping, or publish error>}` | channel | The check itself returned an error (from a custom `Check` implementation; the only error the bundled `httpcheck` returns is the not-run one in the row above), or the observation could not be delivered: the event could not be encoded (a payload that will not marshal — an `Extra` value such as a channel or NaN), or the sink rejected it up to 3 times (fewer if the context was cancelled mid-retry) | your check, your `Extra` payload, or your sink — **not** the target |
-| `Run` returns `runner: event config: ...` | error | The event config (`Source`, `Type`) is invalid. The runner validates it once in `New` and `Run` refuses to start: `Results()` is closed with no `Result` and no check runs. The `descry` CLI checks the same config before opening the sink and exits 2 (config error) with `error: invalid event config`; the `source` in that message is printed through `check.RedactURL`, so one that does not parse shows as `<unparseable>` | fix `source` / the event config; this is a startup error, never a per-event one |
+| `Run` returns `runner: event config: ...` | error | The event config (`Source`, `Type`) is invalid. The runner validates it once in `New` and `Run` refuses to start: `Results()` is closed with no `Result` and no check runs. The `descry` CLI checks the same config before opening the sink and exits 2 (config error) with `error: invalid event config`; the `source` in that message is printed through `check.RedactURL`, so one that does not parse, or that has any literal `@` other than the userinfo delimiter, shows as `<unparseable>` (see [Log lines and their levels](#log-lines-and-their-levels)) | fix `source` / the event config; this is a startup error, never a per-event one |
 | `Result{Err: runner.ErrSkipped}` | channel | Slot skipped: the prior run **had started** and was still running. The check is slower than the target's interval | lengthen that target's interval, or shorten `timeout` |
 | `Result{Err: runner.ErrSkippedQueued}` | channel | Slot skipped: the prior run was still **queued** behind a saturated worker pool and had not started. The pool is too small | raise `concurrency` (see sizing below) |
 | `Runner.Skipped() int64` | counter | Total skipped slots, both kinds. Exported as `descry_runner_skipped_slots_total` | trend it; a nonzero rate in steady state means undersized |
@@ -540,7 +540,7 @@ you set yourself is published verbatim, except that the CloudEvents library
 trims surrounding whitespace and omits a subject left empty, so two labels
 that differ only in surrounding whitespace share a subject, and the
 startup `targets share an event subject` warning does not catch that case. Log lines are a third path, through
-`check.RedactURL`, which can still print a password from a misparsed URL; see
+`check.RedactURL`, which keeps the query string; see
 [Log lines and their levels](#log-lines-and-their-levels).
 
 The `descry` binary applies the same rendering to the events, whether or not
@@ -698,20 +698,20 @@ Lines that print a target URL (`url` above, `subject` when it comes from a
 `url` label you set, and the per-run diagnostics `descry` writes to stderr)
 pass it through `check.RedactURL`. It masks the password (the username
 stays) and a bare username with no password, but leaves the query string as
-it is, so a `?token=` is printed even in a well-formed URL. It masks nothing
-in a URL with no `//` after the scheme (`https:user:pass@host` is printed as
-written), nor in a password with a literal `/`, `?` or `#` whose part before
-that character is empty or all digits: `url.Parse` reads that part as a port,
-which moves the `@` out of the authority (`https://user:12/34@host/p`). Any
-other password of that shape fails to parse, and a URL that fails to parse
-prints as `<unparseable>`. A literal `/`, `?` or `#` in the username, or in a
-bare token with no password (`https://tok/en@host/p`), leaves a valid host
-before it, so that URL parses and is printed in full. This is a known gap, to be fixed in
-`check.RedactURL`. The `skipping slot`, `publish failed` and `dropping
+it is, so a `?token=` is printed even in a well-formed URL. A URL that it
+cannot print safely is printed as `<unparseable>`: one that fails to parse,
+and one with any literal `@` other than the userinfo delimiter, the same rule
+as the metrics `url` label's. That rule catches the two shapes `url.Parse`
+reads as having no userinfo: a URL with no `//` after the scheme
+(`https:user:pass@host`), and a password with a literal `/`, `?` or `#`,
+which can end the authority early (`https://user:12/34@host/p` parses with
+the `@` in its path). A scheme-less `localhost:8080` has no `@` and is
+printed as written. The rule also
+catches a literal `@` in a path, query or fragment (`/users/@me`); escape it
+as `%40` to see the URL in these lines. The `skipping slot`, `publish failed` and `dropping
 results` lines come from the engine, so they reach a program that embeds the
 runner too; the startup warnings and the per-run stderr diagnostics come from
-the `descry` binary. Keep credentials and tokens out of target URLs, or out
-of URLs of those shapes at least.
+the `descry` binary. Keep tokens out of target query strings.
 
 Publishing is best-effort by design: bounded retry, then log and continue. The
 scheduler goroutine is never blocked by a sink — a slow `Publish` holds one

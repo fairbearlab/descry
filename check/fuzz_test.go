@@ -2,6 +2,7 @@ package check
 
 import (
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -29,6 +30,16 @@ func FuzzRedactURL(f *testing.F) {
 		// Inputs that url.Parse rejects, exercising the placeholder path.
 		"https://user:pw@exa mple.com", "://", "http://[::1",
 		"%%", "\x7f", "",
+		// Shapes url.Parse accepts but misreads, finding no userinfo: an
+		// opaque URL, and a password whose "/", "?" or "#" ends the
+		// authority early. Both must yield the placeholder.
+		"https:user:hunter2@example.com",
+		"https://user:12/34@example.com/p",
+		"https://user:12?34" + "@example.com/p",
+		"https://user:12#34" + "@example.com/p",
+		"https://example.com/users/@me",
+		"https://example.com/a%40b%20c",
+		"//@@", // a second "@" in the authority: once read as a bare username
 		// The placeholder itself: a fixed point, never re-escaped.
 		"<unparseable>",
 	}
@@ -53,6 +64,25 @@ func FuzzRedactURL(f *testing.F) {
 				t.Fatalf("RedactURL(%q) = %q; unparseable input must yield <unparseable>", raw, got)
 			}
 			return
+		}
+
+		if got == "<unparseable>" {
+			// The placeholder prints nothing of the input, so it leaks nothing.
+			return
+		}
+		// Every rendering RedactURL prints parses, and its only "@" is its
+		// userinfo delimiter, so no credential can hide in an opaque part,
+		// the path, the query or the fragment.
+		g, err := url.Parse(got)
+		if err != nil {
+			t.Fatalf("RedactURL(%q) = %q, which no longer parses: %v", raw, got, err)
+		}
+		delims := 0
+		if g.User != nil {
+			delims = 1
+		}
+		if n := strings.Count(got, "@"); n > delims {
+			t.Fatalf("RedactURL(%q) = %q has %d literal @ but %d userinfo delimiter(s)", raw, got, n, delims)
 		}
 
 		if u.User == nil {
@@ -104,6 +134,11 @@ func FuzzRedactURLIdempotent(f *testing.F) {
 		"https://a:xxxxx@example.com/",
 		"http://[::1]:8080/x",
 		"://",
+		"https:user:hunter2@example.com",
+		"https://user:12/34@example.com/p",
+		"https://example.com/a%40b%20c",
+		// Value: protects=RedactURL idempotence when the first rendering turns %40 into a literal "@"; fails_when=the redact(once) re-check is removed (once ends in /@me%20now, twice is <unparseable>); why_new=the fully escaped seed above keeps RawPath and never reaches the re-check reject; seam=none; no_claim=inputs the seed corpus does not hold
+		"https://example.com/users/%40me now",
 		"<unparseable>",
 	} {
 		f.Add(s)
