@@ -1,6 +1,6 @@
 # bin/env-check config, read by the shared `loops env-check` engine. See CONTRIBUTING.md.
 schema_version = 1
-engine = ">=0.7.0"
+engine = ">=0.8.0"
 
 [shared_checkout]
 hint = "git worktree add ../descry-<topic> -b <branch> origin/main"
@@ -20,7 +20,7 @@ compare = "exact"
 local = "warn"
 
 # ci.yml (release-check) and release.yml must run the same goreleaser. Contributors rarely have it
-# installed and CI is what runs it, so there is no local probe.
+# installed and CI is what runs it, so the pin has no engine probe; d.goreleaser below checks the installed one.
 [[pins]]
 tool = "goreleaser"
 sources = ["goreleaser-action:.github/workflows/ci.yml", "goreleaser-action:.github/workflows/release.yml"]
@@ -30,7 +30,7 @@ local = "off"
 [harness]
 tools = ["git", "go", "golangci-lint"]
 files = ["go.mod", "go.sum", "tools/go.mod", "tools/go.sum", ".tool-versions", ".golangci.yml", ".goreleaser.yaml", ".github/workflows/ci.yml", ".github/workflows/release.yml"]
-entrypoints = ["bin/env-check", ".loops/checks/modcache.sh", ".loops/checks/govulncheck.sh"]
+entrypoints = ["bin/env-check", ".loops/checks/modcache.sh", ".loops/checks/govulncheck.sh", ".loops/checks/goreleaser.sh"]
 tracked = true
 sparse = "warn"
 
@@ -46,3 +46,10 @@ timeout_s = 60
 id = "d.govulncheck"
 run = ".loops/checks/govulncheck.sh"
 timeout_s = 60
+
+# Needs goreleaser on PATH (0.8.0 `needs`): SKIPs where it is not installed instead of FAILing.
+[[local]]
+id = "d.goreleaser"
+run = ".loops/checks/goreleaser.sh"
+timeout_s = 15
+needs = ["goreleaser"]
