@@ -95,7 +95,10 @@ No code generation, no external services needed to build or run the tests.
 
 `bin/env-check` checks a checkout before you build or test in it: that the Go,
 golangci-lint and goreleaser pins in `go.mod`, `.tool-versions` and the
-workflows agree, that your local Go and golangci-lint match them, that the
+workflows agree, that your local Go and golangci-lint match them, that an
+installed goreleaser matches the `release.yml` goreleaser-action pin (the
+`d.goreleaser` row: SKIP where goreleaser is not installed, WARN on a mismatch,
+never FAIL; it only matters if you change `.goreleaser.yaml`), that the
 module cache already has every module the tests and the `govulncheck` tool
 (`tools/go.mod`) need (the scan itself still downloads the vulnerability database), that the
 files CI needs are present, and that you are working in a git worktree
@@ -113,6 +116,10 @@ main checkout. It is a thin wrapper around the shared `loops env-check` engine
   [Before you push](#before-you-push), and CI, stay the gate.
 - `bin/env-check --static` reads repo files only. In a single plain clone,
   run `ENV_CHECK_ALLOW_MAIN=1 bin/env-check`.
+- CI never runs `bin/env-check`. `TestGoreleaserProbe`
+  (`cmd/descry/envcheck_test.go`, part of `go test ./cmd/descry/`) runs
+  `.loops/checks/goreleaser.sh` against a stub goreleaser, so a change to that
+  script's verdicts fails the tests.
 
 ## Before you push
 
